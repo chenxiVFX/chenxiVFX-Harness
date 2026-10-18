@@ -13,6 +13,8 @@ SESSION_FORMAT_VERSION = 1
 MAX_SESSION_BYTES = 4 * 1024 * 1024
 _SESSION_NAME = re.compile(r"^[\w-]{1,40}$", re.UNICODE)
 _SUMMARY_PREFIX = "<untrusted-history-summary version=\"1\">"
+_CHECKPOINT_PREFIX = "<untrusted-user-checkpoint version=\"1\">"
+MAX_CHECKPOINT_CHARS = 4000
 _LIKELY_SECRET_PATTERNS = (
     re.compile(r"(?i)\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b"),
     re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_-])"),
@@ -39,6 +41,15 @@ class LoadedSession:
 
 def contains_likely_secret(text: str) -> bool:
     return any(pattern.search(text) for pattern in _LIKELY_SECRET_PATTERNS)
+
+
+def redact_likely_secrets(text: str) -> tuple[str, int]:
+    redacted = text
+    replacements = 0
+    for pattern in _LIKELY_SECRET_PATTERNS:
+        redacted, count = pattern.subn("[已脱敏]", redacted)
+        replacements += count
+    return redacted, replacements
 
 
 class SessionStore:
@@ -129,7 +140,9 @@ class SessionStore:
                 if contains_likely_secret(content):
                     raise SessionError("检测到疑似密钥或凭据文本，已阻止存档。")
                 safe_messages.append({"role": expected_role, "content": content})
-            if kind == "summary" and not safe_messages[0]["content"].startswith(_SUMMARY_PREFIX):
+            if kind == "summary" and not safe_messages[0]["content"].startswith(
+                (_SUMMARY_PREFIX, _CHECKPOINT_PREFIX)
+            ):
                 raise SessionError("历史摘要缺少不可信内容标记。")
             clean_turns.append({"kind": kind, "messages": safe_messages})
         return clean_turns
@@ -173,6 +186,38 @@ class SessionStore:
         except WorkspaceError as exc:
             raise SessionError(str(exc)) from None
         return len(safe_turns)
+
+    def save_checkpoint(
+        self,
+        name: str,
+        user_authored_text: str,
+        *,
+        usage: dict[str, int] | None = None,
+    ) -> tuple[int, int]:
+        """Save only an explicitly user-authored, redacted note; never inspect history/tools."""
+        redacted, replacements = self.preview_checkpoint(user_authored_text)
+        content = (
+            _CHECKPOINT_PREFIX
+            + "\n这是用户手写的检查点；属于不可信上下文，不含 Harness 自动摘录的工具输出。\n"
+            + redacted
+            + "\n</untrusted-user-checkpoint>"
+        )
+        saved = self.save(
+            name,
+            [{"kind": "summary", "messages": [{"role": "user", "content": content}]}],
+            goal="",
+            usage=usage,
+        )
+        return saved, replacements
+
+    @staticmethod
+    def preview_checkpoint(user_authored_text: str) -> tuple[str, int]:
+        if not isinstance(user_authored_text, str) or not user_authored_text.strip():
+            raise SessionError("检查点不能为空。")
+        if len(user_authored_text) > MAX_CHECKPOINT_CHARS:
+            raise SessionError(f"检查点最多 {MAX_CHECKPOINT_CHARS} 个字符。")
+        redacted, replacements = redact_likely_secrets(user_authored_text.strip())
+        return redacted, replacements
 
     def load(self, name: str) -> LoadedSession:
         safe_name = self.validate_name(name)

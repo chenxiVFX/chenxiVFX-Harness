@@ -116,6 +116,26 @@ class WritePreview:
 ApprovalCallback = Callable[[ActionRequest], bool]
 
 
+def authorize_subagent_plan(
+    tasks: tuple[str, ...], approve_action: ApprovalCallback
+) -> bool:
+    """Request explicit local approval for the exact text a child will receive."""
+    if not tasks or len(tasks) > 3 or any(not isinstance(task, str) or len(task) > 240 for task in tasks):
+        raise WorkspaceError("子代理计划超出本地任务范围上限。")
+    preview = "\n".join(
+        f"子任务 {index}: {task}\n输入范围：仅此任务文字；不包含主会话、文件引用或工具结果。"
+        for index, task in enumerate(tasks, 1)
+    )
+    return approve_action(
+        ActionRequest(
+            operation="delegate",
+            path="受限只读子代理",
+            diff=preview,
+            source="subagent",
+        )
+    )
+
+
 class Workspace:
     """File access constrained to a canonical workspace root."""
 

@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
-from .usage import ProviderUsage
+from .usage import ProviderUsage, estimate_tokens
 
 
 class ProviderError(RuntimeError):
     """A user-safe provider error. Never includes request headers or bodies."""
+
+
+class ProviderCancelled(RuntimeError):
+    """Raised when a caller cancels a provider operation at a safe boundary."""
 
 
 @dataclass
@@ -60,6 +65,29 @@ class MockProvider:
             assistant_message={"role": "assistant", "content": answer},
         )
 
+    def complete_subagent(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        timeout_seconds: float,
+        max_output_tokens: int,
+        cancellation_event: threading.Event,
+    ) -> AssistantTurn:
+        if cancellation_event.is_set():
+            raise ProviderCancelled("subagent cancelled")
+        if timeout_seconds <= 0:
+            raise TimeoutError("subagent deadline elapsed")
+        turn = self.complete(messages, [])
+        content = turn.content
+        while content and estimate_tokens(content) > max_output_tokens:
+            content = content[:-1]
+        if content != turn.content:
+            turn.content = content
+            turn.assistant_message = {"role": "assistant", "content": content}
+        if cancellation_event.is_set():
+            raise ProviderCancelled("subagent cancelled")
+        return turn
+
 
 class OpenAICompatibleProvider:
     """Small OpenAI Chat Completions adapter using only the Python stdlib."""
@@ -75,9 +103,7 @@ class OpenAICompatibleProvider:
         timeout: float = 45.0,
     ) -> None:
         if not api_key:
-            raise ProviderError(
-                "未配置 DEEPSEEK_API_KEY。请按 README 的本地安全录入步骤设置后重试。"
-            )
+            raise ProviderError("未提供 API 密钥。")
         parsed = urlsplit(base_url)
         if (
             parsed.scheme not in {"https", "http"}
@@ -104,12 +130,21 @@ class OpenAICompatibleProvider:
         return f"{base}/chat/completions"
 
     def complete(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        cancellation_event: threading.Event | None = None,
+        max_tokens: int = 2048,
     ) -> AssistantTurn:
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise ProviderCancelled("provider request cancelled before send")
+        if type(max_tokens) is not int or not 1 <= max_tokens <= 65536:
+            raise ProviderError("max_tokens must be between 1 and 65536")
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
             "reasoning_effort": "high",
             "thinking": {"type": "enabled"},
         }
@@ -134,10 +169,11 @@ class OpenAICompatibleProvider:
             # Provider response bodies are intentionally omitted: they are untrusted
             # and might reflect sensitive request data.
             raise ProviderError(f"模型服务返回 HTTP {exc.code}。") from None
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            reason = getattr(exc, "reason", None)
-            reason_text = str(reason) if reason else type(exc).__name__
-            raise ProviderError(f"连接模型服务失败：{reason_text}") from None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            raise ProviderError("连接模型服务失败；请检查网络和 Base URL。") from None
+
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise ProviderCancelled("provider request cancelled after response")
 
         if len(raw) > 4 * 1024 * 1024:
             raise ProviderError("模型响应超过 4 MiB 上限。")
@@ -197,15 +233,24 @@ class OpenAICompatibleProvider:
         return ProviderUsage(prompt, completion, total)
 
 
-def provider_from_environment(provider_name: str, model_override: str | None = None) -> Provider:
+def provider_from_environment(
+    provider_name: str,
+    model_override: str | None = None,
+    *,
+    api_key_override: str | None = None,
+    base_url_override: str | None = None,
+) -> Provider:
     model = model_override or os.environ.get("HARNESS_MODEL", "deepseek-flash")
     if provider_name == "mock":
         return MockProvider(model=model if model_override else "mock")
     if provider_name == "openai":
-        base_url = os.environ.get("HARNESS_BASE_URL", "https://api.deepseek.com")
+        base_url = base_url_override or os.environ.get("HARNESS_BASE_URL", "https://api.deepseek.com")
+        # Do not silently consume a process-wide credential. A later interactive
+        # hidden-input flow must pass the one-shot value explicitly.
+        api_key = api_key_override or ""
         return OpenAICompatibleProvider(
             base_url=base_url,
-            api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+            api_key=api_key,
             model=model,
         )
     raise ProviderError(f"未知模型提供商：{provider_name}")

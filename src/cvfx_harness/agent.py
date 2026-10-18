@@ -155,7 +155,10 @@ class Agent:
                 and len(turn.messages) == 1
                 and turn.messages[0].get("role") == "user"
                 and isinstance(turn.messages[0].get("content"), str)
-                and turn.messages[0]["content"].startswith('<untrusted-history-summary version="1">')
+                and turn.messages[0]["content"].startswith((
+                    '<untrusted-history-summary version="1">',
+                    '<untrusted-user-checkpoint version="1">',
+                ))
                 and not contains_likely_secret(turn.messages[0]["content"])
             ):
                 safe.append(
@@ -216,7 +219,10 @@ class Agent:
             ):
                 raise ValueError("session message is invalid")
             if kind == "summary" and not source_messages[0]["content"].startswith(
-                '<untrusted-history-summary version="1">'
+                (
+                    '<untrusted-history-summary version="1">',
+                    '<untrusted-user-checkpoint version="1">',
+                )
             ):
                 raise ValueError("session summary lacks its untrusted marker")
             messages = [dict(message) for message in source_messages]

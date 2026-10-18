@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,8 +21,10 @@ from cvfx_harness.providers import (
     AssistantTurn,
     MockProvider,
     OpenAICompatibleProvider,
+    ProviderCancelled,
     ProviderError,
     ToolCall,
+    provider_from_environment,
 )
 from cvfx_harness.tools import ActionRequest, Workspace, WorkspaceError, run_tool
 
@@ -572,11 +576,162 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("TEST_KEY_ONLY", captured["body"])
         self.assertIn("deepseek-flash", captured["body"])
 
+    def test_openai_tool_turn_roundtrips_reasoning_content_without_live_http(self) -> None:
+        provider = OpenAICompatibleProvider(
+            "https://api.deepseek.com", "TEST_KEY_ONLY", "deepseek-flash"
+        )
+        payloads = [
+            {
+                "choices": [{"message": {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "private reasoning sentinel",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'},
+                    }],
+                }}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
+            },
+            {
+                "choices": [{"message": {"role": "assistant", "content": "读取完成"}}],
+                "usage": {"prompt_tokens": 17, "completion_tokens": 2, "total_tokens": 19},
+            },
+        ]
+        captured_messages: list[list[dict[str, object]]] = []
+
+        class FakeResponse:
+            def __init__(self, value):
+                self.value = value
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, _size):
+                return json.dumps(self.value, ensure_ascii=False).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            del timeout
+            body = json.loads(request.data.decode("utf-8"))
+            captured_messages.append(body["messages"])
+            return FakeResponse(payloads.pop(0))
+
+        first_messages = [{"role": "system", "content": "static system"}, {"role": "user", "content": "read"}]
+        with patch("urllib.request.urlopen", fake_urlopen):
+            first = provider.complete(first_messages, [{"type": "function"}])
+            second_messages = first_messages + [
+                first.assistant_message,
+                {"role": "tool", "tool_call_id": "call-1", "content": "file result"},
+            ]
+            second = provider.complete(second_messages, [{"type": "function"}])
+
+        self.assertEqual(first.tool_calls[0].arguments, {"path": "a.txt"})
+        self.assertEqual(first.assistant_message["reasoning_content"], "private reasoning sentinel")
+        self.assertEqual(captured_messages[1][-2]["reasoning_content"], "private reasoning sentinel")
+        self.assertEqual(captured_messages[1][-1]["tool_call_id"], "call-1")
+        self.assertEqual(first.usage.prompt_tokens, 11)
+        self.assertEqual(second.content, "读取完成")
+        self.assertEqual(second.usage.total_tokens, 19)
+        self.assertFalse(hasattr(first.usage, "cost_usd"))
+
+    def test_openai_rate_limit_is_redacted_and_not_retried(self) -> None:
+        provider = OpenAICompatibleProvider(
+            "https://api.deepseek.com", "TEST_KEY_ONLY", "deepseek-flash"
+        )
+        calls = 0
+        response_body = b"SENSITIVE_PROVIDER_BODY_SENTINEL"
+
+        def rate_limited(request, timeout):
+            nonlocal calls
+            calls += 1
+            raise __import__("urllib.error").error.HTTPError(
+                request.full_url,
+                429,
+                "Too Many Requests",
+                None,
+                io.BytesIO(response_body),
+            )
+
+        with patch("urllib.request.urlopen", rate_limited):
+            with self.assertRaisesRegex(ProviderError, "429") as caught:
+                provider.complete([{"role": "user", "content": "hello"}], [])
+        self.assertEqual(calls, 1, "automatic retries could amplify cost")
+        self.assertNotIn(response_body.decode(), str(caught.exception))
+        self.assertNotIn("TEST_KEY_ONLY", str(caught.exception))
+
+    def test_openai_request_can_be_cancelled_before_send_and_after_read(self) -> None:
+        provider = OpenAICompatibleProvider(
+            "https://api.deepseek.com", "TEST_KEY_ONLY", "deepseek-flash"
+        )
+        event = threading.Event()
+        event.set()
+        with patch("urllib.request.urlopen", side_effect=AssertionError("must not send")):
+            with self.assertRaises(ProviderCancelled):
+                provider.complete([{"role": "user", "content": "hello"}], [], cancellation_event=event)
+
+        event.clear()
+
+        class CancellingResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, _size):
+                event.set()
+                return json.dumps({"choices": [{"message": {"role": "assistant", "content": "late"}}]}).encode()
+
+        with patch("urllib.request.urlopen", return_value=CancellingResponse()):
+            with self.assertRaises(ProviderCancelled):
+                provider.complete([{"role": "user", "content": "hello"}], [], cancellation_event=event)
+
+    def test_openai_max_tokens_request_boundary_and_validation(self) -> None:
+        provider = OpenAICompatibleProvider(
+            "https://api.deepseek.com", "TEST_KEY_ONLY", "deepseek-flash"
+        )
+        bodies = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, _size):
+                return b'{"choices":[{"message":{"role":"assistant","content":"ok"}}]}'
+
+        def fake_urlopen(request, timeout):
+            del timeout
+            bodies.append(json.loads(request.data.decode("utf-8")))
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            provider.complete([{"role": "user", "content": "synthetic"}], [], max_tokens=128)
+            for invalid in (0, 65537, True):
+                with self.assertRaises(ProviderError):
+                    provider.complete(
+                        [{"role": "user", "content": "synthetic"}], [], max_tokens=invalid
+                    )
+
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual(bodies[0]["max_tokens"], 128)
+
     def test_rejects_remote_http_and_missing_key(self) -> None:
         with self.assertRaises(ProviderError):
             OpenAICompatibleProvider("http://example.com", "key", "model")
-        with self.assertRaisesRegex(ProviderError, "未配置 DEEPSEEK_API_KEY"):
+        with self.assertRaisesRegex(ProviderError, "未提供 API 密钥"):
             OpenAICompatibleProvider("https://api.deepseek.com", "", "deepseek-flash")
+
+    def test_provider_factory_never_reads_environment_api_key(self) -> None:
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "TEST_KEY_ONLY"}):
+            with self.assertRaisesRegex(ProviderError, "未提供 API 密钥"):
+                provider_from_environment("openai", "deepseek-flash")
 
 
 if __name__ == "__main__":

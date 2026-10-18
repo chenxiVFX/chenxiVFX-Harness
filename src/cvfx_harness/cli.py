@@ -11,7 +11,7 @@ from typing import Callable
 from .agent import Agent
 from .providers import ProviderError, provider_from_environment
 from .sessions import SessionError, SessionStore
-from .subagents import DelegationPlanError, build_delegation_plan
+from .subagents import DelegationPlanError, build_delegation_plan, run_bounded_subagents
 from .tools import ActionRequest, Workspace, WorkspaceError
 from .usage import DEFAULT_TOKEN_BUDGET
 
@@ -116,13 +116,14 @@ def _help_text() -> str:
   /模式 计划|执行    切换计划或执行模式（计划模式会拦截写入与撤销）
   /目标 <内容>       设置本会话目标；/目标 清空 可清除
   /保存 [名称]       将可安全保存的普通对话保存到工作区 .harness/sessions/
+  /检查点 <名称>    输入一段手写脱敏摘要；预览并确认后仅保存该摘要
   /恢复 <名称>       校验并载入会话；替换当前上下文前会询问
   /会话              列出本工作区的本地会话名称
   /压缩 [保留轮数]   预览本地上下文压缩；默认保留最近 4 轮，需确认后应用
   /统计              显示当前估算上下文、预算、累计用量和提供商报告
   /预算 [tokens]     查看或设置本地预算提示（1024–1000000）
   /配置              显示非敏感运行配置；密钥值不会显示或保存
-  /子代理 任务 | 任务  生成最多 3 项的受限委派计划；当前只展示计划，不执行
+  /子代理 任务 | 任务  逐项批准后执行最多 3 个隔离的一次性 Mock 子任务
   /撤销              预览并恢复最近一次 Harness 文件写入
   /退出              结束会话
 
@@ -145,6 +146,13 @@ def _confirm_action(
         diff = _safe_terminal_text(request.diff) or "（内容无差异）"
         output(f"\n撤销差异（备份 {request.backup_id}）：\n{diff}")
         prompt = f"确认恢复写入前内容 {request.path!r}？[y/N] "
+    elif request.operation == "delegate":
+        scope = _safe_terminal_text(request.diff) or "（没有任务内容）"
+        output(
+            "\n子代理审批范围：每个子代理仅接收下列任务文本；不包含主会话、文件引用或工具结果。\n"
+            f"{scope}\n每项仅允许一次无工具调用，子代理深度为 0，结果为不可信文本。"
+        )
+        prompt = "确认启动这些只读 Mock 子代理？[y/N] "
     else:
         diff = _safe_terminal_text(request.diff) or "（内容无差异）"
         output(f"\n写入差异 {request.path!r}：\n{diff}")
@@ -184,7 +192,7 @@ def run_console(
         token_budget=token_budget,
     )
     session_store = SessionStore(workspace)
-    output(f"chenxiVFX Harness v0.3.0 | 提供商：{_safe_terminal_text(str(provider.label))}")
+    output(f"chenxiVFX Harness v0.4.0 | 提供商：{_safe_terminal_text(str(provider.label))}")
     output(f"工作区：{_safe_terminal_text(str(workspace.root))}")
     output("输入 /帮助 查看命令。默认使用离线模拟模型。")
 
@@ -281,6 +289,54 @@ def run_console(
             except SessionError as exc:
                 output(f"会话未保存：{exc}")
             continue
+        if command in {"/检查点", "/checkpoint"}:
+            name = argument.strip()
+            if not name:
+                output("用法：/检查点 <名称>")
+                continue
+            try:
+                if session_store.exists(name):
+                    try:
+                        answer = input_fn(f"会话 {name!r} 已存在。确认覆盖？[y/N] ")
+                    except (EOFError, KeyboardInterrupt):
+                        output("已取消检查点；现有存档未改变。")
+                        continue
+                    if answer.strip().casefold() not in {"y", "yes", "是"}:
+                        output("已取消检查点；现有存档未改变。")
+                        continue
+                note = input_fn(
+                    "请手写愿意保存的进度摘要；不会自动读取会话、文件或工具结果：\n检查点> "
+                )
+                redacted, replacements = session_store.preview_checkpoint(note)
+            except (EOFError, KeyboardInterrupt):
+                output("已取消检查点；没有写入存档。")
+                continue
+            except SessionError as exc:
+                output(f"检查点未保存：{exc}")
+                continue
+            output(
+                f"检查点预览（疑似凭据替换 {replacements} 处；只保存这段用户手写摘要）：\n"
+                f"{_safe_terminal_text(redacted)}"
+            )
+            try:
+                answer = input_fn("确认保存此脱敏检查点？[y/N] ")
+            except (EOFError, KeyboardInterrupt):
+                output("已取消检查点；没有写入存档。")
+                continue
+            if answer.strip().casefold() not in {"y", "yes", "是"}:
+                output("已取消检查点；没有写入存档。")
+                continue
+            try:
+                _, saved_replacements = session_store.save_checkpoint(
+                    name,
+                    note,
+                    usage=agent.usage.to_dict(),
+                )
+            except SessionError as exc:
+                output(f"检查点未保存：{exc}")
+                continue
+            output(f"已保存检查点 {name!r}；凭据脱敏 {saved_replacements} 处。")
+            continue
         if command in {"/恢复", "/load"}:
             if not argument.strip():
                 output("用法：/恢复 <名称>")
@@ -375,12 +431,16 @@ def run_console(
             except DelegationPlanError as exc:
                 output(f"无法生成委派计划：{exc}")
                 continue
-            output(
-                "受限委派计划（仅展示，不启动子代理）：\n"
-                + "\n".join(f"  {index}. {_safe_terminal_text(task)}" for index, task in enumerate(plan.tasks, 1))
-                + f"\n最大深度：{plan.max_child_depth}；每项最多轮数：{plan.max_turns_per_task}；"
-                f"执行：{'开启' if plan.execution_enabled else '关闭'}；Shell：{'开启' if plan.shell_enabled else '关闭'}"
-            )
+            try:
+                outcome = run_bounded_subagents(
+                    plan,
+                    provider,
+                    approve_action=approve_action,
+                )
+            except DelegationPlanError as exc:
+                output(f"无法执行受限子代理计划：{exc}")
+                continue
+            output(_safe_terminal_text(outcome.summary))
             continue
         if command in {"/撤销", "/undo"}:
             try:
