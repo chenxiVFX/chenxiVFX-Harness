@@ -4,15 +4,37 @@ import argparse
 import os
 import re
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Callable
 
 from .agent import Agent
 from .providers import ProviderError, provider_from_environment
-from .tools import Workspace, WorkspaceError
+from .tools import ActionRequest, Workspace, WorkspaceError
 
 _REFERENCE = re.compile(r"(?<![\w@])@(?:\{([^{}]+)\}|([^\s]+))", re.UNICODE)
 _TRAILING_PUNCTUATION = ",，。;；!?！？)]}"
+
+
+def _safe_terminal_text(text: str) -> str:
+    """Render model-controlled control/format characters visibly, not as terminal codes."""
+    visible: list[str] = []
+    for char in text:
+        if char == "\n":
+            visible.append(char)
+            continue
+        category = unicodedata.category(char)
+        if category.startswith("C"):
+            codepoint = ord(char)
+            if codepoint <= 0xFF:
+                visible.append(f"\\x{codepoint:02x}")
+            elif codepoint <= 0xFFFF:
+                visible.append(f"\\u{codepoint:04x}")
+            else:
+                visible.append(f"\\U{codepoint:08x}")
+        else:
+            visible.append(char)
+    return "".join(visible)
 
 
 def configure_console_encoding() -> None:
@@ -22,7 +44,13 @@ def configure_console_encoding() -> None:
             reconfigure(encoding="utf-8", errors="replace")
 
 
-def parse_references(text: str, workspace: Workspace) -> tuple[str, list[tuple[str, str]]]:
+def parse_references(
+    text: str,
+    workspace: Workspace,
+    *,
+    approve_action: Callable[[ActionRequest], bool],
+    on_blocked: Callable[[str, str], None] | None = None,
+) -> tuple[str, list[tuple[str, str]]]:
     references: list[tuple[str, str]] = []
     visible_text = text
 
@@ -32,9 +60,18 @@ def parse_references(text: str, workspace: Workspace) -> tuple[str, list[tuple[s
         if not path:
             continue
         try:
+            workspace.resolve(path)
+            if not approve_action(
+                ActionRequest(operation="read", path=path, source="reference")
+            ):
+                if on_blocked is not None:
+                    on_blocked(path, "用户拒绝读取；文件内容未提供给模型")
+                continue
             contents = workspace.read_text(path)
-        except WorkspaceError:
+        except WorkspaceError as exc:
             # Leave unresolvable @mentions untouched so emails and prose remain usable.
+            if on_blocked is not None:
+                on_blocked(path, str(exc))
             continue
         references.insert(0, (path, contents))
         visible_text = visible_text[: match.start()] + visible_text[match.end() :]
@@ -67,19 +104,36 @@ def _help_text() -> str:
     return """命令：
   /帮助              显示帮助
   /状态              显示当前模型、目标和模式
-  /模式 计划|执行    切换计划或执行模式（计划模式会拦截写入）
+  /模式 计划|执行    切换计划或执行模式（计划模式会拦截写入与撤销）
   /目标 <内容>       设置本会话目标；/目标 清空 可清除
+  /撤销              预览并恢复最近一次 Harness 文件写入
   /退出              结束会话
 
 文件引用：在提问中写 @相对路径，或用 @{包含空格的相对路径}。
-写入文件前每次都会显示路径并等待你确认。当前版本不会运行 shell 命令。
+每次文件读取和写入都要人工确认；写入/撤销会先显示完整差异。
+敏感凭据路径默认禁止读取或修改。当前版本不会运行 shell 命令。
 """
 
 
-def _confirm_write(path: str, existed: bool, *, input_fn: Callable[[str], str]) -> bool:
-    action = "覆盖" if existed else "创建"
+def _confirm_action(
+    request: ActionRequest,
+    *,
+    input_fn: Callable[[str], str],
+    output: Callable[[str], None],
+) -> bool:
+    if request.operation == "read":
+        source = "你引用的文件" if request.source == "reference" else "模型请求读取的文件"
+        prompt = f"\n{source} {request.path!r} 会发送给模型。确认读取？[y/N] "
+    elif request.operation == "undo":
+        diff = _safe_terminal_text(request.diff) or "（内容无差异）"
+        output(f"\n撤销差异（备份 {request.backup_id}）：\n{diff}")
+        prompt = f"确认恢复写入前内容 {request.path!r}？[y/N] "
+    else:
+        diff = _safe_terminal_text(request.diff) or "（内容无差异）"
+        output(f"\n写入差异 {request.path!r}：\n{diff}")
+        prompt = f"确认写入此工作区文件？[y/N] "
     try:
-        answer = input_fn(f"\n需要{action}工作区文件 {path!r}。确认？[y/N] ")
+        answer = input_fn(prompt)
     except (EOFError, KeyboardInterrupt):
         return False
     return answer.strip().casefold() in {"y", "yes", "是"}
@@ -99,14 +153,15 @@ def run_console(
         return 2
 
     mode = "执行"
+    approve_action = lambda request: _confirm_action(
+        request, input_fn=input_fn, output=output
+    )
     agent = Agent(
         provider,
         workspace,
-        approve_write=lambda path, existed: _confirm_write(
-            path, existed, input_fn=input_fn
-        ),
+        approve_action=approve_action,
     )
-    output(f"chenxiVFX Harness v0.1.0 | 提供商：{provider.label}")
+    output(f"chenxiVFX Harness v0.2.0 | 提供商：{provider.label}")
     output(f"工作区：{workspace.root}")
     output("输入 /帮助 查看命令。默认使用离线模拟模型。")
 
@@ -158,14 +213,30 @@ def run_console(
                 agent.goal = argument.strip()
             output(f"会话目标：{agent.goal or '（已清空）'}")
             continue
+        if command in {"/撤销", "/undo"}:
+            try:
+                output(
+                    workspace.undo_last(
+                        approve_action=approve_action,
+                        plan_only=mode == "计划",
+                    )
+                )
+            except WorkspaceError as exc:
+                output(f"撤销失败：{exc}")
+            continue
 
-        prompt, references = parse_references(line, workspace)
+        prompt, references = parse_references(
+            line,
+            workspace,
+            approve_action=approve_action,
+            on_blocked=lambda path, reason: output(f"已跳过文件引用 {path!r}：{reason}"),
+        )
         try:
             answer = agent.ask(prompt, references=references, plan_only=mode == "计划")
         except ProviderError as exc:
             output(f"模型请求失败：{exc}")
             continue
-        output(answer)
+        output(_safe_terminal_text(answer))
 
 
 def main(argv: list[str] | None = None) -> int:

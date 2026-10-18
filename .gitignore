@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 .pytest_cache/
 .test-tmp/
+.harness/
 .coverage
 .env
 .env.*
