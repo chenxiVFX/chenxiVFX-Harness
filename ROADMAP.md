@@ -35,11 +35,11 @@
 
 ## 当前恢复点
 
-- 分支 `main`；本轮成果已在 `ef8b82f`、`a0c6ce4` 之后生成中文本地提交。远端同步仍受阻。
+- 分支 `main`；第四轮实现已生成中文本地提交，工作树在保全后保持干净。任务目录中仓库外有经 `git bundle verify` 校验的完整历史 bundle。
 - 仓库最初经授权克隆尝试失败，随后只在新建独立目录中依据 GitHub 公共页面确认的空仓库状态启动；无其他项目文件被改动。
 - 当前工作树为目标仓库唯一开发目标。`.harness/`、`.test-tmp/` 和 Python 缓存均忽略，不放入版本控制。
 - Git 工作区 owner 与执行身份不同；每条 Git 命令仅用一次性 `-c safe.directory=<本仓库绝对路径>`。不修改全局 Git 配置。
-- GitHub 空仓库元数据此前显示允许 push，但本机 DNS/HTTPS 失败；没有实际推送。后续需先由用户/执行环境恢复正常网络，再检查远端 ref，避免覆盖。
+- 本机 `git ls-remote` 仍报 `getaddrinfo() thread failed to start`。GitHub 授权连接器确认仓库可 push，但 `main` ref 查询返回 409 `Git Repository is empty`。连接器没有 Git pack push 能力；使用文件/对象 API 创建快照会改变原有提交链，因此未走该路径。网络恢复后用普通非强推 Git 同步并核验远端 SHA。
 
 ## 风险与未验证项
 
