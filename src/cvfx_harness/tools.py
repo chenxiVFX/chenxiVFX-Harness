@@ -299,10 +299,12 @@ class Workspace:
             changed=before_bytes != new_bytes,
         )
 
-    def _backup_dir(self, *, create: bool) -> Path | None:
+    def internal_storage_dir(self, name: str, *, create: bool) -> Path | None:
+        if name not in {_BACKUP_DIR, "sessions"}:
+            raise WorkspaceError("未授权的 Harness 内部存储目录。")
         control = self.root / _CONTROL_DIR
-        backup_dir = control / _BACKUP_DIR
-        for directory in (control, backup_dir):
+        storage_dir = control / name
+        for directory in (control, storage_dir):
             if not directory.exists():
                 if not create:
                     return None
@@ -321,7 +323,10 @@ class Workspace:
                 raise WorkspaceError("Harness 备份目录必须位于工作区内且不能链接到外部。") from None
             if not directory.is_dir():
                 raise WorkspaceError("Harness 备份路径不是目录。")
-        return backup_dir
+        return storage_dir
+
+    def _backup_dir(self, *, create: bool) -> Path | None:
+        return self.internal_storage_dir(_BACKUP_DIR, create=create)
 
     @staticmethod
     def _atomic_write_bytes(target: Path, data: bytes) -> None:

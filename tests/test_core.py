@@ -536,7 +536,7 @@ class CliTests(unittest.TestCase):
 class ProviderTests(unittest.TestCase):
     def test_openai_request_keeps_key_out_of_body(self) -> None:
         provider = OpenAICompatibleProvider(
-            "https://api.deepseek.com", "NON_SECRET_SENTINEL_943", "deepseek-flash"
+            "https://api.deepseek.com", "TEST_KEY_ONLY", "deepseek-flash"
         )
         captured: dict[str, object] = {}
 
@@ -549,7 +549,10 @@ class ProviderTests(unittest.TestCase):
 
             def read(self, _size):
                 return json.dumps(
-                    {"choices": [{"message": {"role": "assistant", "content": "收到"}}]}
+                    {
+                        "choices": [{"message": {"role": "assistant", "content": "收到"}}],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+                    }
                 ).encode("utf-8")
 
         def fake_urlopen(request, timeout):
@@ -563,9 +566,10 @@ class ProviderTests(unittest.TestCase):
             turn = provider.complete([{"role": "user", "content": "你好"}], [])
 
         self.assertEqual(turn.content, "收到")
+        self.assertEqual(turn.usage.prompt_tokens, 5)
         self.assertEqual(captured["url"], "https://api.deepseek.com/chat/completions")
-        self.assertEqual(captured["auth"], "Bearer NON_SECRET_SENTINEL_943")
-        self.assertNotIn("NON_SECRET_SENTINEL_943", captured["body"])
+        self.assertEqual(captured["auth"], "Bearer TEST_KEY_ONLY")
+        self.assertNotIn("TEST_KEY_ONLY", captured["body"])
         self.assertIn("deepseek-flash", captured["body"])
 
     def test_rejects_remote_http_and_missing_key(self) -> None:

@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
+from .usage import ProviderUsage
+
 
 class ProviderError(RuntimeError):
     """A user-safe provider error. Never includes request headers or bodies."""
@@ -25,6 +27,7 @@ class AssistantTurn:
     content: str
     tool_calls: list[ToolCall] = field(default_factory=list)
     assistant_message: dict[str, Any] = field(default_factory=dict)
+    usage: ProviderUsage | None = None
 
 
 class Provider(Protocol):
@@ -175,7 +178,23 @@ class OpenAICompatibleProvider:
             content=content,
             tool_calls=calls,
             assistant_message=assistant_message,
+            usage=self._parse_usage(payload.get("usage")),
         )
+
+    @staticmethod
+    def _parse_usage(value: Any) -> ProviderUsage | None:
+        if not isinstance(value, dict):
+            return None
+        prompt = value.get("prompt_tokens")
+        completion = value.get("completion_tokens")
+        total = value.get("total_tokens")
+        if type(prompt) is not int or type(completion) is not int:
+            return None
+        if prompt < 0 or completion < 0:
+            return None
+        if type(total) is not int or total < 0:
+            total = prompt + completion
+        return ProviderUsage(prompt, completion, total)
 
 
 def provider_from_environment(provider_name: str, model_override: str | None = None) -> Provider:

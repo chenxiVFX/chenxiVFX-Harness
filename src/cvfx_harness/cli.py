@@ -10,7 +10,10 @@ from typing import Callable
 
 from .agent import Agent
 from .providers import ProviderError, provider_from_environment
+from .sessions import SessionError, SessionStore
+from .subagents import DelegationPlanError, build_delegation_plan
 from .tools import ActionRequest, Workspace, WorkspaceError
+from .usage import DEFAULT_TOKEN_BUDGET
 
 _REFERENCE = re.compile(r"(?<![\w@])@(?:\{([^{}]+)\}|([^\s]+))", re.UNICODE)
 _TRAILING_PUNCTUATION = ",，。;；!?！？)]}"
@@ -97,6 +100,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="模型提供商；默认 mock，不会发送网络请求",
     )
     parser.add_argument("--model", default=None, help="覆盖 HARNESS_MODEL")
+    parser.add_argument(
+        "--token-budget",
+        type=int,
+        default=DEFAULT_TOKEN_BUDGET,
+        help="本地上下文预算提示；只是估算，不会限制提供商侧输出上限",
+    )
     return parser
 
 
@@ -106,6 +115,14 @@ def _help_text() -> str:
   /状态              显示当前模型、目标和模式
   /模式 计划|执行    切换计划或执行模式（计划模式会拦截写入与撤销）
   /目标 <内容>       设置本会话目标；/目标 清空 可清除
+  /保存 [名称]       将可安全保存的普通对话保存到工作区 .harness/sessions/
+  /恢复 <名称>       校验并载入会话；替换当前上下文前会询问
+  /会话              列出本工作区的本地会话名称
+  /压缩 [保留轮数]   预览本地上下文压缩；默认保留最近 4 轮，需确认后应用
+  /统计              显示当前估算上下文、预算、累计用量和提供商报告
+  /预算 [tokens]     查看或设置本地预算提示（1024–1000000）
+  /配置              显示非敏感运行配置；密钥值不会显示或保存
+  /子代理 任务 | 任务  生成最多 3 项的受限委派计划；当前只展示计划，不执行
   /撤销              预览并恢复最近一次 Harness 文件写入
   /退出              结束会话
 
@@ -153,6 +170,10 @@ def run_console(
         return 2
 
     mode = "执行"
+    token_budget = getattr(args, "token_budget", DEFAULT_TOKEN_BUDGET)
+    if type(token_budget) is not int or not 1024 <= token_budget <= 1_000_000:
+        output("错误：--token-budget 必须在 1024 到 1000000 之间。")
+        return 2
     approve_action = lambda request: _confirm_action(
         request, input_fn=input_fn, output=output
     )
@@ -160,9 +181,11 @@ def run_console(
         provider,
         workspace,
         approve_action=approve_action,
+        token_budget=token_budget,
     )
-    output(f"chenxiVFX Harness v0.2.0 | 提供商：{provider.label}")
-    output(f"工作区：{workspace.root}")
+    session_store = SessionStore(workspace)
+    output(f"chenxiVFX Harness v0.3.0 | 提供商：{_safe_terminal_text(str(provider.label))}")
+    output(f"工作区：{_safe_terminal_text(str(workspace.root))}")
     output("输入 /帮助 查看命令。默认使用离线模拟模型。")
 
     while True:
@@ -189,11 +212,25 @@ def run_console(
             return 0
         if command in {"/状态", "/status"}:
             output(
-                f"提供商：{provider.label}\n"
-                f"模型：{getattr(provider, 'model', '未知')}\n"
-                f"工作区：{workspace.root}\n"
+                f"提供商：{_safe_terminal_text(str(provider.label))}\n"
+                f"模型：{_safe_terminal_text(str(getattr(provider, 'model', '未知')))}\n"
+                f"工作区：{_safe_terminal_text(str(workspace.root))}\n"
                 f"模式：{mode}\n"
-                f"目标：{agent.goal or '（未设置）'}"
+                f"目标：{_safe_terminal_text(agent.goal) or '（未设置）'}"
+            )
+            continue
+        if command in {"/配置", "/config"}:
+            endpoint = getattr(provider, "endpoint", None)
+            # Provider validates URL credentials/query/fragment at construction.
+            output(
+                f"提供商：{_safe_terminal_text(str(provider.label))}\n"
+                f"模型：{_safe_terminal_text(str(getattr(provider, 'model', '未知')))}\n"
+                f"API 端点：{_safe_terminal_text(str(endpoint or '无（离线模拟）'))}\n"
+                f"工作区：{_safe_terminal_text(str(workspace.root))}\n"
+                f"会话目录：{_safe_terminal_text(str(workspace.root / '.harness' / 'sessions'))}\n"
+                f"Token 预算提示：{agent.token_budget}\n"
+                "密钥：仅可能从当前进程环境读取；此界面不展示、不写入会话\n"
+                "Shell：禁用"
             )
             continue
         if command in {"/模式", "/mode"}:
@@ -211,7 +248,139 @@ def run_console(
                 agent.goal = ""
             else:
                 agent.goal = argument.strip()
-            output(f"会话目标：{agent.goal or '（已清空）'}")
+            output(f"会话目标：{_safe_terminal_text(agent.goal) or '（已清空）'}")
+            continue
+        if command in {"/会话", "/sessions"}:
+            try:
+                names = session_store.list_names()
+                output("本地会话：\n" + ("\n".join(f"  {name}" for name in names) if names else "  （暂无）"))
+            except SessionError as exc:
+                output(f"会话读取失败：{exc}")
+            continue
+        if command in {"/保存", "/save"}:
+            name = argument.strip() or "default"
+            try:
+                if session_store.exists(name):
+                    try:
+                        answer = input_fn(f"会话 {name!r} 已存在。确认覆盖？[y/N] ")
+                    except (EOFError, KeyboardInterrupt):
+                        output("已取消保存；现有存档未改变。")
+                        continue
+                    if answer.strip().casefold() not in {"y", "yes", "是"}:
+                        output("已取消保存；现有存档未改变。")
+                        continue
+                safe_turns = agent.safe_session_turns()
+                saved = session_store.save(
+                    name,
+                    safe_turns,
+                    goal=agent.goal,
+                    usage=agent.usage.to_dict(),
+                )
+                omitted = len(agent.turns) - saved
+                output(f"已保存 {saved} 个安全对话轮次到会话 {name!r}；省略 {omitted} 个不完整、工具或敏感轮次。")
+            except SessionError as exc:
+                output(f"会话未保存：{exc}")
+            continue
+        if command in {"/恢复", "/load"}:
+            if not argument.strip():
+                output("用法：/恢复 <名称>")
+                continue
+            try:
+                loaded = session_store.load(argument.strip())
+            except SessionError as exc:
+                output(f"会话未恢复：{exc}")
+                continue
+            if agent.turns or agent.goal:
+                try:
+                    answer = input_fn("恢复会话将替换当前上下文。确认？[y/N] ")
+                except (EOFError, KeyboardInterrupt):
+                    output("已取消恢复；当前上下文未改变。")
+                    continue
+                if answer.strip().casefold() not in {"y", "yes", "是"}:
+                    output("已取消恢复；当前上下文未改变。")
+                    continue
+            agent.restore(turns=loaded.turns, goal=loaded.goal, usage=loaded.usage)
+            output(f"已恢复会话 {loaded.name!r}，包含 {len(loaded.turns)} 个安全轮次。")
+            continue
+        if command in {"/统计", "/stats"}:
+            context_tokens = agent.estimated_context_tokens()
+            percent = context_tokens * 100 / agent.token_budget
+            stats = agent.usage
+            provider_usage = (
+                f"{stats.provider_usage_reports} 次报告，输入 {stats.provider_prompt_tokens}、输出 {stats.provider_completion_tokens} tokens"
+                if stats.provider_usage_reports
+                else "暂无提供商 usage 报告"
+            )
+            output(
+                f"当前上下文估算：{context_tokens} tokens（预算 {agent.token_budget}，约 {percent:.1f}%）\n"
+                f"累计请求：{stats.requests}\n"
+                f"累计估算输入/输出：{stats.estimated_input_tokens} / {stats.estimated_output_tokens} tokens\n"
+                f"提供商报告：{provider_usage}\n"
+                "估算使用本地字符启发式，不是 tokenizer 精确值；预算仅提示。"
+            )
+            continue
+        if command in {"/预算", "/budget"}:
+            if not argument.strip():
+                output(f"当前 Token 预算提示：{agent.token_budget}")
+                continue
+            try:
+                new_budget = int(argument.strip())
+                if not 1024 <= new_budget <= 1_000_000:
+                    raise ValueError
+            except ValueError:
+                output("用法：/预算 <1024–1000000>")
+                continue
+            agent.token_budget = new_budget
+            output(f"已将本地预算提示设为 {new_budget} tokens。")
+            continue
+        if command in {"/压缩", "/compact"}:
+            try:
+                keep = int(argument.strip()) if argument.strip() else 4
+                preview = agent.preview_compression(keep_recent_turns=keep)
+            except ValueError as exc:
+                output(f"无法预览压缩：{exc}")
+                continue
+            if preview is None:
+                output("没有可安全压缩且能减少估算上下文的旧轮次。")
+                continue
+            summary = next(
+                turn.messages[0]["content"]
+                for turn in preview.replacement
+                if turn.kind == "summary"
+            )
+            output(
+                f"压缩预览：估算 {preview.before_tokens} → {preview.after_tokens} tokens；"
+                f"概括 {preview.summarized_turns} 轮、丢弃旧轮次 {preview.dropped_turns} 个"
+                f"（其中工具轮次 {preview.dropped_tool_turns} 个）。\n"
+                f"将加入以下不可信用户上下文：\n{_safe_terminal_text(summary)}"
+            )
+            try:
+                answer = input_fn("确认应用压缩？[y/N] ")
+            except (EOFError, KeyboardInterrupt):
+                output("已取消压缩；当前上下文未改变。")
+                continue
+            if answer.strip().casefold() not in {"y", "yes", "是"}:
+                output("已取消压缩；当前上下文未改变。")
+                continue
+            try:
+                agent.apply_compression(preview)
+            except ValueError as exc:
+                output(f"压缩未应用：{exc}")
+                continue
+            output("压缩已应用；历史摘要保留为不可信用户消息，系统提示未更改。")
+            continue
+        if command in {"/子代理", "/delegate"}:
+            try:
+                plan = build_delegation_plan(argument)
+            except DelegationPlanError as exc:
+                output(f"无法生成委派计划：{exc}")
+                continue
+            output(
+                "受限委派计划（仅展示，不启动子代理）：\n"
+                + "\n".join(f"  {index}. {_safe_terminal_text(task)}" for index, task in enumerate(plan.tasks, 1))
+                + f"\n最大深度：{plan.max_child_depth}；每项最多轮数：{plan.max_turns_per_task}；"
+                f"执行：{'开启' if plan.execution_enabled else '关闭'}；Shell：{'开启' if plan.shell_enabled else '关闭'}"
+            )
             continue
         if command in {"/撤销", "/undo"}:
             try:
@@ -233,6 +402,9 @@ def run_console(
         )
         try:
             answer = agent.ask(prompt, references=references, plan_only=mode == "计划")
+        except KeyboardInterrupt:
+            output("\n已取消当前模型请求；不完整轮次不会写入会话存档。")
+            continue
         except ProviderError as exc:
             output(f"模型请求失败：{exc}")
             continue
