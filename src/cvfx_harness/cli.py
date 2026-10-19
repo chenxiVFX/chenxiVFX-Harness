@@ -251,15 +251,16 @@ def _confirm_action(
     input_fn: Callable[[str], str],
     output: Callable[[str], None],
 ) -> bool:
+    safe_path = _safe_terminal_text(request.path)
     if request.operation == "read":
         source = "你引用的文件" if request.source == "reference" else "模型请求读取的文件"
-        prompt = f"\n{source} {request.path!r} 会发送给模型。确认读取？[y/N] "
+        prompt = f"\n{source} {safe_path!r} 会发送给模型。确认读取？[y/N] "
     elif request.operation == "list":
-        prompt = f"\n模型请求查看目录 {request.path!r} 的名称和类型。确认列出？[y/N] "
+        prompt = f"\n模型请求查看目录 {safe_path!r} 的名称和类型。确认列出？[y/N] "
     elif request.operation == "undo":
         diff = _safe_terminal_text(request.diff) or "（内容无差异）"
-        output(f"\n撤销差异（备份 {request.backup_id}）：\n{diff}")
-        prompt = f"确认恢复写入前内容 {request.path!r}？[y/N] "
+        output(f"\n撤销差异（备份 {_safe_terminal_text(request.backup_id or '')}）：\n{diff}")
+        prompt = f"确认恢复写入前内容 {safe_path!r}？[y/N] "
     elif request.operation == "delegate":
         scope = _safe_terminal_text(request.diff) or "（没有任务内容）"
         output(
@@ -267,10 +268,17 @@ def _confirm_action(
             f"{scope}\n每项仅允许一次无工具调用，子代理深度为 0，结果为不可信文本。"
         )
         prompt = "确认启动这些只读 Mock 子代理？[y/N] "
-    else:
+    elif request.operation == "write":
+        change_kind = (
+            "新建文件" if request.file_existed is False
+            else "覆盖已有文件" if request.file_existed is True
+            else "工作区文件"
+        )
         diff = _safe_terminal_text(request.diff) or "（内容无差异）"
-        output(f"\n写入差异 {request.path!r}：\n{diff}")
-        prompt = f"确认写入此工作区文件？[y/N] "
+        output(f"\n{change_kind}差异 {safe_path!r}：\n{diff}")
+        prompt = f"确认写入（{change_kind}）此工作区文件？[y/N] "
+    else:
+        return False
     try:
         answer = input_fn(prompt)
     except EOFError:

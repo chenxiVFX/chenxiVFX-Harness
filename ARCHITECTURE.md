@@ -51,7 +51,8 @@ OpenAI 兼容 CLI 通过 `complete_streaming` 使用 `text/event-stream`。SSE �
 - `list_directory` 仅在批准后扫描一个工作区目录；不跟随 symlink/junction，只返回普通文件和目录，最多检查 1000 项并返回 100 项，排除敏感路径与 Harness 内部状态。扫描过程会逐项响应取消信号。操作不读取文件正文。
 - 每个工具请求由本地 Agent 再验证调用编号、参数对象、调用数量和大小；重复编号或无效结构会停止整次未完成轮次，不执行该批次工具。
 - 模型循环上限为 4 轮、每轮执行上限为 4 项；超出的工具调用仍回填“未执行”结果，末轮工具调用全部不执行。每次提问共享 2048 默认输出预算，CLI 可用 `--max-output-tokens` 调整（1–65536）。
-- 读操作每次单独批准；写操作先预览差异，再单独批准并备份；撤销也预览并再次确认。
+- 读操作每次单独批准；模型写入先区分新建/覆盖、预览完整差异，再单独批准，重新核对原始字节并创建可恢复备份后以同目录原子替换。输入拒绝、EOF、取消或无效内容均不写入；已有文件不能被空内容清空。
+- 写入只支持工作区内≤64 KiB 的 UTF-8 文本，拒绝 NUL/控制字符、二进制、链接路径和敏感路径；没有模型删除工具。多个模型写调用各自询问，不批量批准。撤销仍预览并再次确认，计划模式的工具层继续拒绝写入。
 - `.harness/backups` 与 `.harness/sessions` 是 Harness 私有状态，不能通过模型工具访问。
 - `.harness/config/settings.json` 只存 provider/model/Base URL/预算等非敏感设置，拒绝重复键、未识别字段和疑似凭据，不包含 API Key；仅支持 Mock 与 DeepSeek OpenAI 兼容模式。`--ignore-config` 只跳过此文件以便修复损坏配置。
 - 目录 symlink 与硬链接逃逸通过实际链接 fixture 集成测试覆盖；junction 仅适用于 Windows。当前 Linux/Windows 与 Python 3.11/3.12 跨平台 CI 矩阵全部通过；若 Windows 系统拒绝创建测试 fixture，对应 Windows 用例会明确跳过。

@@ -114,6 +114,7 @@ class ActionRequest:
     diff: str = ""
     backup_id: str | None = None
     source: str = "tool"
+    file_existed: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -335,12 +336,17 @@ class Workspace:
         if len(new_bytes) > WRITE_LIMIT_BYTES:
             raise WorkspaceError("单次写入超过 64 KiB 上限。")
 
-        target = self.resolve(relative_path)
+        target = self._resolve_write_target(relative_path)
         if not target.parent.is_dir():
             raise WorkspaceError("目标文件的父目录必须已存在。")
         before_bytes = self._read_snapshot(target)
         existed = before_bytes is not None
         before_content = before_bytes.decode("utf-8") if before_bytes is not None else ""
+        if existed and content == "" and before_bytes != b"":
+            raise WorkspaceError("拒绝清空已有文件；当前没有删除文件工具。")
+        self._validate_writable_text(content)
+        if existed:
+            self._validate_writable_text(before_content)
         canonical_path = target.relative_to(self.root).as_posix()
         diff = self._diff(canonical_path, before_content, content, before_exists=existed)
         return WritePreview(
@@ -354,6 +360,25 @@ class Workspace:
             diff=diff,
             changed=before_bytes != new_bytes,
         )
+
+    @staticmethod
+    def _validate_writable_text(content: str) -> None:
+        if any(
+            unicodedata.category(char) == "Cc" and char not in "\t\r\n"
+            for char in content
+        ):
+            raise WorkspaceError("拒绝写入包含 NUL 或控制字符的二进制内容。")
+
+    def _resolve_write_target(self, relative_path: str) -> Path:
+        target = self.resolve(relative_path)
+        current = self.root
+        for part in Path(relative_path).parts:
+            if part in {"", "."}:
+                continue
+            current = current / part
+            if self._is_reparse_point(current):
+                raise WorkspaceError("拒绝通过 symlink/junction 路径写入文件。")
+        return target
 
     def internal_storage_dir(self, name: str, *, create: bool) -> Path | None:
         if name not in {_BACKUP_DIR, "sessions", "config", "plans"}:
@@ -415,16 +440,16 @@ class Workspace:
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         Workspace._atomic_write_bytes(target, encoded)
 
-    def commit_write(self, preview: WritePreview) -> str | None:
+    def commit_write(
+        self,
+        preview: WritePreview,
+        *,
+        cancellation_event: Any | None = None,
+    ) -> str | None:
         if not preview.changed:
             return None
 
-        current_target = self.resolve(preview.path)
-        if current_target != preview.target:
-            raise WorkspaceError("审批后目标路径发生变化；为防止写错文件，本次操作已取消。")
-        current_bytes = self._read_snapshot(current_target)
-        if current_bytes != preview.before_bytes:
-            raise WorkspaceError("审批预览后文件发生变化；请重新请求并检查新的差异。")
+        current_target = self._revalidate_write_preview(preview)
 
         backup_dir = self._backup_dir(create=True)
         assert backup_dir is not None
@@ -447,14 +472,26 @@ class Workspace:
         backup_path = backup_dir / f"{backup_id}.json"
         self._atomic_write_json(backup_path, record)
         try:
+            _raise_if_cancelled(cancellation_event)
+            current_target = self._revalidate_write_preview(preview)
+            _raise_if_cancelled(cancellation_event)
             self._atomic_write_bytes(current_target, new_bytes)
-        except WorkspaceError:
+        except (WorkspaceError, ProviderCancelled):
             try:
                 backup_path.unlink()
             except OSError:
                 pass
             raise
         return backup_id
+
+    def _revalidate_write_preview(self, preview: WritePreview) -> Path:
+        current_target = self._resolve_write_target(preview.path)
+        if current_target != preview.target:
+            raise WorkspaceError("审批后目标路径发生变化；为防止写错文件，本次操作已取消。")
+        current_bytes = self._read_snapshot(current_target)
+        if current_bytes != preview.before_bytes:
+            raise WorkspaceError("审批预览后文件发生变化；请重新请求并检查新的差异。")
+        return current_target
 
     def _load_backups(self) -> list[tuple[Path, dict[str, Any]]]:
         backup_dir = self._backup_dir(create=False)
@@ -695,11 +732,15 @@ def run_tool(
             path=path,
             diff=preview.diff,
             source="tool",
+            file_existed=preview.existed,
         )
         if not approve_action(request):
             return "用户拒绝本次写入；文件未修改，也未创建撤销备份。"
         _raise_if_cancelled(cancellation_event)
-        backup_id = workspace.commit_write(preview)
+        backup_id = workspace.commit_write(
+            preview,
+            cancellation_event=cancellation_event,
+        )
         if backup_id is None:
             return "文件内容已经相同，没有写入。"
         return f"已写入工作区文件并创建撤销备份 {backup_id}：{path}"

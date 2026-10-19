@@ -402,6 +402,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("撤销备份", result)
         self.assertEqual(file.read_text(encoding="utf-8"), "新内容\n")
         self.assertEqual(requests[0].operation, "write")
+        self.assertTrue(requests[0].file_existed)
         self.assertIn("-旧内容", requests[0].diff)
         self.assertIn("+新内容", requests[0].diff)
 
@@ -508,6 +509,106 @@ class WorkspaceTests(unittest.TestCase):
             run_tool(self.workspace, self.write_call("race.txt", "after"), approve_action=change_during_approval)
         self.assertEqual(file.read_text(encoding="utf-8"), "changed during approval")
 
+    def test_commit_rechecks_after_backup_creation_before_atomic_write(self) -> None:
+        file = self.root / "backup-race.txt"
+        file.write_text("before", encoding="utf-8")
+        original = Workspace._atomic_write_json
+
+        def mutate_during_backup(target: Path, value: dict[str, object]) -> None:
+            file.write_text("changed during backup", encoding="utf-8")
+            original(target, value)
+
+        with patch.object(Workspace, "_atomic_write_json", side_effect=mutate_during_backup):
+            with self.assertRaisesRegex(WorkspaceError, "预览后文件发生变化"):
+                run_tool(
+                    self.workspace,
+                    self.write_call("backup-race.txt", "after"),
+                    approve_action=self.approve(),
+                )
+        self.assertEqual(file.read_text(encoding="utf-8"), "changed during backup")
+        backups = self.root / ".harness" / "backups"
+        self.assertEqual(list(backups.glob("*.json")), [])
+
+    def test_cancellation_after_backup_creation_removes_backup_without_writing(self) -> None:
+        file = self.root / "cancel-race.txt"
+        file.write_text("before", encoding="utf-8")
+        cancellation_event = threading.Event()
+        original = Workspace._atomic_write_json
+
+        def cancel_after_backup(target: Path, value: dict[str, object]) -> None:
+            original(target, value)
+            cancellation_event.set()
+
+        with patch.object(Workspace, "_atomic_write_json", side_effect=cancel_after_backup):
+            with self.assertRaises(ProviderCancelled):
+                run_tool(
+                    self.workspace,
+                    self.write_call("cancel-race.txt", "after"),
+                    approve_action=self.approve(),
+                    cancellation_event=cancellation_event,
+                )
+        self.assertEqual(file.read_text(encoding="utf-8"), "before")
+        backups = self.root / ".harness" / "backups"
+        self.assertEqual(list(backups.glob("*.json")), [])
+
+    def test_write_rejects_deletion_and_binary_text_before_approval(self) -> None:
+        nonempty = self.root / "keep.txt"
+        nonempty.write_text("must stay", encoding="utf-8")
+        utf8_with_nul = self.root / "nul.txt"
+        utf8_with_nul.write_bytes(b"a\x00b")
+        invalid_utf8 = self.root / "binary.bin"
+        invalid_utf8.write_bytes(b"\x89PNG\x00\xff")
+
+        invalid_writes = (
+            ("keep.txt", ""),
+            ("new-nul.txt", "a\x00b"),
+            ("new-escape.txt", "a\x1b[31m"),
+            ("nul.txt", "replacement"),
+            ("binary.bin", "replacement"),
+            (".env", "not allowed"),
+            (".harness/config/settings.json", "{}"),
+            ("../outside.txt", "not allowed"),
+        )
+        for path, content in invalid_writes:
+            with self.subTest(path=path), self.assertRaises(WorkspaceError):
+                run_tool(
+                    self.workspace,
+                    self.write_call(path, content),
+                    approve_action=lambda _request: self.fail("invalid write must not prompt"),
+                )
+        self.assertEqual(nonempty.read_text(encoding="utf-8"), "must stay")
+        self.assertEqual(utf8_with_nul.read_bytes(), b"a\x00b")
+        self.assertEqual(invalid_utf8.read_bytes(), b"\x89PNG\x00\xff")
+        self.assertFalse((self.root / ".harness").exists())
+
+    def test_write_refuses_internal_symlink_targets_before_approval(self) -> None:
+        real_file = self.root / "real.txt"
+        real_file.write_text("original", encoding="utf-8")
+        file_link = self.root / "alias.txt"
+        linked_directory = self.root / "real-dir"
+        linked_directory.mkdir()
+        nested_file = linked_directory / "nested.txt"
+        nested_file.write_text("nested", encoding="utf-8")
+        directory_link = self.root / "alias-dir"
+        try:
+            file_link.symlink_to(real_file)
+            directory_link.symlink_to(linked_directory, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            if os.name == "nt":
+                self.skipTest(f"Windows runner 未允许创建 symlink fixture：{type(exc).__name__}")
+            raise
+
+        for path in ("alias.txt", "alias-dir/nested.txt"):
+            with self.subTest(path=path), self.assertRaisesRegex(WorkspaceError, "symlink/junction"):
+                run_tool(
+                    self.workspace,
+                    self.write_call(path, "changed"),
+                    approve_action=lambda _request: self.fail("linked write must not prompt"),
+                )
+        self.assertEqual(real_file.read_text(encoding="utf-8"), "original")
+        self.assertEqual(nested_file.read_text(encoding="utf-8"), "nested")
+        self.assertFalse((self.root / ".harness").exists())
+
     def test_corrupt_backup_is_rejected_without_touching_target(self) -> None:
         run_tool(
             self.workspace,
@@ -525,6 +626,7 @@ class WorkspaceTests(unittest.TestCase):
             self.write_call("missing-parent/file.txt", "value"),
             self.write_call("large.txt", "x" * (64 * 1024 + 1)),
             self.write_call("type.txt", "value", extra="not allowed"),
+            self.write_call("approval.txt", "value", approval=True),
         )
         for call in invalid_calls:
             with self.subTest(path=call.arguments.get("path")), self.assertRaises(WorkspaceError):
@@ -622,6 +724,7 @@ class AgentTests(unittest.TestCase):
             agent = Agent(provider, workspace, approve_action=self._approval(approvals))
             self.assertEqual(agent.ask("创建文件"), "已完成。")
             self.assertEqual(approvals[0].operation, "write")
+            self.assertFalse(approvals[0].file_existed)
             self.assertEqual((Path(temp) / "你好.txt").read_text(encoding="utf-8"), "写入成功")
             self.assertEqual(provider.requests[1][-1]["role"], "tool")
 
@@ -922,16 +1025,19 @@ class CliTests(unittest.TestCase):
         with make_test_temp() as temp:
             workspace = Workspace(temp)
             (Path(temp) / "existing.txt").write_text("before\n", encoding="utf-8")
-            arguments = {"path": "existing.txt", "content": "after\x1b[31m\n"}
+            arguments = {"path": "existing.txt", "content": "after\n"}
             provider = ScriptedProvider([
                 AssistantTurn(
                     "",
-                    [ToolCall("1", "write_file", arguments)],
+                    [
+                        ToolCall("1", "write_file", arguments),
+                        ToolCall("2", "write_file", {"path": "new.txt", "content": "new file\n"}),
+                    ],
                     {"role": "assistant", "content": None},
                 ),
                 AssistantTurn("写入成功。", assistant_message={"role": "assistant", "content": "写入成功。"}),
             ])
-            inputs = iter(["替换文件", "y", "/撤销", "y", "/退出"])
+            inputs = iter(["替换文件", "y", "n", "/撤销", "y", "/退出"])
             prompts: list[str] = []
             outputs: list[str] = []
 
@@ -944,13 +1050,53 @@ class CliTests(unittest.TestCase):
                 rc = run_console(args, input_fn=input_fn, output=outputs.append)
             self.assertEqual(rc, 0)
             self.assertEqual((Path(temp) / "existing.txt").read_text(encoding="utf-8"), "before\n")
-            self.assertEqual(sum("确认写入" in prompt for prompt in prompts), 1)
+            self.assertFalse((Path(temp) / "new.txt").exists())
+            self.assertEqual(sum("确认写入" in prompt for prompt in prompts), 2)
+            self.assertTrue(any("覆盖已有文件" in prompt for prompt in prompts))
+            self.assertTrue(any("新建文件" in prompt for prompt in prompts))
             self.assertEqual(sum("确认恢复" in prompt for prompt in prompts), 1)
             combined = "\n".join(outputs)
             self.assertIn("-before", combined)
-            self.assertIn("+after\\x1b[31m", combined)
+            self.assertIn("+after", combined)
             self.assertNotIn("\x1b", combined)
+            self.assertIn("覆盖已有文件差异", combined)
+            self.assertIn("新建文件差异", combined)
+            self.assertIn("拒绝本次写入", provider.requests[1][-1]["content"])
             self.assertIn("撤销差异", combined)
+
+    def test_write_approval_rejection_eof_cancel_and_invalid_input_never_write(self) -> None:
+        modes = ("no", "invalid", "eof", "interrupt")
+        for mode in modes:
+            with self.subTest(mode=mode), make_test_temp(prefix="write-cancel-") as temp:
+                provider = ScriptedProvider([
+                    AssistantTurn("", [ToolCall("1", "write_file", {"path": "new.txt", "content": "value"})]),
+                    AssistantTurn("结束", assistant_message={"role": "assistant", "content": "结束"}),
+                ])
+                outputs: list[str] = []
+                prompts: list[str] = []
+                first_user_input = True
+
+                def input_fn(prompt: str) -> str:
+                    nonlocal first_user_input
+                    prompts.append(prompt)
+                    if prompt.startswith("你["):
+                        if first_user_input:
+                            first_user_input = False
+                            return "请新建文件"
+                        return "/退出"
+                    if mode == "eof":
+                        raise EOFError
+                    if mode == "interrupt":
+                        raise KeyboardInterrupt
+                    return "n" if mode == "no" else "maybe"
+
+                args = SimpleNamespace(workspace=temp, provider="mock", model=None)
+                with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                    rc = run_console(args, input_fn=input_fn, output=outputs.append)
+                self.assertEqual(rc, 0)
+                self.assertFalse((Path(temp) / "new.txt").exists())
+                self.assertFalse((Path(temp) / ".harness" / "backups").exists())
+                self.assertEqual(sum("确认写入" in prompt for prompt in prompts), 1)
 
 
 class ProviderTests(unittest.TestCase):
@@ -1076,6 +1222,80 @@ class ProviderTests(unittest.TestCase):
         self.assertTrue(request_bodies[0]["tools"])
         self.assertEqual(request_bodies[1]["messages"][-1]["role"], "tool")
         self.assertIsNone(request_bodies[0].get("authorization"))
+
+    def test_local_sse_fixture_writes_only_after_explicit_diff_approval(self) -> None:
+        request_bodies: list[dict[str, object]] = []
+        author_args = json.dumps(
+            {"path": "new.txt", "content": "本地合成文件\n"},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        responses = [
+            fixture_sse_frames([
+                {"choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "write-local-1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": author_args},
+                }]}, "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+            ]),
+            fixture_sse_frames([
+                {"choices": [{"index": 0, "delta": {"content": "写入完成"}, "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            ]),
+        ]
+
+        def serve(handler, request_body: bytes) -> None:
+            request_bodies.append(json.loads(request_body.decode("utf-8")))
+            response = responses.pop(0)
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            handler.send_header("Content-Length", str(len(response)))
+            handler.end_headers()
+            handler.wfile.write(response)
+
+        server, worker = local_http_fixture(serve)
+        outputs: list[str] = []
+        streamed: list[str] = []
+        prompts: list[str] = []
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "fixture-model", stream_timeout=2.0
+            )
+            with make_test_temp(prefix="sse-write-loop-") as temp:
+                inputs = iter(["请新建合成文件", "y", "/退出"])
+                args = SimpleNamespace(workspace=temp, provider="openai", model=None)
+
+                def input_fn(prompt: str) -> str:
+                    prompts.append(prompt)
+                    return next(inputs)
+
+                with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                    rc = run_console(
+                        args,
+                        input_fn=input_fn,
+                        output=outputs.append,
+                        stream_write=streamed.append,
+                    )
+                target = Path(temp) / "new.txt"
+                self.assertEqual(rc, 0)
+                self.assertEqual(target.read_text(encoding="utf-8"), "本地合成文件\n")
+                self.assertTrue((Path(temp) / ".harness" / "backups").is_dir())
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+        self.assertEqual(len(request_bodies), 2)
+        self.assertTrue(request_bodies[0]["stream"])
+        self.assertTrue(any(tool["function"]["name"] == "write_file" for tool in request_bodies[0]["tools"]))
+        self.assertEqual(request_bodies[1]["messages"][-1]["role"], "tool")
+        self.assertIn("已写入工作区文件", request_bodies[1]["messages"][-1]["content"])
+        self.assertTrue(any("确认写入（新建文件）" in prompt for prompt in prompts))
+        self.assertIn("新建文件差异", "\n".join(outputs))
+        self.assertIn("+++ b/new.txt", "\n".join(outputs))
+        self.assertEqual("".join(streamed), "写入完成\n")
 
     def test_incomplete_sse_tool_call_never_reaches_tool_approval(self) -> None:
         partial = fixture_sse_frames([
