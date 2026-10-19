@@ -17,10 +17,14 @@ def main() -> int:
     suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"))
     result = unittest.TextTestRunner(stream=sys.stdout, verbosity=2).run(suite)
     if result.wasSuccessful():
+        expected_failures = len(result.expectedFailures)
+        passed = result.testsRun - len(result.skipped) - expected_failures
+        summary = (
+            f"total={result.testsRun}, passed={passed}, skipped={len(result.skipped)}, "
+            f"expected_failures={expected_failures}"
+        )
         print(
-            f"Offline tests: total={result.testsRun}, "
-            f"passed={result.testsRun - len(result.skipped)}, "
-            f"skipped={len(result.skipped)}",
+            f"::notice title=Offline test results::{_annotation(summary)}",
             flush=True,
         )
         return 0
