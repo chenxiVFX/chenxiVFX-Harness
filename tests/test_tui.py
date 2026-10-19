@@ -137,13 +137,13 @@ class PromptToolkitTests(unittest.TestCase):
         ]
         change_set_values = [
             item.text
-            for item in completer.get_completions(Document("/变更集 恢"), CompleteEvent())
+            for item in completer.get_completions(Document("/变更集 "), CompleteEvent())
         ]
         self.assertEqual(plan_values, ["接受"])
         self.assertEqual(compression_values, ["撤销"])
         self.assertIn("编辑", config_values)
         self.assertEqual(provider_values, ["deepseek-anthropic"])
-        self.assertEqual(change_set_values, ["恢复"])
+        self.assertEqual(change_set_values, ["列表", "证据", "恢复"])
 
     def test_tui_config_editor_reviews_then_persists_through_input_events(self) -> None:
         from cvfx_harness.config import WorkspaceConfigStore

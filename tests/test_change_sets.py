@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -14,7 +15,15 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from cvfx_harness.cli import _confirm_action, _completion_matches, build_parser, run_console
 from cvfx_harness.providers import ToolCall
-from cvfx_harness.tools import ActionRequest, Workspace, WorkspaceConflictError, WorkspaceError, run_tool
+from cvfx_harness.tools import (
+    CHANGE_SET_BACKUP_SCAN_LIMIT,
+    CHANGE_SET_JOURNAL_SCAN_LIMIT,
+    ActionRequest,
+    Workspace,
+    WorkspaceConflictError,
+    WorkspaceError,
+    run_tool,
+)
 
 from test_core import _set_windows_dacl_protection, cli_subprocess_env, make_test_temp
 
@@ -61,12 +70,16 @@ class ChangeSetTests(unittest.TestCase):
         return ToolCall("change-set-call", "apply_change_set", {"changes": changes})
 
     def make_interrupted_fully_applied_set(self) -> str:
+        return self.make_interrupted_set_after_commit(2)
+
+    def make_interrupted_set_after_commit(self, kill_after_commit: int) -> str:
         script = r'''
 import hashlib, os, sys
 from pathlib import Path
 from cvfx_harness.tools import Workspace
 
 root = Path(sys.argv[1])
+kill_after_commit = int(sys.argv[2])
 workspace = Workspace(root)
 changes = []
 for name, old, new in (("a.txt", "旧值甲", "新值甲"), ("b.txt", "旧值乙", "新值乙")):
@@ -74,18 +87,18 @@ for name, old, new in (("a.txt", "旧值甲", "新值甲"), ("b.txt", "旧值乙
     changes.append({"path": name, "expected_sha256": hashlib.sha256(data).hexdigest(), "old_text": old, "new_text": new})
 real_commit = Workspace.commit_write
 calls = 0
-def kill_after_second(self, preview, **kwargs):
+def kill_after_nth(self, preview, **kwargs):
     global calls
     backup = real_commit(self, preview, **kwargs)
     calls += 1
-    if calls == 2:
+    if calls == kill_after_commit:
         os._exit(75)
     return backup
-Workspace.commit_write = kill_after_second
+Workspace.commit_write = kill_after_nth
 workspace.apply_change_set(changes, approve_action=lambda _request: True)
 '''
         result = subprocess.run(
-            [sys.executable, "-c", script, str(self.root)],
+            [sys.executable, "-c", script, str(self.root), str(kill_after_commit)],
             cwd=ROOT,
             env=cli_subprocess_env(str(self.root)),
             capture_output=True,
@@ -119,6 +132,136 @@ workspace.apply_change_set(changes, approve_action=lambda _request: True)
         backups = [data for _path, data in self.workspace._load_backups() if data.get("change_set_id") == requests[0].path]
         self.assertEqual(len(backups), 2)
         self.assertTrue(all(data["before_exists"] is True for data in backups))
+        self.assertEqual(self.workspace.describe_incomplete_change_sets(), "没有未完成的多文件变更集。")
+
+    def test_terminal_journal_cannot_hide_contradictory_file_states(self) -> None:
+        requests: list[ActionRequest] = []
+        self.workspace.apply_change_set(self.changes(), approve_action=self.approval(requests))
+        journal = self.root / ".harness" / "change-sets" / f"{requests[0].path}.json"
+        original = json.loads(journal.read_text(encoding="utf-8"))
+        cases = (
+            ("completed", "applying"),
+            ("completed", "pending"),
+            ("rolled_back", "committed"),
+            ("recovered", "committed"),
+        )
+        for state, status in cases:
+            with self.subTest(state=state, status=status):
+                contradicted = json.loads(json.dumps(original))
+                contradicted["state"] = state
+                contradicted["files"][0]["status"] = status
+                journal.write_text(json.dumps(contradicted), encoding="utf-8")
+                with self.assertRaisesRegex(WorkspaceError, "终态与文件状态矛盾"):
+                    self.workspace.describe_incomplete_change_sets()
+        journal.write_text(json.dumps(original), encoding="utf-8")
+        self.assertEqual(self.workspace.describe_incomplete_change_sets(), "没有未完成的多文件变更集。")
+
+    def test_corrupt_escaped_and_linked_journals_remain_fail_closed(self) -> None:
+        requests: list[ActionRequest] = []
+        self.workspace.apply_change_set(self.changes(), approve_action=self.approval(requests))
+        journal = self.root / ".harness" / "change-sets" / f"{requests[0].path}.json"
+        original = json.loads(journal.read_text(encoding="utf-8"))
+
+        journal.write_bytes(b"{broken json")
+        with self.assertRaisesRegex(WorkspaceError, "损坏或无法读取"):
+            self.workspace.describe_incomplete_change_sets()
+
+        escaped = json.loads(json.dumps(original))
+        escaped["files"][0]["path"] = "../outside.txt"
+        journal.write_text(json.dumps(escaped), encoding="utf-8")
+        with self.assertRaisesRegex(WorkspaceError, "越界或不再安全"):
+            self.workspace.describe_incomplete_change_sets()
+
+        journal.unlink()
+        alternate = self.root / "alternate-journal.json"
+        alternate.write_text(json.dumps(original), encoding="utf-8")
+        try:
+            journal.symlink_to(alternate)
+        except (OSError, NotImplementedError):
+            journal.write_text(json.dumps(original), encoding="utf-8")
+            return
+        with self.assertRaisesRegex(WorkspaceError, "链接形式"):
+            self.workspace.describe_incomplete_change_sets()
+
+    def test_missing_journal_is_reported_from_orphan_batch_backups_without_recovery(self) -> None:
+        change_set_id = self.make_interrupted_set_after_commit(1)
+        journal = self.root / ".harness" / "change-sets" / f"{change_set_id}.json"
+        journal.unlink()
+        before_a = (self.root / "a.txt").read_bytes()
+        before_b = (self.root / "b.txt").read_bytes()
+        self.assertEqual(before_a.decode("utf-8"), "中文段落甲\n新值甲\n")
+        self.assertEqual(before_b.decode("utf-8"), self.sources["b.txt"])
+
+        with self.assertRaisesRegex(WorkspaceError, "不得据此判定为没有待办"):
+            self.workspace.list_incomplete_change_sets()
+        startup = self.workspace.describe_incomplete_change_sets()
+        self.assertIn("孤立批次备份", startup)
+        self.assertIn("不能从备份重建授权", startup)
+        self.assertNotIn("没有未完成的多文件变更集", startup)
+        evidence = self.workspace.describe_change_set_evidence()
+        self.assertIn(change_set_id, evidence)
+        self.assertIn("a.txt", evidence)
+        self.assertIn("备份", evidence)
+        inputs = iter(["/变更集 证据", "/退出"])
+        outputs: list[str] = []
+        args = build_parser().parse_args(["--workspace", str(self.root), "--plain"])
+        self.assertEqual(
+            run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append),
+            0,
+        )
+        self.assertIn("孤立批次备份", "\n".join(outputs))
+        self.assertEqual((self.root / "a.txt").read_bytes(), before_a)
+        self.assertEqual((self.root / "b.txt").read_bytes(), before_b)
+
+    def test_corrupt_orphan_backup_is_uncertain_evidence_not_a_clean_scan(self) -> None:
+        change_set_id = self.make_interrupted_fully_applied_set()
+        journal = self.root / ".harness" / "change-sets" / f"{change_set_id}.json"
+        journal.unlink()
+        batch_backups = [
+            path for path, data in self.workspace._load_backups()
+            if data.get("change_set_id") == change_set_id
+        ]
+        self.assertEqual(len(batch_backups), 2)
+        batch_backups[0].write_bytes(b"{broken json")
+
+        evidence = self.workspace.describe_change_set_evidence()
+        self.assertIn("孤立批次备份", evidence)
+        self.assertIn("无法校验", evidence)
+        self.assertIn("不能判定为无孤立项", evidence)
+        self.assertNotIn("没有未完成的多文件变更集", evidence)
+
+    def test_backup_evidence_scan_limit_does_not_claim_storage_is_clean(self) -> None:
+        backup_dir = self.workspace._backup_dir(create=True)
+        assert backup_dir is not None
+        for index in range(CHANGE_SET_BACKUP_SCAN_LIMIT + 1):
+            backup_id = f"1-{index:032x}"
+            (backup_dir / f"{backup_id}.json").write_text("{}", encoding="utf-8")
+
+        evidence = self.workspace.describe_change_set_evidence()
+        self.assertIn(f"达到 {CHANGE_SET_BACKUP_SCAN_LIMIT} 项上限", evidence)
+        self.assertIn("不能据此判定为无待办", evidence)
+        self.assertNotIn("未发现孤立、损坏或矛盾", evidence)
+
+    def test_journal_evidence_scan_limit_fails_closed(self) -> None:
+        journal_dir = self.workspace._change_set_dir(create=True)
+        assert journal_dir is not None
+        for index in range(CHANGE_SET_JOURNAL_SCAN_LIMIT + 1):
+            (journal_dir / f"{index:032x}.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(WorkspaceError, "超过安全扫描上限"):
+            self.workspace.describe_incomplete_change_sets()
+
+    def test_linked_backup_is_rejected_during_evidence_scan(self) -> None:
+        backup_dir = self.workspace._backup_dir(create=True)
+        assert backup_dir is not None
+        target = self.root / "ordinary-backup.json"
+        target.write_text("{}", encoding="utf-8")
+        linked = backup_dir / f"1-{'a' * 32}.json"
+        try:
+            linked.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("platform policy does not permit a symlink fixture")
+        with self.assertRaisesRegex(WorkspaceError, "链接或非普通文件"):
+            self.workspace.describe_change_set_evidence()
 
     def test_denial_and_plan_mode_do_not_create_private_state_or_modify_files(self) -> None:
         source = {name: (self.root / name).read_bytes() for name in self.sources}
@@ -426,6 +569,9 @@ workspace.apply_change_set(changes, approve_action=lambda _request: True)
         record = self.workspace._load_change_set_record(change_set_id)
         self.assertEqual(record["state"], "recovery_required")
         self.assertEqual([item["status"] for item in record["files"]], ["restore_failed", "restored"])
+        notice = self.workspace.describe_incomplete_change_sets()
+        self.assertIn(change_set_id, notice)
+        self.assertIn("recovery_required", notice)
         self.assertEqual((self.root / "a.txt").read_text(encoding="utf-8"), "中文段落甲\n新值甲\n")
         self.assertEqual((self.root / "b.txt").read_text(encoding="utf-8"), self.sources["b.txt"])
 
@@ -520,6 +666,14 @@ workspace.apply_change_set(changes, approve_action=lambda _request: True)
         records = list((self.root / ".harness" / "change-sets").glob("*.json"))
         self.assertEqual(len(records), 32)
         self.assertFalse(self.workspace.list_incomplete_change_sets())
+        self.assertEqual(self.workspace.describe_incomplete_change_sets(), "没有未完成的多文件变更集。")
+        self.assertTrue(self.workspace._load_backups())
+        retained_ids = {path.stem for path in (self.root / ".harness" / "change-sets").glob("*.json")}
+        self.assertTrue(all(
+            data.get("change_set_id") in retained_ids
+            for _path, data in self.workspace._load_backups()
+            if data.get("change_set_id") is not None
+        ))
 
     def test_cli_approval_renders_complete_diff_and_asks_once(self) -> None:
         request = ActionRequest(
@@ -539,6 +693,7 @@ workspace.apply_change_set(changes, approve_action=lambda _request: True)
         self.assertIn("0123456789abcdef", "\n".join(outputs))
         self.assertIn("乙.txt", "\n".join(outputs))
         self.assertEqual(_completion_matches("/变更集 恢", "恢"), ("恢复",))
+        self.assertEqual(_completion_matches("/变更集 证", "证"), ("证据",))
 
     @unittest.skipUnless(os.name == "nt", "Windows DACL semantics require a Windows fixture")
     def test_windows_dacl_is_retained_through_batch_failure_compensation(self) -> None:

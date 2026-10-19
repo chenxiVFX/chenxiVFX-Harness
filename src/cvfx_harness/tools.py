@@ -58,6 +58,9 @@ CHANGE_SET_BACKUP_LIMIT_BYTES = 256 * 1024
 CHANGE_SET_JOURNAL_LIMIT_BYTES = 16 * 1024
 CHANGE_SET_LOG_LIMIT = 128
 CHANGE_SET_TERMINAL_LOG_RETENTION = 32
+CHANGE_SET_JOURNAL_SCAN_LIMIT = CHANGE_SET_LOG_LIMIT + CHANGE_SET_TERMINAL_LOG_RETENTION
+CHANGE_SET_BACKUP_SCAN_LIMIT = 2048
+CHANGE_SET_EVIDENCE_DISPLAY_LIMIT = 24
 _CHANGE_SET_DIR = "change-sets"
 _CONTROL_DIR = ".harness"
 _BACKUP_DIR = "backups"
@@ -1710,6 +1713,7 @@ class Workspace:
         ):
             raise WorkspaceError("变更集日志格式无效；未自动恢复或执行。")
         seen: set[str] = set()
+        seen_backup_ids: set[str] = set()
         for item in record["files"]:
             if (
                 not isinstance(item, dict)
@@ -1752,6 +1756,36 @@ class Workspace:
             if key in seen:
                 raise WorkspaceError("变更集日志包含重复文件路径；未自动恢复或执行。")
             seen.add(key)
+            if item["backup_id"] in seen_backup_ids:
+                raise WorkspaceError("变更集日志包含重复备份编号；未自动恢复或执行。")
+            seen_backup_ids.add(item["backup_id"])
+        statuses = [item["status"] for item in record["files"]]
+        state = record["state"]
+        if state == "completed" and any(status != "committed" for status in statuses):
+            raise WorkspaceError("变更集终态与文件状态矛盾；未自动恢复或执行。")
+        if state in {"rolled_back", "recovered"} and any(
+            status not in {"restored", "not_applied"} for status in statuses
+        ):
+            raise WorkspaceError("变更集终态与文件状态矛盾；未自动恢复或执行。")
+        if state == "applying":
+            unfinished_seen = False
+            applying_seen = False
+            for status in statuses:
+                if status == "committed" and not unfinished_seen:
+                    continue
+                if status == "applying" and not unfinished_seen and not applying_seen:
+                    applying_seen = True
+                    unfinished_seen = True
+                    continue
+                if status == "pending":
+                    unfinished_seen = True
+                    continue
+                raise WorkspaceError("变更集执行状态与文件状态矛盾；未自动恢复或执行。")
+        if state == "recovery_in_progress" and any(
+            status not in {"restoring", "restored", "not_applied", "conflict"}
+            for status in statuses
+        ):
+            raise WorkspaceError("变更集恢复状态与文件状态矛盾；未自动恢复或执行。")
         return record
 
     def _write_change_set_record(self, record: dict[str, Any]) -> None:
@@ -1798,48 +1832,104 @@ class Workspace:
                 raise WorkspaceError("变更集日志路径规范已变化；未自动恢复或执行。")
         return record
 
-    def list_incomplete_change_sets(self) -> list[dict[str, Any]]:
+    def _list_change_set_records(self) -> list[dict[str, Any]]:
         directory = self._change_set_dir(create=False)
         if directory is None:
             return []
-        records: list[dict[str, Any]] = []
+        paths: list[Path] = []
         try:
-            paths = list(directory.glob("*.json"))
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if not entry.name.endswith(".json"):
+                        continue
+                    if len(paths) >= CHANGE_SET_JOURNAL_SCAN_LIMIT:
+                        raise WorkspaceError(
+                            "变更集日志超过安全扫描上限；没有据此判定为无待办。"
+                        )
+                    paths.append(Path(entry.path))
         except OSError as exc:
             raise WorkspaceError(f"无法列出变更集日志：{type(exc).__name__}") from None
+        records: list[dict[str, Any]] = []
         for path in paths:
             if self._is_reparse_point(path):
                 raise WorkspaceError("拒绝读取链接形式的变更集日志。")
             if re.fullmatch(r"[0-9a-f]{32}", path.stem) is None:
                 raise WorkspaceError("变更集日志名称无效；未自动恢复或执行。")
             record = self._load_change_set_record(path.stem)
-            if record["state"] not in {"completed", "rolled_back", "recovered"}:
-                records.append(record)
+            records.append(record)
         return sorted(records, key=lambda item: (item["created_ns"], item["id"]))
+
+    def list_incomplete_change_sets(self) -> list[dict[str, Any]]:
+        records = self._list_change_set_records()
+        evidence = self._inspect_change_set_backup_evidence(records)
+        if self._change_set_evidence_has_warnings(evidence):
+            raise WorkspaceError(
+                "变更集存储包含孤立、矛盾或无法完整核对的备份证据；"
+                "不得据此判定为没有待办，请使用 /变更集 证据人工核对。"
+            )
+        return [
+            record
+            for record in records
+            if record["state"] not in {"completed", "rolled_back", "recovered"}
+        ]
+
+    @staticmethod
+    def _change_set_evidence_has_warnings(evidence: dict[str, Any]) -> bool:
+        return bool(
+            evidence["orphans"]
+            or evidence["unverified"]
+            or evidence["mismatches"]
+            or evidence["scan_limited"]
+        )
 
     def _prune_change_set_logs(self) -> None:
         directory = self._change_set_dir(create=False)
         if directory is None:
             return
-        incomplete = self.list_incomplete_change_sets()
+        records = self._list_change_set_records()
+        evidence = self._inspect_change_set_backup_evidence(records)
+        if self._change_set_evidence_has_warnings(evidence):
+            raise WorkspaceError(
+                "变更集存储证据无法完整核对；拒绝清理状态日志或开始新批次。"
+            )
+        incomplete = [
+            record
+            for record in records
+            if record["state"] not in {"completed", "rolled_back", "recovered"}
+        ]
         if len(incomplete) >= CHANGE_SET_LOG_LIMIT:
             raise WorkspaceError("未完成变更集已达本地上限；请先审阅并处理恢复项。")
-        terminal: list[tuple[Path, dict[str, Any]]] = []
-        try:
-            paths = list(directory.glob("*.json"))
-        except OSError as exc:
-            raise WorkspaceError(f"无法检查变更集日志：{type(exc).__name__}") from None
-        for path in paths:
-            if self._is_reparse_point(path):
-                raise WorkspaceError("拒绝处理链接形式的变更集日志。")
-            record = self._load_change_set_record(path.stem)
-            if record["state"] in {"completed", "rolled_back", "recovered"}:
-                terminal.append((path, record))
+        terminal = [
+            (self._change_set_path(record["id"], create=False), record)
+            for record in records
+            if record["state"] in {"completed", "rolled_back", "recovered"}
+        ]
         terminal.sort(key=lambda item: (item[1]["created_ns"], item[1]["id"]))
         retained_before_new_log = max(0, CHANGE_SET_TERMINAL_LOG_RETENTION - 1)
         remove_count = max(0, len(terminal) - retained_before_new_log)
-        for path, _record in terminal[:remove_count]:
+        for path, record in terminal[:remove_count]:
+            self._forget_change_set_backup_links(record)
             self._unlink_workspace_file(path)
+
+    def _forget_change_set_backup_links(self, record: dict[str, Any]) -> None:
+        """Drop only the obsolete journal association before pruning a terminal log."""
+        for index, entry in enumerate(record["files"]):
+            records = self._load_backups(backup_id=entry["backup_id"])
+            if not records:
+                if entry["status"] in {"committed", "restored"}:
+                    raise WorkspaceError("终态变更集缺少原始备份；拒绝清理其状态日志。")
+                continue
+            backup_path, backup = records[0]
+            has_batch = "change_set_id" in backup or "change_set_index" in backup
+            if not has_batch:
+                continue
+            if not self._change_set_backup_matches_entry(
+                record["id"], index, entry, backup
+            ):
+                raise WorkspaceError("终态变更集备份关联不一致；拒绝清理其状态日志。")
+            backup.pop("change_set_id", None)
+            backup.pop("change_set_index", None)
+            self._atomic_write_json(backup_path, backup)
 
     @staticmethod
     def _supports_dir_fd_operations() -> bool:
@@ -2719,17 +2809,8 @@ class Workspace:
         digest_items: list[dict[str, Any]] = []
         for index, entry in enumerate(record["files"]):
             backup = backups.get(entry["backup_id"])
-            if backup is not None and (
-                backup.get("change_set_id") != change_set_id
-                or backup.get("change_set_index") != index + 1
-                or backup.get("path") != entry["path"]
-                or backup.get("before_exists") is not True
-                or backup.get("state") not in {"pending", "committed", "conflict"}
-                or backup.get("before_mode") != entry["before_mode"]
-                or backup.get("after_mode") != entry["after_mode"]
-                or backup.get("before_acl_sha256") != entry["before_acl_sha256"]
-                or backup.get("after_acl_permissions_sha256") != entry["after_acl_permissions_sha256"]
-                or backup.get("after_sha256") != entry["after_sha256"]
+            if backup is not None and not self._change_set_backup_matches_entry(
+                change_set_id, index, entry, backup
             ):
                 raise WorkspaceError("变更集备份关联无效；未执行恢复。")
             try:
@@ -3020,6 +3101,8 @@ class Workspace:
                 except WorkspaceError:
                     entry["status"] = "restore_failed"
                     stop_reason = "文件内容已恢复，但备份标记未完成；已停止后续恢复。"
+            if stop_reason:
+                record["state"] = "recovery_required"
             try:
                 self._write_change_set_record(record)
             except WorkspaceError:
@@ -3216,19 +3299,295 @@ class Workspace:
             cancellation_event=cancellation_event,
         )
 
-    def describe_incomplete_change_sets(self) -> str:
-        records = self.list_incomplete_change_sets()
-        if not records:
-            return "没有未完成的多文件变更集。"
-        items = "\n".join(
-            f"{record['id']}：{record['state']}；"
-            + "、".join(f"{entry['path']}（{entry['status']}）" for entry in record["files"])
-            for record in records
-        )
+    @staticmethod
+    def _change_set_backup_matches_entry(
+        change_set_id: str,
+        index: int,
+        entry: dict[str, Any],
+        backup: dict[str, Any],
+    ) -> bool:
         return (
-            f"发现 {len(records)} 个未完成变更集；启动时不会自动恢复或重放审批。\n{items}\n"
-            "使用 /变更集 恢复 <编号> 可审阅当前文件状态，并在单独确认后尝试安全恢复。"
+            backup.get("change_set_id") == change_set_id
+            and backup.get("change_set_index") == index + 1
+            and backup.get("path") == entry["path"]
+            and backup.get("before_exists") is True
+            and backup.get("state") in {"pending", "committed", "conflict"}
+            and backup.get("before_mode") == entry["before_mode"]
+            and backup.get("after_mode") == entry["after_mode"]
+            and backup.get("before_acl_sha256") == entry["before_acl_sha256"]
+            and backup.get("after_acl_permissions_sha256") == entry["after_acl_permissions_sha256"]
+            and backup.get("after_sha256") == entry["after_sha256"]
         )
+
+    def _safe_change_set_evidence_path(self, value: Any) -> str:
+        from .sessions import contains_likely_secret
+
+        if (
+            not isinstance(value, str)
+            or not value
+            or contains_likely_secret(value)
+            or any(
+                unicodedata.category(char).startswith("C")
+                or unicodedata.category(char) in {"Zl", "Zp"}
+                for char in value
+            )
+        ):
+            return "（路径已省略）"
+        try:
+            target = self._resolve_write_target(value)
+            canonical = target.relative_to(self.root).as_posix()
+        except (ValueError, WorkspaceError):
+            return "（路径无法安全核对）"
+        return canonical if canonical == value else "（路径规范已变化）"
+
+    @staticmethod
+    def _backup_error_can_be_reported_as_uncertain(exc: WorkspaceError) -> bool:
+        message = str(exc)
+        return message.startswith((
+            "撤销备份格式无效",
+            "冲突快照格式无效",
+            "撤销备份超过安全大小上限",
+            "无法读取撤销备份：",
+        ))
+
+    def _inspect_change_set_backup_evidence(
+        self,
+        records: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        journals = {record["id"]: record for record in records}
+        expected: dict[str, tuple[str, int, dict[str, Any]]] = {}
+        for record in records:
+            for index, entry in enumerate(record["files"]):
+                expected[entry["backup_id"]] = (record["id"], index, entry)
+
+        result: dict[str, Any] = {
+            "orphans": {},
+            "unverified": [],
+            "mismatches": [],
+            "scan_count": 0,
+            "scan_limited": False,
+        }
+        backup_dir = self._backup_dir(create=False)
+        if backup_dir is not None:
+            try:
+                with os.scandir(backup_dir) as entries:
+                    for entry in entries:
+                        if not entry.name.endswith(".json"):
+                            continue
+                        if result["scan_count"] >= CHANGE_SET_BACKUP_SCAN_LIMIT:
+                            result["scan_limited"] = True
+                            break
+                        result["scan_count"] += 1
+                        match = re.fullmatch(r"([0-9]+-[0-9a-f]{32})\.json", entry.name)
+                        if match is None:
+                            result["unverified"].append(
+                                {"backup_id": None, "batch_id": None, "reason": "名称无效"}
+                            )
+                            continue
+                        backup_id = match.group(1)
+                        path = Path(entry.path)
+                        try:
+                            info = path.lstat()
+                        except FileNotFoundError:
+                            result["unverified"].append(
+                                {"backup_id": backup_id, "batch_id": None, "reason": "扫描期间消失"}
+                            )
+                            continue
+                        except OSError:
+                            result["unverified"].append(
+                                {"backup_id": backup_id, "batch_id": None, "reason": "无法检查"}
+                            )
+                            continue
+                        if (
+                            self._is_reparse_point(path)
+                            or not stat.S_ISREG(info.st_mode)
+                            or getattr(info, "st_nlink", 1) != 1
+                        ):
+                            raise WorkspaceError("拒绝扫描链接或非普通文件形式的撤销备份。")
+                        if info.st_size > WRITE_LIMIT_BYTES * 4:
+                            result["unverified"].append(
+                                {"backup_id": backup_id, "batch_id": None, "reason": "超过大小上限"}
+                            )
+                            continue
+                        try:
+                            loaded = self._load_backups(backup_id=backup_id)
+                        except WorkspaceError as exc:
+                            if not self._backup_error_can_be_reported_as_uncertain(exc):
+                                raise
+                            expected_item = expected.get(backup_id)
+                            result["unverified"].append(
+                                {
+                                    "backup_id": backup_id,
+                                    "batch_id": expected_item[0] if expected_item else None,
+                                    "reason": "格式损坏或无法读取",
+                                }
+                            )
+                            continue
+                        if not loaded:
+                            result["unverified"].append(
+                                {"backup_id": backup_id, "batch_id": None, "reason": "扫描期间消失"}
+                            )
+                            continue
+                        backup = loaded[0][1]
+                        batch_id = backup.get("change_set_id")
+                        if batch_id is None:
+                            continue
+                        if batch_id not in journals:
+                            result["orphans"].setdefault(batch_id, []).append(backup)
+                            continue
+                        expected_item = expected.get(backup_id)
+                        if expected_item is None or expected_item[0] != batch_id or not self._change_set_backup_matches_entry(
+                            batch_id, expected_item[1], expected_item[2], backup
+                        ):
+                            result["mismatches"].append(
+                                {
+                                    "batch_id": batch_id,
+                                    "backup_id": backup_id,
+                                    "entry_index": backup.get("change_set_index"),
+                                    "reason": "备份关联与日志不一致",
+                                }
+                            )
+            except WorkspaceError:
+                raise
+            except OSError as exc:
+                raise WorkspaceError(f"无法完整扫描撤销备份：{type(exc).__name__}") from None
+
+        # Check every journal-referenced backup directly, even if the bounded
+        # directory scan stopped before reaching that file.
+        for record in records:
+            for index, item in enumerate(record["files"]):
+                backup_id = item["backup_id"]
+                try:
+                    loaded = self._load_backups(backup_id=backup_id)
+                except WorkspaceError as exc:
+                    if not self._backup_error_can_be_reported_as_uncertain(exc):
+                        raise
+                    loaded = []
+                    issue = "日志引用的备份格式损坏或无法读取"
+                else:
+                    issue = ""
+                if not loaded:
+                    if item["status"] in {"committed", "restoring", "restore_failed", "restored"}:
+                        result["mismatches"].append(
+                            {
+                                "batch_id": record["id"],
+                                "backup_id": backup_id,
+                                "entry_index": index + 1,
+                                "reason": issue or "日志引用的备份缺失",
+                            }
+                        )
+                    continue
+                backup = loaded[0][1]
+                if not self._change_set_backup_matches_entry(record["id"], index, item, backup):
+                    if not any(
+                        mismatch["batch_id"] == record["id"]
+                        and mismatch["backup_id"] == backup_id
+                        for mismatch in result["mismatches"]
+                    ):
+                        result["mismatches"].append(
+                            {
+                                "batch_id": record["id"],
+                                "backup_id": backup_id,
+                                "entry_index": index + 1,
+                                "reason": "日志引用的备份关联不一致",
+                            }
+                        )
+        return result
+
+    def _describe_change_set_evidence(self, *, detailed: bool) -> str:
+        records = self._list_change_set_records()
+        incomplete = [
+            record
+            for record in records
+            if record["state"] not in {"completed", "rolled_back", "recovered"}
+        ]
+        evidence = self._inspect_change_set_backup_evidence(records)
+        orphan_batches = evidence["orphans"]
+        has_evidence_warning = self._change_set_evidence_has_warnings(evidence)
+        if not incomplete and not has_evidence_warning and not detailed:
+            return "没有未完成的多文件变更集。"
+
+        rendered: list[str] = []
+        if detailed:
+            rendered.append(
+                f"变更集证据检查：日志 {len(records)} 条；未完成 {len(incomplete)} 条；"
+                f"撤销备份扫描 {evidence['scan_count']} 项。"
+            )
+        if incomplete:
+            rendered.append(
+                f"发现 {len(incomplete)} 个未完成变更集；启动时不会自动恢复或重放审批。"
+            )
+            for record in incomplete[:CHANGE_SET_EVIDENCE_DISPLAY_LIMIT]:
+                rendered.append(
+                    f"{record['id']}：{record['state']}；"
+                    + "、".join(
+                        f"{entry['path']}（{entry['status']}）" for entry in record["files"]
+                    )
+                )
+            if len(incomplete) > CHANGE_SET_EVIDENCE_DISPLAY_LIMIT:
+                rendered.append(f"另有 {len(incomplete) - CHANGE_SET_EVIDENCE_DISPLAY_LIMIT} 条未展开。")
+            rendered.append("使用 /变更集 恢复 <编号> 可重新审阅文件状态；恢复仍需单独确认。")
+        elif has_evidence_warning:
+            rendered.append("没有可直接恢复的未完成日志；发现需要人工核对的批次存储证据。")
+
+        if orphan_batches:
+            rendered.append(
+                f"发现 {len(orphan_batches)} 个没有对应批次日志的孤立批次备份；"
+                "启动时不会自动恢复或重放审批；不能从备份重建授权。"
+            )
+            if detailed:
+                for batch_id, backups in list(sorted(orphan_batches.items()))[:CHANGE_SET_EVIDENCE_DISPLAY_LIMIT]:
+                    rendered.append(f"孤立批次 {batch_id}：{len(backups)} 个备份")
+                    for backup in backups[:8]:
+                        safe_path = self._safe_change_set_evidence_path(backup.get("path"))
+                        rendered.append(
+                            f"  备份 {backup['id']}；序号 {backup.get('change_set_index')}；"
+                            f"状态 {backup.get('state', '未知')}；路径 {safe_path}"
+                        )
+                if len(orphan_batches) > CHANGE_SET_EVIDENCE_DISPLAY_LIMIT:
+                    rendered.append(f"另有 {len(orphan_batches) - CHANGE_SET_EVIDENCE_DISPLAY_LIMIT} 个孤立批次未展开。")
+        if evidence["mismatches"]:
+            rendered.append(
+                f"有 {len(evidence['mismatches'])} 项日志/备份关联缺失或矛盾；"
+                "不能据此判定已完成或无待恢复项，也不会自动恢复。"
+            )
+            if detailed:
+                for item in evidence["mismatches"][:CHANGE_SET_EVIDENCE_DISPLAY_LIMIT]:
+                    rendered.append(
+                        f"批次 {item['batch_id']}；序号 {item['entry_index']}；"
+                        f"备份 {item['backup_id']}：{item['reason']}"
+                    )
+        if evidence["unverified"]:
+            rendered.append(
+                f"有 {len(evidence['unverified'])} 个备份条目无法校验；"
+                "可能包含无法识别的批次证据，不能判定为无孤立项。"
+            )
+            if detailed:
+                for item in evidence["unverified"][:CHANGE_SET_EVIDENCE_DISPLAY_LIMIT]:
+                    backup_id = item["backup_id"] or "（文件名无效）"
+                    batch_id = item["batch_id"] or "（批次未知）"
+                    rendered.append(
+                        f"备份 {backup_id}；批次 {batch_id}：{item['reason']}"
+                    )
+        if evidence["scan_limited"]:
+            rendered.append(
+                f"撤销备份扫描达到 {CHANGE_SET_BACKUP_SCAN_LIMIT} 项上限；"
+                "未扫描部分可能还有孤立证据，不能据此判定为无待办。"
+            )
+        if has_evidence_warning:
+            rendered.append(
+                "使用 /变更集 证据 查看安全可显示的本地元数据；核对 .harness/change-sets/、"
+                ".harness/backups/ 与实际文件。孤立备份不会生成恢复命令或授权。"
+            )
+        if detailed and not has_evidence_warning:
+            rendered.append("未发现孤立、损坏或矛盾的批次备份证据；没有执行任何恢复。")
+        return "\n".join(rendered)
+
+    def describe_incomplete_change_sets(self) -> str:
+        return self._describe_change_set_evidence(detailed=False)
+
+    def describe_change_set_evidence(self) -> str:
+        return self._describe_change_set_evidence(detailed=True)
 
     def _load_backups(self, *, backup_id: str | None = None) -> list[tuple[Path, dict[str, Any]]]:
         backup_dir = self._backup_dir(create=False)
@@ -3248,9 +3607,17 @@ class Workspace:
                     return []
                 paths = (candidate,)
             for path in paths:
-                if self._is_reparse_point(path):
-                    raise WorkspaceError(f"拒绝读取链接形式的撤销备份：{path.name}")
-                if path.stat().st_size > WRITE_LIMIT_BYTES * 4:
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    continue
+                if (
+                    self._is_reparse_point(path)
+                    or not stat.S_ISREG(info.st_mode)
+                    or getattr(info, "st_nlink", 1) != 1
+                ):
+                    raise WorkspaceError(f"拒绝读取链接或非普通文件形式的撤销备份：{path.name}")
+                if info.st_size > WRITE_LIMIT_BYTES * 4:
                     raise WorkspaceError(f"撤销备份超过安全大小上限：{path.name}")
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if (

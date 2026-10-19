@@ -71,7 +71,7 @@ _CLI_ENUM_ARGUMENTS = {
     "/压缩": ("撤销",),
     "/计划": ("生成", "显示", "修订", "接受", "拒绝", "添加", "执行", "完成", "阻塞", "取消", "重试", "清空"),
     "/配置": ("显示", "编辑", "重置", "提供商", "模型", "端点", "预算", "输出上限"),
-    "/变更集": ("列表", "恢复"),
+    "/变更集": ("列表", "证据", "恢复"),
 }
 _STREAM_SECRET_TAIL_CHARS = 16
 _STREAM_SECRET_RUN_CHARS = frozenset(
@@ -524,7 +524,8 @@ def _help_text() -> str:
   /子代理 取消 <编号>     请求取消排队中或运行中的子任务
   /子代理 收取 [编号|全部] 将完成结果作为不可信上下文加入主对话
   /子代理 时限 <5–120>    设置后续子任务运行时限（审批/排队不计，最多 120 秒）
-  /变更集 列表      查看未完成多文件变更集；启动时不会自动恢复
+  /变更集 列表      查看未完成批次和可识别的孤立备份；启动时不会自动恢复
+  /变更集 证据      只读检查批次日志/备份关联，孤立备份不会重建授权
   /变更集 恢复 <编号> 显示当前状态与完整恢复差异，单独确认后尝试恢复
   /撤销              预览并恢复最近一次 Harness 文件写入
   /多行              开始多行提问；单独输入 /提交 发送，/取消 丢弃
@@ -1047,7 +1048,10 @@ def run_console(
         if not pending_change_sets.startswith("没有未完成的多文件变更集"):
             output(pending_change_sets)
     except WorkspaceError:
-        output("存在无法安全检查的变更集日志；启动不会自动恢复。请检查工作区 .harness/change-sets/。")
+        output(
+            "存在无法安全检查的变更集日志或备份；启动不会自动恢复。"
+            "请人工核对工作区 .harness/change-sets/ 与 .harness/backups/。"
+        )
 
     def render_draft(
         draft: PlanDraft,
@@ -2114,6 +2118,12 @@ def run_console(
                 except WorkspaceError as exc:
                     output(f"无法列出未完成变更集：{_safe_error_text(exc)}")
                 continue
+            if normalized_subcommand in {"证据", "evidence", "inspect"} and not subargument.strip():
+                try:
+                    output(workspace.describe_change_set_evidence())
+                except WorkspaceError as exc:
+                    output(f"无法安全检查变更集证据：{_safe_error_text(exc)}")
+                continue
             if normalized_subcommand in {"恢复", "recover"} and subargument.strip():
                 if mode == "计划":
                     output("计划模式：已拦截变更集恢复；文件未修改。")
@@ -2131,7 +2141,7 @@ def run_console(
                 except KeyboardInterrupt:
                     output("已取消变更集恢复审批；没有继续恢复文件。")
                 continue
-            output("用法：/变更集 列表 | /变更集 恢复 <编号>")
+            output("用法：/变更集 列表 | /变更集 证据 | /变更集 恢复 <编号>")
             continue
         if command in {"/撤销", "/undo"}:
             try:
