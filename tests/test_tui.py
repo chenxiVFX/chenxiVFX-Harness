@@ -307,9 +307,13 @@ class PromptToolkitTests(unittest.TestCase):
             self.assertIn("确认写入文件？", ui._prompt)
             self.assertNotIn("[y/N]", ui._prompt)
             self.assertTrue(ui._application.layout.has_focus(ui._approval_no_button))
+            self.assertIn("当前", ui._approval_no_button.text)
+            self.assertEqual(ui._approval_yes_button.text, "批准本次")
             pipe.send_text("\t")
             time.sleep(0.05)
             self.assertTrue(ui._approval_choice_yes)
+            self.assertTrue(ui._application.layout.has_focus(ui._approval_yes_button))
+            self.assertIn("当前", ui._approval_yes_button.text)
             self.assertIsNotNone(ui._pending, "selection alone must not approve")
             pipe.send_text("\r")
 
@@ -334,9 +338,15 @@ class PromptToolkitTests(unittest.TestCase):
             time.sleep(0.05)
             self.assertIsNotNone(ui._pending, "Enter in the transcript must not confirm")
             self.assertFalse(ui._approval_choice_yes)
-            ui._application.layout.focus(ui._approval_yes_button)
             ui._approval_yes_button.handler()
             self.assertIsNotNone(ui._pending, "mouse selection alone must not confirm")
+            ui._application.layout.focus(ui.output_area)
+            pipe.send_text("\r")
+            time.sleep(0.05)
+            self.assertIsNotNone(
+                ui._pending, "Enter in transcript must not confirm a selection"
+            )
+            ui._application.layout.focus(ui._approval_yes_button)
             pipe.send_text("\r")
 
         ui, result = self._run_ui(worker, send)
@@ -404,20 +414,28 @@ class PromptToolkitTests(unittest.TestCase):
             self.assertTrue(ui._application.mouse_support())
             self.assertTrue(ui.input_area.control.focus_on_click())
             self.assertTrue(ui.output_area.control.focus_on_click())
-            self.assertTrue(
-                any(
-                    isinstance(margin, ScrollbarMargin)
-                    for margin in ui.output_area.window.right_margins
-                )
-            )
+            scrollbar_margins = [
+                margin
+                for margin in ui.output_area.window.right_margins
+                if isinstance(margin, ScrollbarMargin)
+            ]
+            self.assertEqual(len(scrollbar_margins), 1)
+            self.assertFalse(scrollbar_margins[0].display_arrows())
             current_style = ui._application.style.get_attrs_for_style_str(
                 "class:completion-menu.completion.current"
             )
-            self.assertEqual(current_style.bgcolor, "c6a0f6")
-            self.assertEqual(current_style.color, "1b1722")
+            self.assertEqual(current_style.bgcolor, "6bbdb4")
+            self.assertEqual(current_style.color, "0b0d10")
             self.assertTrue(current_style.bold)
+            self.assertTrue(current_style.underline)
+            current_meta_style = ui._application.style.get_attrs_for_style_str(
+                "class:completion-menu.meta.completion.current"
+            )
+            self.assertEqual(current_meta_style.bgcolor, "6bbdb4")
+            self.assertEqual(current_meta_style.color, "0b0d10")
+            self.assertTrue(current_meta_style.bold)
 
-    def test_status_line_fits_terminal_width_and_approval_keeps_mouse_hint(self) -> None:
+    def test_status_line_is_compact_contextual_and_fits_terminal_width(self) -> None:
         from cvfx_harness.tui import _InputRequest
 
         class SizedDummyOutput(DummyOutput):
@@ -427,7 +445,7 @@ class PromptToolkitTests(unittest.TestCase):
             def get_size(self):
                 return Size(rows=24, columns=self.columns)
 
-        for columns in (36, 64, 80, 100):
+        for columns in (20, 24, 36, 64, 80, 100):
             with self.subTest(columns=columns), create_pipe_input() as pipe:
                 ui = TerminalUI(
                     lambda _ui: 0,
@@ -435,15 +453,62 @@ class PromptToolkitTests(unittest.TestCase):
                     output=SizedDummyOutput(columns),
                 )
                 ui._pending = _InputRequest("输入", False, threading.Event())
-                self.assertLessEqual(wcswidth(ui._status_line()), columns)
+                line = ui._status_line()
+                self.assertLessEqual(wcswidth(line), columns)
+                self.assertIn("等待输入" if columns >= 26 else "输入", line)
+                self.assertLessEqual(wcswidth(ui._empty_hint()), columns)
+                self.assertIn(
+                    "查看命令" if columns >= 42 else "/命令", ui._empty_hint()
+                )
+                self.assertNotIn("Ctrl+C", line)
+                self.assertNotIn("Tab填入", line)
                 ui._notice = "这是一个故意很长的合成状态提示，用来检查窄终端不会裁掉状态栏布局。"
                 self.assertLessEqual(wcswidth(ui._status_line()), columns)
                 ui._notice = ""
                 ui._pending = _InputRequest("确认写入？[y/N]", True, threading.Event())
                 line = ui._status_line()
                 self.assertLessEqual(wcswidth(line), columns)
-                if columns >= 90:
-                    self.assertIn("点击切换", line)
+                self.assertIn("Enter", line)
+                if columns >= 58:
+                    self.assertIn("Esc 取消", line)
+                elif columns < 36:
+                    self.assertNotIn("Tab/↑↓", line)
+
+    def test_empty_state_has_a_centered_invitation_without_persistent_shortcuts(self) -> None:
+        class SizedDummyOutput(DummyOutput):
+            def get_size(self):
+                return Size(rows=24, columns=80)
+
+        def worker(ui: TerminalUI) -> int:
+            ui.output("离线模式，启动完成。")
+            ui.input("你 [执行]> ")
+            return 0
+
+        def send(_pipe, ui: TerminalUI) -> None:
+            self._wait_until(
+                lambda: ui._application.renderer.last_rendered_screen is not None,
+                "empty state did not render",
+            )
+            time.sleep(0.03)
+            screen = ui._application.renderer.last_rendered_screen
+            self.assertIsNotNone(screen)
+            positions = screen.visible_windows_to_write_positions
+            title = positions.get(ui._empty_title_window)
+            hint = positions.get(ui._empty_hint_window)
+            self.assertIsNotNone(title)
+            self.assertIsNotNone(hint)
+            transcript = positions.get(ui.output_area.window)
+            self.assertIsNotNone(transcript)
+            self.assertIn("离线模式，启动完成。", ui._transcript)
+            self.assertGreater(title.ypos, 1)
+            self.assertLess(title.ypos, 20)
+            self.assertGreater(title.ypos, transcript.ypos)
+            self.assertEqual(hint.ypos, title.ypos + 1)
+            self.assertNotIn("Ctrl+J", ui._status_line())
+            ui._resolve_pending(value="")
+
+        ui, result = self._run_ui(worker, send, output=SizedDummyOutput())
+        self.assertEqual(result, 0)
 
     def test_completion_menu_is_clipped_above_prompt_at_varied_terminal_sizes(self) -> None:
         class SizedDummyOutput(DummyOutput):
@@ -686,14 +751,17 @@ class PromptToolkitTests(unittest.TestCase):
                 ui._application.layout.focus(ui.output_area)
                 pipe.send_bytes(b"\r")
                 time.sleep(0.05)
-                self.assertIsNotNone(ui._pending, "Enter outside approval controls must not approve")
+                self.assertIsNotNone(
+                    ui._pending, "Enter outside approval controls must not approve"
+                )
                 self.assertEqual(committed_paths, [])
                 ui._approval_yes_button.handler()
                 self.assertTrue(ui._approval_choice_yes)
                 self.assertIsNotNone(ui._pending, "selection alone must not approve")
+                ui._application.layout.focus(ui.output_area)
                 pipe.send_bytes(b"\r")
                 time.sleep(0.05)
-                self.assertIsNotNone(ui._pending, "mouse selection only must not confirm")
+                self.assertIsNotNone(ui._pending, "Enter outside approval controls must not confirm")
                 ui._application.layout.focus(ui._approval_yes_button)
                 pipe.send_bytes(b"\r\r")
                 self._wait_until(

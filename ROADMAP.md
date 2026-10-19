@@ -183,12 +183,13 @@
 
 - TTY 默认使用固定版本 `prompt-toolkit 3.0.53` 与 `wcwidth 0.9.2`；非 TTY、`TERM=dumb` 或 `--plain` 保留纯文本入口。Windows 单文件构建锁定轮子哈希、扫描依赖清单并携带第三方许可证通知。
 - 实现顶部模型/工作区标识、滚动会话区、固定底部输入和状态栏；`/` 实时列出固定中文命令及简介，`/模式` 仅补固定枚举。候选菜单在输入提示上方保留专用行区，空间不足时裁剪候选并保留输入提示/分隔线；Tab 或 Enter 可填入建议，Enter 再提交完整输入，Ctrl+J 换行，Esc 先关建议再取消，Ctrl+C 先清草稿再请求取消。
+- 视觉迭代加入居中的空会话引导，提交首条输入后收起；统一青绿色强调、低对比候选简介与细分隔线，取消滚动条箭头，并按终端宽度缩短底栏和空状态文案。审批当前选项写进按钮文字且焦点同步，颜色不是区分唯一依据。
 - 审批面板显示动作预览，默认拒绝；不显示 `[y/N]` 文字输入，也不接受输入/粘贴内容。键盘/鼠标只选择按钮，必须另按 Enter 才会给当前操作单次授权；焦点离开审批按钮时 Enter 不会确认，Esc 取消。模型/工具输出会转义终端控制字符、遮蔽疑似凭据并限制缓冲输出长度。
 - TUI 把输入桥接到既有 CLI Agent/工具循环，沿用预算、目录/文件逐项审批、计划拦截和取消事件；没有增加 shell 或模型代码执行。PTY 与合成按键用于验证渲染入口和操作流程，不等同 Windows Terminal/ConPTY 或真实中文输入法验收。
 - 交互组件测试、隔离合成键盘自检和 POSIX PTY 测试只使用本地合成内容与 Mock；Windows standalone workflow 会在打包 EXE 内运行 TUI 合成键盘自检。中文 IME 和终端缩放/鼠标差异仍待人工兼容测试。
 - 实际 Linux PTY 录屏展示主界面、状态栏、细分隔线、命令候选高亮、多行草稿、审批预览和拒绝结果；[原始录屏与 PNG 关键帧](evidence/README.md)。PNG 由官方 asciinema `agg` v1.9.0 和 ffmpeg 从 PTY 录屏回放导出；不是重画图或 Windows 截图。录屏、POSIX PTY 测试均启动真实 TUI，只使用本地合成文本与 Mock；不是 Windows Terminal/ConPTY 或中文输入法人工验收。
 - 交互回归覆盖 9×20、10×24、12×36、16×64、24×80、30×100 六种终端尺寸下候选菜单不遮挡提示/分隔线且可裁剪；审批测试覆盖多行粘贴、重复 Enter、新请求重置默认拒绝、焦点切换和鼠标仅选择。Agent 离线集成场景覆盖流式取消/续聊、默认拒绝不落盘及显式审批仅提交一次写入。
-- Linux / Python 3.12 离线回归：185 项，184 通过、1 项 Windows-only junction 跳过；editable install、自检、TUI 合成键盘自检、`compileall` 与 `git diff --check` 通过。Windows/Linux × Python 3.11/3.12 四格 CI 全部通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39248428908)）；Windows standalone 构建、归档审查、帮助/Mock/TUI 自检和 artifact 上传通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39248428833)）。没有真实模型请求或凭据读取；自动测试不等同完整产品验收。
+- Linux / Python 3.12 离线回归：186 项，185 通过、1 项 Windows-only junction 跳过；editable install、自检、TUI 合成键盘自检、`compileall` 与 `git diff --check` 通过。当前视觉修订的跨平台 CI 结果待 push 后记录。只使用 Mock 与本地 fixture，没有真实模型请求或凭据读取；自动测试不等同完整产品验收。
 
 ## 参考项目复用边界
 

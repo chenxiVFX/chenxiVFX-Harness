@@ -12,9 +12,17 @@ from prompt_toolkit import Application
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import Dimension, HSplit, Layout, VSplit, Window
+from prompt_toolkit.layout import (
+    Dimension,
+    HSplit,
+    Layout,
+    VSplit,
+    Window,
+    WindowAlign,
+)
 from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.margins import ScrollbarMargin
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Button, TextArea
@@ -116,6 +124,7 @@ class TerminalUI:
         self._header_model = ""
         self._header_workspace = ""
         self._transcript = ""
+        self._conversation_started = False
         self._follow_output = True
         self.input_area = TextArea(
             multiline=True,
@@ -136,13 +145,32 @@ class TerminalUI:
             self.input_area,
             Condition(lambda: self._pending is None or not self._pending.approval),
         )
-        self._approval_input_hint = ConditionalContainer(
-            Window(
-                FormattedTextControl("选择审批按钮后按 Enter 确认"),
-                height=1,
-                style="class:prompt",
+        self._empty_title_window = Window(
+            FormattedTextControl("准备就绪"),
+            height=1,
+            align=WindowAlign.CENTER,
+            style="class:empty.title",
+        )
+        self._empty_hint_window = Window(
+            FormattedTextControl(lambda: self._empty_hint()),
+            height=1,
+            align=WindowAlign.CENTER,
+            style="class:empty.hint",
+        )
+        self._empty_state = ConditionalContainer(
+            HSplit(
+                [
+                    Window(
+                        height=Dimension(weight=1), style="class:empty.background"
+                    ),
+                    self._empty_title_window,
+                    self._empty_hint_window,
+                    Window(
+                        height=Dimension(weight=1), style="class:empty.background"
+                    ),
+                ]
             ),
-            Condition(lambda: self._pending is not None and self._pending.approval),
+            Condition(lambda: not self._conversation_started),
         )
         self.output_area = TextArea(
             text="",
@@ -152,8 +180,18 @@ class TerminalUI:
             focus_on_click=True,
             wrap_lines=True,
             scrollbar=True,
-            height=Dimension(min=1, weight=1),
+            height=Dimension(min=1, max=8),
             style="class:transcript",
+        )
+        self.output_area.window.right_margins = [ScrollbarMargin(display_arrows=False)]
+        self._conversation_body = HSplit(
+            [
+                ConditionalContainer(
+                    self.output_area,
+                    Condition(lambda: bool(self._transcript)),
+                ),
+                self._empty_state,
+            ]
         )
         self._approval_area = TextArea(
             text="",
@@ -166,16 +204,16 @@ class TerminalUI:
             style="class:approval",
         )
         self._approval_no_button = Button(
-            "● 否（默认）", handler=self._select_no, width=18
+            "拒绝（当前）", handler=self._select_no, width=18
         )
         self._approval_yes_button = Button(
-            "○ 是（本次）", handler=self._select_yes, width=18
+            "批准本次", handler=self._select_yes, width=18
         )
         self._approval_container = ConditionalContainer(
             HSplit(
                 [
                     Window(
-                        FormattedTextControl("审批预览 · 默认拒绝 · 仅本次授权"),
+                        FormattedTextControl("待审批 · 默认拒绝"),
                         height=1,
                         style="class:approval.heading",
                     ),
@@ -188,13 +226,19 @@ class TerminalUI:
             ),
             Condition(lambda: bool(self._approval_text)),
         )
-        self._completion_menu = CompletionsMenu(max_height=8, scroll_offset=1)
+        self._completion_menu = CompletionsMenu(max_height=6, scroll_offset=1)
         self._completion_window = self._completion_menu.content
-        self._completion_menu_row = VSplit(
-            [
-                self._completion_menu,
-                Window(width=Dimension(weight=1), style="bg:#000000"),
-            ]
+        self._completion_menu_row = ConditionalContainer(
+            VSplit(
+                [
+                    self._completion_menu,
+                    Window(width=Dimension(weight=1), style="class:completion-menu"),
+                ]
+            ),
+            Condition(
+                lambda: self._input_buffer.complete_state is not None
+                and bool(self._input_buffer.complete_state.completions)
+            ),
         )
         self._input_top_separator = Window(
             char="─", height=1, style="class:input.separator"
@@ -217,18 +261,17 @@ class TerminalUI:
                 self._input_top_separator,
                 self._prompt_window,
                 self._input_area_container,
-                self._approval_input_hint,
                 self._input_bottom_separator,
             ]
         )
         content = HSplit(
             [
                 Window(
-                    FormattedTextControl(lambda: self._header_line()),
+                    FormattedTextControl(lambda: self._header_fragments()),
                     height=1,
                     style="class:header",
                 ),
-                self.output_area,
+                self._conversation_body,
                 self._completion_menu_row,
                 self._approval_container,
                 input_block,
@@ -241,21 +284,32 @@ class TerminalUI:
             key_bindings=self._bindings,
             style=Style.from_dict(
                 {
-                    "": "bg:#000000",
-                    "header": "bold fg:#ffffff bg:#000000",
-                    "status": "fg:#ffffff bg:#20232a",
-                    "prompt": "bold fg:#74c7ec",
-                    "input": "fg:#f2f2f2",
-                    "input.separator": "fg:#707784",
-                    "transcript": "fg:#d9e2ec",
-                    "approval": "fg:#f5d76e",
-                    "approval.heading": "bold fg:#f5d76e",
-                    "button": "fg:#9aa0aa bg:#000000",
-                    "button.focused": "fg:#c6a0f6 bg:#000000 bold",
-                    "completion-menu": "bg:#000000",
-                    "completion-menu.completion": "fg:#f2f2f2 bg:#263849",
-                    "completion-menu.completion.current": "fg:#1b1722 bg:#c6a0f6 bold",
-                    "completion-menu.meta.completion": "fg:#9fb3c8 bg:#263849",
+                    "": "fg:#d8dee6 bg:#0b0d10",
+                    "header": "bg:#0b0d10",
+                    "header.brand": "fg:#6bbdb4 bold",
+                    "header.muted": "fg:#84909b",
+                    "header.workspace": "fg:#c1c9d2",
+                    "status": "fg:#aab4bf bg:#11151a",
+                    "prompt": "fg:#6bbdb4 bold",
+                    "input": "fg:#e1e6ec",
+                    "input.separator": "fg:#303942",
+                    "transcript": "fg:#d1d7df",
+                    "empty.background": "bg:#0b0d10",
+                    "empty.title": "fg:#6bbdb4 bg:#0b0d10 bold",
+                    "empty.hint": "fg:#8b96a1 bg:#0b0d10",
+                    "approval": "fg:#d8dee6",
+                    "approval.heading": "fg:#6bbdb4 bold",
+                    "button": "fg:#adb7c1 bg:#0b0d10",
+                    "button.focused": "fg:#0b0d10 bg:#6bbdb4 bold underline",
+                    "completion-menu": "bg:#0b0d10",
+                    "completion-menu.completion": "fg:#d4dbe3 bg:#0b0d10",
+                    "completion-menu.completion.current": (
+                        "fg:#0b0d10 bg:#6bbdb4 bold underline"
+                    ),
+                    "completion-menu.meta.completion": "fg:#8c98a4 bg:#0b0d10",
+                    "completion-menu.meta.completion.current": (
+                        "fg:#0b0d10 bg:#6bbdb4 bold underline"
+                    ),
                 }
             ),
             full_screen=True,
@@ -555,6 +609,8 @@ class TerminalUI:
         else:
             value = self._input_buffer.text
             if value:
+                self._conversation_started = True
+                self.output_area.window.height = Dimension(min=1, weight=1)
                 self._append_transcript(f"\n你> {_safe_text(value)}\n")
         self._resolve_pending(value=value)
 
@@ -631,20 +687,50 @@ class TerminalUI:
             return "等待后台任务…"
         return self._prompt or "输入"
 
-    def _header_line(self) -> str:
-        parts = [self._header_model or "chenxiVFX Harness"]
+    def _empty_hint(self) -> str:
+        try:
+            columns = self._application.output.get_size().columns
+        except (AttributeError, NotImplementedError, OSError):
+            columns = 80
+        if columns >= 42:
+            return "输入任务开始  ·  输入 / 查看命令"
+        return "输入任务  ·  /命令"
+
+    def _header_fragments(self) -> list[tuple[str, str]]:
+        fragments = [("class:header.brand", "chenxiVFX Harness")]
+        metadata = self._header_model
+        if metadata:
+            parts = [part.strip() for part in metadata.split("|")]
+            if len(parts) >= 3:
+                version = parts[0]
+                provider = (
+                    parts[1]
+                    .removeprefix("提供商：")
+                    .removeprefix("提供商:")
+                    .strip()
+                )
+                model = (
+                    parts[2]
+                    .removeprefix("模型：")
+                    .removeprefix("模型:")
+                    .strip()
+                )
+                metadata = f"{version}  {provider} / {model}"
+            fragments.append(("class:header.muted", f"  {metadata}"))
         if self._header_workspace:
-            parts.append(f"工作区：{self._header_workspace}")
-        return "  " + "  ·  ".join(parts)
+            fragments.append(("class:header.workspace", f"  {self._header_workspace}"))
+        return fragments
 
     def _select_no(self) -> None:
         self._approval_choice_yes = False
         self._update_approval_buttons()
+        self._application.layout.focus(self._approval_no_button)
         self._notice = "当前选择：否；按 Enter 拒绝本次操作。"
 
     def _select_yes(self) -> None:
         self._approval_choice_yes = True
         self._update_approval_buttons()
+        self._application.layout.focus(self._approval_yes_button)
         self._notice = "当前选择：是；按 Enter 仅批准本次操作。"
 
     def _toggle_approval_choice(self) -> None:
@@ -655,10 +741,10 @@ class TerminalUI:
 
     def _update_approval_buttons(self) -> None:
         self._approval_no_button.text = (
-            "○ 否（默认）" if self._approval_choice_yes else "● 否（默认）"
+            "拒绝（默认）" if self._approval_choice_yes else "拒绝（当前）"
         )
         self._approval_yes_button.text = (
-            "● 是（本次）" if self._approval_choice_yes else "○ 是（本次）"
+            "批准（当前）" if self._approval_choice_yes else "批准本次"
         )
 
     def _status_line(self) -> str:
@@ -667,27 +753,22 @@ class TerminalUI:
         except (AttributeError, NotImplementedError, OSError):
             columns = 80
 
-        prefix = f" 状态：{self._status}  "
         if self._notice:
-            details = self._notice
+            line = f"{self._status}  ·  {self._notice}"
         elif self._pending is None and not self._worker_done:
-            details = "生成中；输入已暂停  Ctrl+C取消"
+            line = "生成中  ·  Ctrl+C 取消"
         elif self._pending is None:
-            details = ""
+            line = self._status
         elif self._pending.approval:
-            details = (
-                "Tab/↑↓/点击切换  Enter确认  Esc取消"
-                if columns >= 90
-                else "Tab/↑↓切换 Enter确认 Esc取消"
-            )
-        elif columns >= 90:
-            details = "↑↓选候选  Tab填入  Enter提交  Ctrl+J换行  Ctrl+C清空/取消  Esc关闭/取消"
-        elif columns >= 64:
-            details = "↑↓候选 Tab填入 Enter提交 Ctrl+J换行 Ctrl+C取消"
+            if columns >= 58:
+                line = "待审批  ·  Tab/↑↓ 选择  ·  Enter 确认  ·  Esc 取消"
+            elif columns >= 36:
+                line = "待审批 · Tab/↑↓选择 · Enter确认"
+            else:
+                line = "审批 · Enter确认"
         else:
-            details = "Enter提交 Ctrl+C取消"
+            line = "等待输入 · Enter提交" if columns >= 26 else "输入 · Enter"
 
-        line = prefix + details
         if wcswidth(line) <= columns:
             return line
         limit = max(0, columns - 1)

@@ -2,7 +2,7 @@
 
 `tui-synthetic-session.cast` 是在 Linux PTY 中启动真实 `TerminalUI` 录制的 asciinema v2 会话。操作过程展示主界面、命令候选与高亮、多行草稿、写入审批预览和默认拒绝结果。录制只使用合成文字和 Mock；没有调用模型服务、读取凭据或修改测试工作区文件。
 
-关键帧从这份 PTY 录屏回放导出，使用官方 asciinema `agg` v1.9.0 终端渲染器和 `ffmpeg` 转成 PNG。它们保留 PTY 的 ANSI、中文字体与布局输出；不是重画的终端模拟图，也不是 Windows 截图。
+关键帧从这份 PTY 录屏回放导出，使用官方 asciinema `agg` v1.9.0 终端渲染器和 `ffmpeg` 转成 PNG；联系表由五张关键帧拼成。画面展示居中的空会话提示、单一青绿色强调、无箭头滚动条、收敛的状态栏和文字标记的审批选择。它们保留 PTY 的 ANSI、中文字体与布局输出；不是重画的终端模拟图，也不是 Windows 截图。
 
 - [主界面](tui-frame-main.png)
 - [命令候选高亮](tui-frame-candidates.png)
