@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .agent import DEFAULT_MAX_OUTPUT_TOKENS
-from .providers import ProviderError, validate_deepseek_base_url
+from .providers import (
+    DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL,
+    DEEPSEEK_ANTHROPIC_MODELS,
+    ProviderError,
+    validate_deepseek_anthropic_base_url,
+    validate_deepseek_base_url,
+)
 from .sessions import contains_likely_secret
 from .tools import Workspace, WorkspaceError
 from .usage import DEFAULT_TOKEN_BUDGET
@@ -63,16 +69,18 @@ class ResolvedConfig:
 
 def _validate_provider(value: Any) -> str:
     if not isinstance(value, str):
-        raise ConfigError("提供商配置无效；当前仅支持 mock 和 DeepSeek OpenAI 兼容模式。")
+        raise ConfigError("提供商配置无效；请选择 mock、openai 或 deepseek-anthropic。")
     normalized = value.casefold()
     if normalized == "anthropic":
-        raise ConfigError("Anthropic provider 尚未实现；当前仅支持 mock 和 DeepSeek OpenAI 兼容模式。")
-    if normalized not in {"mock", "openai"}:
-        raise ConfigError("提供商配置无效；当前仅支持 mock 和 DeepSeek OpenAI 兼容模式。")
+        raise ConfigError(
+            "未接入官方 Claude 服务；如使用 DeepSeek Anthropic 兼容入口，请选择 deepseek-anthropic。"
+        )
+    if normalized not in {"mock", "openai", "deepseek-anthropic"}:
+        raise ConfigError("提供商配置无效；请选择 mock、openai 或 deepseek-anthropic。")
     return normalized
 
 
-def _validate_model(value: Any) -> str | None:
+def _validate_model(value: Any, *, provider: str | None = None) -> str | None:
     if value is None:
         return None
     if (
@@ -81,17 +89,24 @@ def _validate_model(value: Any) -> str | None:
         or contains_likely_secret(value)
     ):
         raise ConfigError("模型名称无效；请只填写模型标识，不要填写 URL、凭据或其他参数。")
+    if provider == "deepseek-anthropic" and value not in DEEPSEEK_ANTHROPIC_MODELS:
+        raise ConfigError("DeepSeek Anthropic 兼容模式只接受 deepseek-flash 或 deepseek-v4-pro；不接受 Claude 模型别名。")
     return value
 
 
-def _validate_base_url(value: Any) -> str | None:
+def _validate_base_url(value: Any, *, provider: str | None = None) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or contains_likely_secret(value):
         raise ConfigError("Base URL 无效；当前仅支持不含凭据的 DeepSeek HTTPS 服务地址。")
     try:
-        validated = validate_deepseek_base_url(value)
+        if provider == "deepseek-anthropic":
+            validated = validate_deepseek_anthropic_base_url(value)
+        else:
+            validated = validate_deepseek_base_url(value)
     except ProviderError:
+        if provider == "deepseek-anthropic":
+            raise ConfigError("Base URL 无效；DeepSeek Anthropic 兼容模式仅允许 HTTPS api.deepseek.com:443/anthropic。") from None
         raise ConfigError("Base URL 无效；当前仅支持 HTTPS api.deepseek.com:443，且不得含凭据、查询参数或片段。") from None
     return validated
 
@@ -100,8 +115,8 @@ def validate_workspace_config(config: WorkspaceConfig) -> WorkspaceConfig:
     if not isinstance(config, WorkspaceConfig):
         raise ConfigError("工作区配置格式无效。")
     provider = _validate_provider(config.provider)
-    model = _validate_model(config.model)
-    base_url = _validate_base_url(config.base_url)
+    model = _validate_model(config.model, provider=provider)
+    base_url = _validate_base_url(config.base_url, provider=provider)
     if type(config.token_budget) is not int or not 1024 <= config.token_budget <= 1_000_000:
         raise ConfigError("Token 预算必须在 1024 到 1000000 之间。")
     if type(config.max_output_tokens) is not int or not 1 <= config.max_output_tokens <= 65536:
@@ -224,14 +239,20 @@ def resolve_config(
     provider = _validate_provider(
         pick("provider", "mock", stored.provider, "HARNESS_PROVIDER")
     )
-    model_default = "deepseek-flash" if provider == "openai" else "mock"
+    model_default = "deepseek-flash" if provider in {"openai", "deepseek-anthropic"} else "mock"
     model = _validate_model(
-        pick("model", model_default, stored.model or model_default, "HARNESS_MODEL")
+        pick("model", model_default, stored.model or model_default, "HARNESS_MODEL"),
+        provider=provider,
     )
     assert model is not None
-    base_default = DEFAULT_DEEPSEEK_BASE_URL if provider == "openai" else None
+    base_default = (
+        DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL
+        if provider == "deepseek-anthropic"
+        else DEFAULT_DEEPSEEK_BASE_URL if provider == "openai" else None
+    )
     base_url = _validate_base_url(
-        pick("base_url", base_default, stored.base_url or base_default, "HARNESS_BASE_URL")
+        pick("base_url", base_default, stored.base_url or base_default, "HARNESS_BASE_URL"),
+        provider=provider,
     )
 
     token_budget_value = pick(

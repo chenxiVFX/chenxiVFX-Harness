@@ -20,7 +20,11 @@ from urllib.parse import urlsplit
 from .usage import ProviderUsage, estimate_tokens
 
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
+DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
+DEEPSEEK_ANTHROPIC_MODELS = frozenset({"deepseek-flash", "deepseek-v4-pro"})
+ANTHROPIC_API_VERSION = "2023-06-01"
 MAX_PROVIDER_TOOL_CALLS = 16
+MAX_ANTHROPIC_CONTENT_BLOCKS = 256
 MAX_PROVIDER_TOOL_ARGUMENT_BYTES = 128 * 1024
 MAX_STREAM_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_STREAM_LINE_BYTES = 512 * 1024
@@ -43,6 +47,15 @@ MAX_MODEL_REQUEST_TIMEOUT_SECONDS = MAX_STREAM_DURATION_SECONDS
 _URL_CREDENTIAL_MARKER = re.compile(
     r"(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|authorization)(?:=|%3d)"
 )
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
 
 
 class ProviderError(RuntimeError):
@@ -289,6 +302,52 @@ def validate_deepseek_base_url(base_url: str) -> str:
             f"使用 {DEEPSEEK_API_KEY_ENV} 时仅允许 HTTPS api.deepseek.com 的 443 端口。"
         )
     return validate_base_url(base_url)
+
+
+def validate_deepseek_anthropic_base_url(
+    base_url: str,
+    *,
+    allow_loopback_http: bool = False,
+) -> str:
+    """Restrict the DeepSeek Anthropic-compatible adapter to its documented path."""
+    validated = validate_base_url(base_url)
+    parsed = urlsplit(validated)
+    hostname = (parsed.hostname or "").casefold()
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ProviderError("Anthropic 兼容 Base URL 格式无效。") from None
+    if parsed.path.rstrip("/") != "/anthropic":
+        raise ProviderError("DeepSeek Anthropic 兼容模式只允许 /anthropic 路径。")
+    if (
+        parsed.scheme == "https"
+        and hostname == "api.deepseek.com"
+        and port in {None, 443}
+    ):
+        return validated
+    if (
+        allow_loopback_http
+        and parsed.scheme == "http"
+        and hostname in {"localhost", "127.0.0.1", "::1"}
+        and port is not None
+    ):
+        return validated
+    raise ProviderError(
+        f"使用 {DEEPSEEK_API_KEY_ENV} 时仅允许 HTTPS api.deepseek.com:443/anthropic。"
+    )
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so an authenticated request cannot change target hosts."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+def _open_without_redirect(request: urllib.request.Request, *, timeout: float):
+    opener = urllib.request.build_opener(_NoRedirectHandler)
+    return opener.open(request, timeout=timeout)
 
 
 @dataclass
@@ -1044,6 +1103,863 @@ class OpenAICompatibleProvider:
         return ProviderUsage(prompt, completion, total, cached_prompt)
 
 
+class _AnthropicEventAccumulator:
+    """Validate and accumulate the documented Anthropic Messages SSE event sequence."""
+
+    def __init__(self, on_text_delta: Callable[[str], None]) -> None:
+        self._on_text_delta = on_text_delta
+        self.started = False
+        self.stopped = False
+        self.message_delta_seen = False
+        self.stop_reason: str | None = None
+        self.input_tokens: int | None = None
+        self.output_tokens: int | None = None
+        self.blocks: dict[int, dict[str, Any]] = {}
+        self.open_blocks: set[int] = set()
+        self._assistant_bytes = 0
+
+    @staticmethod
+    def _token_count(value: Any) -> int | None:
+        return value if type(value) is int and 0 <= value <= 2_000_000_000 else None
+
+    def _read_usage(self, usage: Any, *, final: bool = False) -> None:
+        if not isinstance(usage, dict):
+            return
+        input_tokens = self._token_count(usage.get("input_tokens"))
+        output_tokens = self._token_count(usage.get("output_tokens"))
+        if input_tokens is not None:
+            self.input_tokens = input_tokens
+        if final and output_tokens is not None:
+            self.output_tokens = output_tokens
+
+    def _add_assistant_bytes(self, value: str) -> None:
+        try:
+            self._assistant_bytes += len(value.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise ProviderStreamError("Anthropic 响应文本格式无效。") from None
+        if self._assistant_bytes > MAX_STREAM_ASSISTANT_BYTES:
+            raise ProviderStreamError("Anthropic 助手内容超过 2 MiB 上限。")
+
+    def handle(self, event_name: str, data: str) -> bool:
+        if event_name == "error":
+            raise ProviderStreamError("DeepSeek Anthropic 接口返回 SSE 错误事件。")
+        try:
+            event = json.loads(data, object_pairs_hook=_unique_json_object)
+        except (ValueError, RecursionError):
+            raise ProviderStreamError("Anthropic SSE 事件 JSON 格式无效。", category="parse_error") from None
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            raise ProviderStreamError("Anthropic SSE 事件格式无效。")
+        if event_name != event["type"]:
+            raise ProviderStreamError("Anthropic SSE 事件名与数据类型不一致。")
+
+        kind = event["type"]
+        allowed_event_keys = {
+            "ping": {"type"},
+            "message_start": {"type", "message"},
+            "content_block_start": {"type", "index", "content_block"},
+            "content_block_delta": {"type", "index", "delta"},
+            "content_block_stop": {"type", "index"},
+            "message_delta": {"type", "delta", "usage"},
+            "message_stop": {"type"},
+        }.get(kind)
+        if allowed_event_keys is None or set(event) - allowed_event_keys:
+            raise ProviderStreamError("Anthropic SSE 含有尚未支持的事件字段或类型。")
+        if kind == "ping":
+            return False
+        if self.stopped:
+            raise ProviderStreamError("Anthropic message_stop 后收到额外事件。")
+        if kind == "message_start":
+            if self.started:
+                raise ProviderStreamError("Anthropic SSE 重复 message_start。")
+            message = event.get("message")
+            if (
+                not isinstance(message, dict)
+                or set(message) - {
+                    "id", "type", "role", "model", "content", "stop_reason", "stop_sequence", "usage",
+                }
+                or message.get("type") != "message"
+                or message.get("role") != "assistant"
+                or message.get("content") != []
+            ):
+                raise ProviderStreamError("Anthropic message_start 格式无效。")
+            self.started = True
+            self._read_usage(message.get("usage"))
+            return False
+
+        if not self.started:
+            raise ProviderStreamError("Anthropic SSE 在 message_start 前收到内容。")
+
+        if kind == "content_block_start":
+            if self.message_delta_seen:
+                raise ProviderStreamError("Anthropic message_delta 后收到内容块。")
+            index = event.get("index")
+            block = event.get("content_block")
+            if (
+                type(index) is not int
+                or not 0 <= index < MAX_ANTHROPIC_CONTENT_BLOCKS
+                or index in self.blocks
+                or not isinstance(block, dict)
+            ):
+                raise ProviderStreamError("Anthropic content_block_start 格式无效。")
+            block_type = block.get("type")
+            if (
+                block_type == "text"
+                and set(block) == {"type", "text"}
+                and block.get("text") == ""
+            ):
+                current: dict[str, Any] = {"type": "text", "parts": [block["text"]]}
+                self._add_assistant_bytes(block["text"])
+            elif (
+                block_type == "thinking"
+                and set(block) <= {"type", "thinking", "signature"}
+                and {"type", "thinking"} <= set(block)
+                and block.get("thinking") == ""
+            ):
+                current = {"type": "thinking", "parts": [block["thinking"]]}
+                signature = block.get("signature")
+                if signature is not None:
+                    if not isinstance(signature, str):
+                        raise ProviderStreamError("Anthropic thinking signature 格式无效。")
+                    current["signature"] = signature
+                    self._add_assistant_bytes(signature)
+                self._add_assistant_bytes(block["thinking"])
+            elif (
+                block_type == "tool_use"
+                and set(block) == {"type", "id", "name", "input"}
+                and isinstance(block.get("id"), str)
+                and block.get("id")
+                and len(block["id"]) <= 128
+                and isinstance(block.get("name"), str)
+                and block.get("name")
+                and len(block["name"]) <= 128
+                and isinstance(block.get("input"), dict)
+                and block.get("input") == {}
+            ):
+                current = {
+                    "type": "tool_use",
+                    "id": block["id"],
+                    "name": block["name"],
+                    "input": block["input"],
+                    "json_parts": [],
+                    "json_bytes": 0,
+                }
+            else:
+                raise ProviderStreamError("Anthropic 响应含有尚未支持的内容块。")
+            self.blocks[index] = current
+            self.open_blocks.add(index)
+            return False
+
+        if kind == "content_block_delta":
+            index = event.get("index")
+            delta = event.get("delta")
+            if type(index) is not int or index not in self.open_blocks or not isinstance(delta, dict):
+                raise ProviderStreamError("Anthropic content_block_delta 格式无效。")
+            block = self.blocks[index]
+            delta_type = delta.get("type")
+            if delta_type == "text_delta" and block["type"] == "text":
+                if set(delta) != {"type", "text"}:
+                    raise ProviderStreamError("Anthropic text_delta 含有尚未支持的字段。")
+                fragment = delta.get("text")
+                if not isinstance(fragment, str):
+                    raise ProviderStreamError("Anthropic text_delta 格式无效。")
+                self._add_assistant_bytes(fragment)
+                block["parts"].append(fragment)
+                if fragment:
+                    try:
+                        self._on_text_delta(fragment)
+                    except Exception:
+                        raise ProviderStreamError("无法显示 Anthropic 流式文本。", category="local_output_error") from None
+            elif delta_type == "thinking_delta" and block["type"] == "thinking":
+                if set(delta) != {"type", "thinking"}:
+                    raise ProviderStreamError("Anthropic thinking_delta 含有尚未支持的字段。")
+                if "signature" in block:
+                    raise ProviderStreamError("Anthropic thinking_delta 出现在签名之后。")
+                fragment = delta.get("thinking")
+                if not isinstance(fragment, str):
+                    raise ProviderStreamError("Anthropic thinking_delta 格式无效。")
+                self._add_assistant_bytes(fragment)
+                block["parts"].append(fragment)
+            elif delta_type == "signature_delta" and block["type"] == "thinking":
+                if set(delta) != {"type", "signature"}:
+                    raise ProviderStreamError("Anthropic signature_delta 含有尚未支持的字段。")
+                signature = delta.get("signature")
+                if not isinstance(signature, str) or not signature or "signature" in block:
+                    raise ProviderStreamError("Anthropic signature_delta 格式无效。")
+                block["signature"] = signature
+                self._add_assistant_bytes(signature)
+            elif delta_type == "input_json_delta" and block["type"] == "tool_use":
+                if set(delta) != {"type", "partial_json"}:
+                    raise ProviderStreamError("Anthropic input_json_delta 含有尚未支持的字段。")
+                fragment = delta.get("partial_json")
+                if not isinstance(fragment, str):
+                    raise ProviderStreamError("Anthropic input_json_delta 格式无效。")
+                try:
+                    block["json_bytes"] += len(fragment.encode("utf-8"))
+                except UnicodeEncodeError:
+                    raise ProviderStreamError("Anthropic input_json_delta 格式无效。") from None
+                if block["json_bytes"] > MAX_PROVIDER_TOOL_ARGUMENT_BYTES:
+                    raise ProviderStreamError("Anthropic 工具参数超过本地大小上限。")
+                block["json_parts"].append(fragment)
+            else:
+                raise ProviderStreamError("Anthropic SSE 含有尚未支持的 delta 类型。")
+            return False
+
+        if kind == "content_block_stop":
+            index = event.get("index")
+            if type(index) is not int or index not in self.open_blocks:
+                raise ProviderStreamError("Anthropic content_block_stop 格式无效。")
+            block = self.blocks[index]
+            if block["type"] == "thinking" and not block.get("signature"):
+                raise ProviderStreamError("Anthropic thinking 块缺少签名；未执行工具。")
+            if block["type"] == "tool_use" and block["json_parts"]:
+                try:
+                    parsed = json.loads(
+                        "".join(block["json_parts"]),
+                        object_pairs_hook=_unique_json_object,
+                    )
+                except (ValueError, RecursionError):
+                    raise ProviderStreamError("Anthropic 工具参数 JSON 无效。") from None
+                if not isinstance(parsed, dict):
+                    raise ProviderStreamError("Anthropic 工具参数必须是 JSON 对象。")
+                try:
+                    if len(json.dumps(parsed, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")) > MAX_PROVIDER_TOOL_ARGUMENT_BYTES:
+                        raise ProviderStreamError("Anthropic 工具参数超过本地大小上限。")
+                except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+                    raise ProviderStreamError("Anthropic 工具参数 JSON 无效。") from None
+                block["input"] = parsed
+            self.open_blocks.remove(index)
+            return False
+
+        if kind == "message_delta":
+            if self.open_blocks:
+                raise ProviderStreamError("Anthropic message_delta 前仍有未结束内容块。")
+            delta = event.get("delta")
+            if not isinstance(delta, dict):
+                raise ProviderStreamError("Anthropic message_delta 格式无效。")
+            if set(delta) - {"stop_reason", "stop_sequence"}:
+                raise ProviderStreamError("Anthropic message_delta 含有尚未支持的字段。")
+            reason = delta.get("stop_reason")
+            if reason is not None:
+                if not isinstance(reason, str) or reason not in {"end_turn", "max_tokens", "stop_sequence", "tool_use"}:
+                    raise ProviderStreamError("Anthropic stop_reason 尚未支持。")
+                if self.stop_reason is not None and self.stop_reason != reason:
+                    raise ProviderStreamError("Anthropic stop_reason 不一致。")
+                self.stop_reason = reason
+            self.message_delta_seen = True
+            self._read_usage(event.get("usage"), final=True)
+            return False
+
+        if kind == "message_stop":
+            if not self.message_delta_seen or self.stop_reason is None or self.open_blocks:
+                raise ProviderStreamError("Anthropic message_stop 前缺少完整 message_delta。")
+            self.stopped = True
+            tool_count = sum(block["type"] == "tool_use" for block in self.blocks.values())
+            if (tool_count > 0) != (self.stop_reason == "tool_use"):
+                raise ProviderStreamError("Anthropic 工具调用与 stop_reason 不一致。")
+            if tool_count > MAX_PROVIDER_TOOL_CALLS:
+                raise ProviderStreamError("Anthropic 工具调用超过本地数量上限。")
+            return True
+
+        raise ProviderStreamError("Anthropic SSE 含有尚未支持的事件类型。")
+
+    def payload(self) -> dict[str, Any]:
+        if not self.stopped or self.stop_reason is None:
+            raise ProviderStreamError("Anthropic SSE 在 message_stop 前结束。")
+        content: list[dict[str, Any]] = []
+        for index in sorted(self.blocks):
+            block = self.blocks[index]
+            if block["type"] == "text":
+                content.append({"type": "text", "text": "".join(block["parts"])})
+            elif block["type"] == "thinking":
+                content.append({
+                    "type": "thinking",
+                    "thinking": "".join(block["parts"]),
+                    "signature": block["signature"],
+                })
+            else:
+                content.append({
+                    "type": "tool_use",
+                    "id": block["id"],
+                    "name": block["name"],
+                    "input": block["input"],
+                })
+        usage: dict[str, int] | None = None
+        if self.input_tokens is not None and self.output_tokens is not None:
+            usage = {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens}
+        return {
+            "type": "message",
+            "role": "assistant",
+            "content": content,
+            "stop_reason": self.stop_reason,
+            "usage": usage,
+        }
+
+
+class DeepSeekAnthropicProvider:
+    """DeepSeek-only adapter for the documented Anthropic Messages-compatible route."""
+
+    label = "deepseek-anthropic"
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        *,
+        timeout: float = DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS,
+        stream_timeout: float = MAX_STREAM_DURATION_SECONDS,
+    ) -> None:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not 0 < timeout <= MAX_MODEL_REQUEST_TIMEOUT_SECONDS
+        ):
+            raise ProviderError("模型请求总时限必须在 0 到 120 秒之间。")
+        if (
+            isinstance(stream_timeout, bool)
+            or not isinstance(stream_timeout, (int, float))
+            or not 0 < stream_timeout <= MAX_STREAM_DURATION_SECONDS
+        ):
+            raise ProviderError("SSE 总时限必须在 0 到 120 秒之间。")
+        if not isinstance(model, str) or model not in DEEPSEEK_ANTHROPIC_MODELS:
+            raise ProviderError("DeepSeek Anthropic 兼容模式只支持 deepseek-flash 和 deepseek-v4-pro。")
+        base_url = validate_deepseek_anthropic_base_url(
+            base_url,
+            allow_loopback_http=not api_key,
+        )
+        parsed = urlsplit(base_url)
+        is_loopback = (parsed.hostname or "").casefold() in {"localhost", "127.0.0.1", "::1"}
+        if not api_key and not is_loopback:
+            raise ProviderError("未提供 API 密钥。")
+        self.endpoint = f"{base_url.rstrip('/')}/v1/messages"
+        self.base_url = base_url
+        self._api_key = api_key
+        self.model = model
+        self.timeout = float(timeout)
+        self.stream_timeout = float(stream_timeout)
+
+    def _request_body(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        max_tokens: int,
+        stream: bool,
+    ) -> dict[str, Any]:
+        if type(max_tokens) is not int or not 1 <= max_tokens <= 65536:
+            raise ProviderError("max_tokens must be between 1 and 65536")
+        if not isinstance(messages, list) or not isinstance(tools, list):
+            raise ProviderError("Anthropic 请求上下文格式无效。")
+        system_parts: list[str] = []
+        anth_messages: list[dict[str, Any]] = []
+        previous_source_role: str | None = None
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ProviderError("Anthropic 请求消息格式无效。")
+            role = message.get("role")
+            if role == "system":
+                content = message.get("content")
+                if not isinstance(content, str):
+                    raise ProviderError("Anthropic system 消息格式无效。")
+                system_parts.append(content)
+                previous_source_role = "system"
+                continue
+            if role == "tool":
+                call_id = message.get("tool_call_id")
+                content = message.get("content")
+                if not isinstance(call_id, str) or not call_id or len(call_id) > 128 or not isinstance(content, str):
+                    raise ProviderError("Anthropic tool_result 消息格式无效。")
+                block = {"type": "tool_result", "tool_use_id": call_id, "content": content}
+                if previous_source_role == "tool" and anth_messages and anth_messages[-1]["role"] == "user":
+                    anth_messages[-1]["content"].append(block)
+                else:
+                    anth_messages.append({"role": "user", "content": [block]})
+                previous_source_role = "tool"
+                continue
+            if not isinstance(role, str) or role not in {"user", "assistant"}:
+                raise ProviderError("Anthropic 请求角色尚未支持。")
+            if role == "assistant" and "deepseek_anthropic_content" in message:
+                content = message["deepseek_anthropic_content"]
+                if not isinstance(content, list) or len(content) > MAX_ANTHROPIC_CONTENT_BLOCKS:
+                    raise ProviderError("Anthropic 原生 assistant 内容格式无效。")
+            elif role == "assistant" and message.get("tool_calls"):
+                if message.get("reasoning_content"):
+                    raise ProviderError("无法安全转换无 Anthropic 签名的历史 reasoning 内容。")
+                content = []
+                for call in message["tool_calls"]:
+                    try:
+                        function = call["function"]
+                        args = json.loads(function["arguments"])
+                        if not isinstance(args, dict):
+                            raise ValueError
+                        content.append({
+                            "type": "tool_use",
+                            "id": call["id"],
+                            "name": function["name"],
+                            "input": args,
+                        })
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError, RecursionError):
+                        raise ProviderError("Anthropic assistant tool_use 历史格式无效。") from None
+            else:
+                content = message.get("content", "")
+                if not isinstance(content, str):
+                    raise ProviderError("Anthropic 请求消息内容格式无效。")
+            anth_messages.append({"role": role, "content": content})
+            previous_source_role = role
+
+        if not anth_messages:
+            raise ProviderError("Anthropic 请求缺少 user/assistant 消息。")
+        body: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": anth_messages,
+            "stream": stream,
+            # Disable model-side hidden reasoning by default. DeepSeek documents this
+            # toggle; any returned thinking blocks are still validated and preserved.
+            "thinking": {"type": "disabled"},
+        }
+        if system_parts:
+            body["system"] = "\n\n".join(system_parts)
+        if tools:
+            if len(tools) > MAX_PROVIDER_TOOL_CALLS:
+                raise ProviderError("Anthropic tool 定义超过本地上限。")
+            converted_tools: list[dict[str, Any]] = []
+            for schema in tools:
+                try:
+                    function = schema["function"]
+                    name = function["name"]
+                    input_schema = function["parameters"]
+                    description = function.get("description", "")
+                except (KeyError, TypeError):
+                    raise ProviderError("Anthropic tool 定义格式无效。") from None
+                if (
+                    schema.get("type") != "function"
+                    or not isinstance(name, str)
+                    or not name
+                    or not isinstance(description, str)
+                    or not isinstance(input_schema, dict)
+                ):
+                    raise ProviderError("Anthropic tool 定义格式无效。")
+                converted_tools.append({
+                    "name": name,
+                    "description": description,
+                    "input_schema": input_schema,
+                })
+            body["tools"] = converted_tools
+            body["tool_choice"] = {"type": "auto"}
+        try:
+            if len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_STREAM_RESPONSE_BYTES:
+                raise ProviderError("Anthropic 请求超过 4 MiB 本地上限。")
+        except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+            raise ProviderError("Anthropic 请求内容格式无效。") from None
+        return body
+
+    def _request(self, body: dict[str, Any], *, stream: bool) -> urllib.request.Request:
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "text/event-stream" if stream else "application/json",
+            "anthropic-version": ANTHROPIC_API_VERSION,
+        }
+        if self._api_key:
+            headers["x-api-key"] = self._api_key
+        return urllib.request.Request(
+            self.endpoint,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+
+    def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        cancellation_event: threading.Event | None = None,
+        max_tokens: int = 2048,
+    ) -> AssistantTurn:
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise ProviderCancelled("provider request cancelled before send")
+        body = self._request_body(messages, tools, max_tokens=max_tokens, stream=False)
+        try:
+            with _open_without_redirect(self._request(body, stream=False), timeout=self.timeout) as response:
+                raw = response.read(MAX_STREAM_RESPONSE_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            try:
+                exc.close()
+            except Exception:
+                pass
+            safe_status = status if type(status) is int and 100 <= status <= 599 else "未知"
+            raise ProviderError(f"DeepSeek Anthropic 接口返回 HTTP {safe_status}。") from None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            raise ProviderError("连接 DeepSeek Anthropic 接口失败；TLS 和目标主机未放宽。") from None
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise ProviderCancelled("provider request cancelled after response")
+        if len(raw) > MAX_STREAM_RESPONSE_BYTES:
+            raise ProviderError("Anthropic 响应超过 4 MiB 上限。")
+        try:
+            payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_object)
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            raise ProviderError("Anthropic 响应格式无效。") from None
+        return self._turn_from_payload(payload)
+
+    def complete_streaming(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        cancellation_event: threading.Event | None = None,
+        max_tokens: int = 2048,
+        on_text_delta: Callable[[str], None],
+        timeout_seconds: float | None = None,
+    ) -> AssistantTurn:
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise ProviderCancelled("provider stream cancelled before send")
+        if not callable(on_text_delta):
+            raise ProviderStreamError("Anthropic 文本回调无效。")
+        stream_timeout = self.stream_timeout
+        if timeout_seconds is not None:
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or not 0 < timeout_seconds <= MAX_STREAM_DURATION_SECONDS
+            ):
+                raise ProviderStreamError("Anthropic 单次请求时限无效。")
+            stream_timeout = min(stream_timeout, float(timeout_seconds))
+        body = self._request_body(messages, tools, max_tokens=max_tokens, stream=True)
+        request = self._request(body, stream=True)
+        started_at = time.monotonic()
+        deadline = started_at + stream_timeout
+        received_bytes = 0
+        http_status: int | None = None
+        stage = "connect"
+        accumulator = _AnthropicEventAccumulator(on_text_delta)
+
+        def on_event(event_name: str, data: str) -> bool:
+            nonlocal stage
+            stage = "protocol"
+            return accumulator.handle(event_name, data)
+
+        parser = _SSEParser(on_event)
+
+        def diagnostic_error(error: ProviderStreamError, category: str) -> ProviderStreamError:
+            status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+            return ProviderStreamError(
+                error.safe_message,
+                category=category,
+                diagnostics=StreamDiagnostics(
+                    category=category,
+                    stage=stage,
+                    http_status=status,
+                    received_bytes=received_bytes,
+                    elapsed_ms=max(0, int((time.monotonic() - started_at) * 1000)),
+                ),
+            )
+
+        try:
+            with _open_without_redirect(request, timeout=min(self.timeout, stream_timeout)) as response:
+                status = getattr(response, "status", None)
+                if type(status) is int and 100 <= status <= 599:
+                    http_status = status
+                stage = "response_headers"
+                headers = getattr(response, "headers", None)
+                content_type = ""
+                if headers is not None:
+                    getter = getattr(headers, "get_content_type", None)
+                    content_type = getter() if callable(getter) else str(headers.get("Content-Type", ""))
+                if content_type.partition(";")[0].strip().casefold() != "text/event-stream":
+                    raise ProviderStreamError("DeepSeek Anthropic 接口没有返回 text/event-stream。")
+                content_length = headers.get("Content-Length") if headers is not None else None
+                if content_length is not None:
+                    try:
+                        if int(content_length) > MAX_STREAM_RESPONSE_BYTES:
+                            raise ProviderStreamError("Anthropic SSE 响应超过 4 MiB 上限。")
+                    except ValueError:
+                        raise ProviderStreamError("Anthropic SSE Content-Length 格式无效。") from None
+                raw_socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+                if raw_socket is None:
+                    raise ProviderStreamError("无法建立有界 Anthropic SSE 网络读取。", category="bounded_reader_unavailable")
+                while True:
+                    stage = "response_body"
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        raise ProviderCancelled("provider stream cancelled")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ProviderStreamError("Anthropic SSE 超过总时限。")
+                    if raw_socket is not None:
+                        try:
+                            raw_socket.settimeout(min(STREAM_READ_POLL_SECONDS, remaining))
+                        except OSError:
+                            try:
+                                closed = raw_socket.fileno() < 0
+                            except OSError:
+                                closed = True
+                            if not closed:
+                                raise ProviderStreamError("Anthropic SSE 网络传输配置失败。", category="transport_error") from None
+                            raw_socket = None
+                    try:
+                        chunk = response.read1(8192)
+                    except http.client.IncompleteRead as exc:
+                        if isinstance(exc.partial, bytes):
+                            received_bytes += len(exc.partial)
+                        raise ProviderStreamError("Anthropic SSE 在 message_stop 前断开。", category="missing_end_marker") from None
+                    except TimeoutError:
+                        if cancellation_event is not None and cancellation_event.is_set():
+                            raise ProviderCancelled("provider stream cancelled") from None
+                        if time.monotonic() >= deadline:
+                            raise ProviderStreamError("Anthropic SSE 超过总时限。") from None
+                        continue
+                    except (OSError, urllib.error.URLError) as exc:
+                        category = _stream_transport_category(exc, stage)
+                        if category == "transport_error" and deadline - time.monotonic() <= STREAM_READ_POLL_SECONDS:
+                            category = "read_timeout"
+                        message = {
+                            "read_timeout": "Anthropic SSE 响应读取超时。",
+                            "tls_failure": "Anthropic SSE TLS 安全传输失败。",
+                            "remote_disconnect": "Anthropic SSE 对端提前断开连接。",
+                            "connection_reset": "Anthropic SSE 连接被对端重置。",
+                            "name_resolution_failure": "Anthropic SSE 主机名解析失败。",
+                        }.get(category, "Anthropic SSE 网络传输失败。")
+                        raise ProviderStreamError(message, category=category) from None
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        raise ProviderCancelled("provider stream cancelled")
+                    if time.monotonic() >= deadline:
+                        raise ProviderStreamError("Anthropic SSE 超过总时限。")
+                    if not chunk:
+                        stage = "sse_parse"
+                        parser.finish()
+                        raise ProviderStreamError("Anthropic SSE 在 message_stop 前结束。", category="missing_end_marker")
+                    received_bytes += len(chunk)
+                    stage = "sse_parse"
+                    parser.feed(chunk)
+                    if time.monotonic() >= deadline:
+                        raise ProviderStreamError("Anthropic SSE 超过总时限。")
+                    if parser.done:
+                        break
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            if type(status) is int and 100 <= status <= 599:
+                http_status = status
+            try:
+                exc.close()
+            except Exception:
+                pass
+            error = ProviderStreamError(
+                f"DeepSeek Anthropic 接口返回 HTTP {http_status}。",
+                category="http_status",
+            )
+            raise diagnostic_error(error, "http_status") from None
+        except ProviderStreamError as exc:
+            category = exc.category or _stream_error_category(exc, stage)
+            raise diagnostic_error(exc, category) from None
+        except ProviderCancelled:
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            category = _stream_transport_category(exc, stage)
+            message = {
+                "connect_timeout": "Anthropic SSE 建连或响应头等待超时。",
+                "read_timeout": "Anthropic SSE 响应读取超时。",
+                "tls_failure": "Anthropic SSE TLS 安全传输失败。",
+                "remote_disconnect": "Anthropic SSE 对端提前断开连接。",
+                "connection_reset": "Anthropic SSE 连接被对端重置。",
+                "name_resolution_failure": "Anthropic SSE 主机名解析失败。",
+            }.get(category, "Anthropic SSE 网络传输失败。")
+            raise diagnostic_error(ProviderStreamError(message, category=category), category) from None
+        except Exception:
+            error = ProviderStreamError("Anthropic SSE 流处理失败。", category="internal_error")
+            raise diagnostic_error(error, "internal_error") from None
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise ProviderCancelled("provider stream cancelled")
+        return self._turn_from_payload(accumulator.payload())
+
+    def _turn_from_payload(self, payload: Any) -> AssistantTurn:
+        if (
+            not isinstance(payload, dict)
+            or set(payload) - {"id", "type", "role", "model", "content", "stop_reason", "stop_sequence", "usage"}
+            or payload.get("type") != "message"
+            or payload.get("role") != "assistant"
+            or not isinstance(payload.get("content"), list)
+            or len(payload["content"]) > MAX_ANTHROPIC_CONTENT_BLOCKS
+        ):
+            raise ProviderError("Anthropic 响应格式无效。")
+        stop_reason = payload.get("stop_reason")
+        if not isinstance(stop_reason, str) or stop_reason not in {"end_turn", "max_tokens", "stop_sequence", "tool_use"}:
+            raise ProviderError("Anthropic 响应 stop_reason 无效。")
+        content_parts: list[str] = []
+        calls: list[ToolCall] = []
+        seen_ids: set[str] = set()
+        safe_blocks: list[dict[str, Any]] = []
+        assistant_bytes = 0
+        for block in payload["content"]:
+            if not isinstance(block, dict):
+                raise ProviderError("Anthropic 响应内容块格式无效。")
+            block_type = block.get("type")
+            if block_type == "text":
+                if set(block) != {"type", "text"}:
+                    raise ProviderError("Anthropic 文本块含有尚未支持的字段。")
+                text = block.get("text")
+                if not isinstance(text, str):
+                    raise ProviderError("Anthropic 文本块格式无效。")
+                content_parts.append(text)
+                safe_blocks.append({"type": "text", "text": text})
+                value_for_size = text
+            elif block_type == "thinking":
+                if set(block) != {"type", "thinking", "signature"}:
+                    raise ProviderError("Anthropic thinking 块含有尚未支持的字段。")
+                thinking = block.get("thinking")
+                signature = block.get("signature")
+                if not isinstance(thinking, str) or not isinstance(signature, str) or not signature:
+                    raise ProviderError("Anthropic thinking 块缺少有效文本或签名。")
+                safe_blocks.append({"type": "thinking", "thinking": thinking, "signature": signature})
+                value_for_size = thinking + signature
+            elif block_type == "tool_use":
+                if set(block) != {"type", "id", "name", "input"}:
+                    raise ProviderError("Anthropic tool_use 块含有尚未支持的字段。")
+                call_id = block.get("id")
+                name = block.get("name")
+                arguments = block.get("input")
+                if (
+                    not isinstance(call_id, str)
+                    or not call_id
+                    or len(call_id) > 128
+                    or any(ord(char) < 32 for char in call_id)
+                    or call_id in seen_ids
+                    or not isinstance(name, str)
+                    or not name
+                    or len(name) > 128
+                    or any(ord(char) < 32 for char in name)
+                    or not isinstance(arguments, dict)
+                ):
+                    raise ProviderError("Anthropic tool_use 块格式无效。")
+                try:
+                    raw_arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+                    argument_bytes = len(raw_arguments.encode("utf-8"))
+                except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+                    raise ProviderError("Anthropic tool_use 参数格式无效。") from None
+                if argument_bytes > MAX_PROVIDER_TOOL_ARGUMENT_BYTES:
+                    raise ProviderError("Anthropic 工具参数超过本地大小上限。")
+                seen_ids.add(call_id)
+                calls.append(ToolCall(call_id, name, arguments))
+                safe_blocks.append({"type": "tool_use", "id": call_id, "name": name, "input": arguments})
+                value_for_size = raw_arguments
+            else:
+                raise ProviderError("Anthropic 响应含有尚未支持的内容块。")
+            try:
+                assistant_bytes += len(value_for_size.encode("utf-8"))
+            except UnicodeEncodeError:
+                raise ProviderError("Anthropic 响应文本格式无效。") from None
+            if assistant_bytes > MAX_STREAM_ASSISTANT_BYTES:
+                raise ProviderError("Anthropic 助手内容超过 2 MiB 上限。")
+            if len(calls) > MAX_PROVIDER_TOOL_CALLS:
+                raise ProviderError("Anthropic 工具调用超过本地数量上限。")
+        if (bool(calls)) != (stop_reason == "tool_use"):
+            raise ProviderError("Anthropic 工具调用与 stop_reason 不一致；未执行工具。")
+        usage_value = payload.get("usage")
+        usage: ProviderUsage | None = None
+        if isinstance(usage_value, dict):
+            prompt = usage_value.get("input_tokens")
+            completion = usage_value.get("output_tokens")
+            if (
+                type(prompt) is int
+                and 0 <= prompt <= 2_000_000_000
+                and type(completion) is int
+                and 0 <= completion <= 2_000_000_000
+            ):
+                usage = ProviderUsage(prompt, completion, prompt + completion)
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(content_parts) or None,
+            "deepseek_anthropic_content": safe_blocks,
+        }
+        return AssistantTurn(
+            content="".join(content_parts),
+            tool_calls=calls,
+            assistant_message=assistant_message,
+            usage=usage,
+            finish_reason=stop_reason,
+        )
+
+    def complete_subagent(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        timeout_seconds: float,
+        max_output_tokens: int,
+        cancellation_event: threading.Event,
+    ) -> AssistantTurn:
+        """Keep the common subagent boundary: exact canonical read tools only."""
+        if cancellation_event.is_set():
+            raise ProviderCancelled("subagent cancelled")
+        if (
+            not isinstance(messages, list)
+            or not 2 <= len(messages) <= 5
+            or not all(isinstance(item, dict) for item in messages)
+            or messages[0].get("role") != "system"
+            or messages[1].get("role") != "user"
+            or not isinstance(messages[0].get("content"), str)
+            or not isinstance(messages[1].get("content"), str)
+            or len(messages[1]["content"]) > MAX_SUBAGENT_TASK_CHARS
+            or any(item.get("role") not in {"system", "user", "assistant", "tool"} for item in messages)
+            or any(item.get("role") == "system" for item in messages[1:])
+            or any(item.get("role") == "user" for item in messages[2:])
+        ):
+            raise ProviderError("子代理上下文格式无效。")
+        allowed_names = {"read_file", "list_directory"}
+        tools = [] if tools is None else tools
+        if not isinstance(tools, list) or len(tools) > 2:
+            raise ProviderError("子代理只读工具列表格式无效。")
+        from .tools import TOOL_SCHEMAS
+        canonical = {
+            schema["function"]["name"]: schema
+            for schema in TOOL_SCHEMAS
+            if schema["function"]["name"] in allowed_names
+        }
+        seen: set[str] = set()
+        for schema in tools:
+            try:
+                name = schema["function"]["name"]
+            except (KeyError, TypeError):
+                raise ProviderError("子代理只读工具列表格式无效。") from None
+            if name not in allowed_names or name in seen or schema != canonical[name]:
+                raise ProviderError("子代理只允许使用只读文件工具。")
+            seen.add(name)
+        from .usage import estimate_payload_tokens
+        if estimate_payload_tokens(messages, tools) > MAX_SUBAGENT_INPUT_TOKENS:
+            raise ProviderError("子代理输入超过本地预算上限。")
+        if type(max_output_tokens) is not int or not 1 <= max_output_tokens <= MAX_SUBAGENT_OUTPUT_TOKENS:
+            raise ProviderError("子代理输出预算超出本地上限。")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < timeout_seconds <= MAX_SUBAGENT_TIMEOUT_SECONDS
+        ):
+            raise ProviderError("子代理请求时限超出本地上限。")
+        started = time.monotonic()
+        try:
+            result = self.complete_streaming(
+                messages,
+                tools,
+                cancellation_event=cancellation_event,
+                max_tokens=max_output_tokens,
+                on_text_delta=lambda _fragment: None,
+                timeout_seconds=float(timeout_seconds),
+            )
+        except ProviderStreamError:
+            if cancellation_event.is_set():
+                raise ProviderCancelled("subagent cancelled") from None
+            if time.monotonic() - started >= timeout_seconds:
+                raise TimeoutError("subagent deadline elapsed") from None
+            raise
+        if time.monotonic() - started > timeout_seconds:
+            raise TimeoutError("subagent deadline elapsed")
+        if cancellation_event.is_set():
+            raise ProviderCancelled("subagent cancelled")
+        if len(result.tool_calls) > MAX_SUBAGENT_TOOL_CALLS_PER_TURN:
+            raise ProviderError("子代理只读调用数超过本地上限。")
+        return result
+
+
 def provider_from_environment(
     provider_name: str,
     model_override: str | None = None,
@@ -1072,6 +1988,28 @@ def provider_from_environment(
         else:
             base_url = validate_base_url(base_url)
         return OpenAICompatibleProvider(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            timeout=request_timeout_seconds,
+            stream_timeout=request_timeout_seconds,
+        )
+    if provider_name == "deepseek-anthropic":
+        model = model_override or settings.get("HARNESS_MODEL", "deepseek-flash")
+        base_url = (
+            base_url_override
+            or settings.get("HARNESS_BASE_URL", DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL)
+        )
+        api_key = (
+            api_key_override
+            if api_key_override is not None
+            else settings.get(DEEPSEEK_API_KEY_ENV, "")
+        )
+        base_url = validate_deepseek_anthropic_base_url(
+            base_url,
+            allow_loopback_http=not api_key,
+        )
+        return DeepSeekAnthropicProvider(
             base_url=base_url,
             api_key=api_key,
             model=model,

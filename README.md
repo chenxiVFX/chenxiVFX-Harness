@@ -77,7 +77,7 @@ python -m venv .venv
 
 `提供商`、`模型`和`端点`保存后需重启才会切换本轮 provider；预算配置在没有更高优先级覆盖时立即应用。`/预算 16384` 只改当前会话。用 `/配置 模型 默认` 或 `/配置 端点 默认` 清除相应工作区覆盖；`/配置 重置` 写回默认值，但环境变量和命令行仍优先。若配置文件损坏，可用 `--ignore-config` 忽略它启动，再通过 `/配置` 保存新设置。
 
-当前只支持离线 `mock` 和 DeepSeek 的 OpenAI 兼容模式；Anthropic 和其他服务尚未实现。Base URL 必须是 HTTPS `api.deepseek.com:443`，不得包含 userinfo、查询参数、片段或看起来像凭据的文本；只允许配置服务地址，不要把密钥放入 URL。`DEEPSEEK_API_KEY` 只从环境读取，绝不写进配置文件；使用 Network secret 时目标主机限制仍为 `api.deepseek.com:443`。
+当前支持离线 `mock`、DeepSeek OpenAI 兼容模式，以及独立的 `deepseek-anthropic` DeepSeek Anthropic 兼容模式。后者固定使用 `https://api.deepseek.com/anthropic` 路径，只接受 `deepseek-flash` 与 `deepseek-v4-pro`，不会连接官方 Claude 服务，也不接受 Claude 模型别名。两种 DeepSeek provider 只读取 `DEEPSEEK_API_KEY`；Anthropic 兼容模式不会查询 `ANTHROPIC_API_KEY`。凭据仍只从环境读取，绝不写进配置文件；请求仅发往固定 DeepSeek HTTPS 主机与协议路径，不接受重定向。不得把密钥放入 URL、命令行、项目文件、聊天或 Git。
 
 同样的非敏感设置也可在启动时用 `--provider`、`--model`、`--base-url`、`--token-budget` 和 `--max-output-tokens` 覆盖。超长或格式错误的输入不会被错误消息回显。配置文件损坏时可这样绕过并继续使用 Mock：
 
@@ -95,7 +95,7 @@ python -m venv .venv
 
 Token 数由本地字符启发式估算，不是提供商 tokenizer 的精确数值。`/统计` 另显示固定系统提示与工具 schema、会话消息的独立估算分项；分项不相加，也不是缓存命中量。provider 明确返回 `prompt_cache_hit_tokens` 时才统计缓存输入，否则显示暂无报告。`--token-budget`（默认 16384）和 `/预算` 只是上下文提示；`--max-output-tokens`（默认 2048）为单次提问的所有模型回复共享输出预算，`--max-model-requests` 可把每次提问限制为 1–4 次请求（默认 4），不会自动重试。每次请求按剩余预算和剩余请求数分配 `max_tokens`。`--request-timeout` 为每个 SSE 请求设置从建连开始的总时限，默认 45 秒、硬限 120 秒。若 provider 返回 usage，统计会记录报告值；缺失时按该请求完整 `max_tokens` 额度保守扣除。字符估算不是 provider tokenizer，不能保证远端计量精确；当前不计算金额或推测动态价格。启动参数示例：`.\run.ps1 --token-budget 32000 --max-output-tokens 2048`。
 
-委派计划每个会话最多 3 项，每项在启动前单独审批；任务最多 240 字符、最多 2 个并发子代理、每项最多 2 轮模型请求、首轮最多 2 个工具调用、单任务输出最多 256 tokens、单请求输入估算最多 512 tokens、共享输入估算最多 3072 tokens。子代理运行时限默认为 60 秒，可用 `--subagent-timeout` 或 `/子代理 时限 <5–120>` 调整；这是每项任务的硬上限，从该任务首个 provider 请求开始计时，审批与执行前排队不计入。单个 SSE 请求仍受 `--request-timeout` 限制，默认 45 秒、上限 120 秒；取消在响应读取期间最多约 250 ms 检查一次。Mock 和 OpenAI 兼容 provider 都通过同一 `complete_subagent` 边界。子代理默认不获文件工具；用户可用 `--读取` 明确预授权最多 4 个工作区内现存文件或目录，每次委派审批会展示精确任务、工具和时限。文件只允许 `read_file`；目录只允许列名称与类型。子代理不能读范围外路径、写入、执行 shell、递归委派，也不会继承主会话、目标、文件引用、工具结果或父代理的审批。共享输入上限用本地估算执行，失败请求会保留输入预留；获批任务的输出上限会预留、不因失败释放。结果会先脱敏，再以不可信 JSON 汇总；`收取` 将它作为不可存档的 user 上下文加入父对话。失败、超时、取消和预算耗尽会显示为不同状态。
+委派计划每个会话最多 3 项，每项在启动前单独审批；任务最多 240 字符、最多 2 个并发子代理、每项最多 2 轮模型请求、首轮最多 2 个工具调用、单任务输出最多 256 tokens、单请求输入估算最多 512 tokens、共享输入估算最多 3072 tokens。子代理运行时限默认为 60 秒，可用 `--subagent-timeout` 或 `/子代理 时限 <5–120>` 调整；这是每项任务的硬上限，从该任务首个 provider 请求开始计时，审批与执行前排队不计入。单个 SSE 请求仍受 `--request-timeout` 限制，默认 45 秒、上限 120 秒；取消在响应读取期间最多约 250 ms 检查一次。Mock、OpenAI 兼容和 DeepSeek Anthropic 兼容 provider 共用 `complete_subagent` 边界；Anthropic 兼容路径的远端服务行为尚未在线验证。子代理默认不获文件工具；用户可用 `--读取` 明确预授权最多 4 个工作区内现存文件或目录，每次委派审批会展示精确任务、工具和时限。文件只允许 `read_file`；目录只允许列名称与类型。子代理不能读范围外路径、写入、执行 shell、递归委派，也不会继承主会话、目标、文件引用、工具结果或父代理的审批。共享输入上限用本地估算执行，失败请求会保留输入预留；获批任务的输出上限会预留、不因失败释放。结果会先脱敏，再以不可信 JSON 汇总；`收取` 将它作为不可存档的 user 上下文加入父对话。失败、超时、取消和预算耗尽会显示为不同状态。
 
 示例：`/子代理 提交 --读取 src/app.py -- 检查路由边界 | 梳理配置校验`。如任务不需要文件，可用旧写法 `/子代理 检查路由边界 | 梳理配置校验`。提交后用 `/子代理 列表` 查询，`/子代理 取消 S01` 取消单项，`/子代理 收取 全部` 收取已结束结果。子代理文件范围必须在当前工作区内，且不递归扩展目录；需要其他文件时重新提交明确范围并再次审批。
 
@@ -113,13 +113,23 @@ Token 数由本地字符启发式估算，不是提供商 tokenizer 的精确数
 
 离线回归使用合成数据和本机 HTTP fixture。另一次无工具 DeepSeek smoke 返回 HTTP 200 和“连接成功”（usage 输入 36、输出 43、总计 79）。本轮在全新临时目录完成了有限真实工具闭环：向 `api.deepseek.com:443` 的 `deepseek-flash` 发出 2 次请求，单次 `max_tokens` 为 256、合计上限 512；模型仅获 `list_directory` schema，并获准列出 `synthetic/hello.txt`，两次 HTTP 均为 200，usage 输入 1022、输出 82、合计 1104。只传了合成提示和列表结果，没有发送仓库或用户文件；这只验证了该受限路径，不代表完整产品或其他工具已通过。HTTP 429 不自动重试；适配器只统计 provider 返回的 Token usage，不核算费用。直接调用保留的非流式 JSON `complete()` 时，取消信号只在发送前和收到响应后检查；CLI SSE 流在响应体读取期间每 250 ms 检查一次，建连/响应头仍受 provider 超时限制。
 
+## DeepSeek Anthropic 兼容模式
+
+`--provider deepseek-anthropic` 使用 DeepSeek 官方记录的 Anthropic-compatible API 入口 `https://api.deepseek.com/anthropic`，内部只请求 `/v1/messages`；模型限制为 `deepseek-flash` 和 `deepseek-v4-pro`。选择该模式时 Harness 只读取 `DEEPSEEK_API_KEY` 并通过 `x-api-key` 请求头发送，不会读取 `ANTHROPIC_API_KEY`。固定目标 HTTPS 使用标准证书校验，HTTP 重定向不会跟随。官方 Claude 服务、Claude 账号、Claude 模型别名、自定义主机和其他 API 路径均不支持。详情参见 [DeepSeek Anthropic API 指南](https://api-docs.deepseek.com/guides/anthropic_api/)；DeepSeek 文档说明了兼容功能，但没有枚举其 SSE 事件序列和 usage 响应字段，因此事件序列按[Anthropic 官方 SSE 规范](https://platform.claude.com/docs/en/build-with-claude/streaming)实现，尚未由真实 DeepSeek Anthropic 请求验证。
+
+请求使用 Anthropic Messages 的 `system`、文本消息、工具 schema、`tool_use` / `tool_result` 往返与 `auto` 工具选择。模型侧 thinking 默认关闭（见 [DeepSeek thinking mode 文档](https://api-docs.deepseek.com/guides/thinking_mode/)）；若响应仍含标准 `thinking` 块，Harness 不显示其内容，并在当前内存上下文中原样保留文本和签名供工具轮次使用。只接受文本、带有效签名的 thinking 和标准 `tool_use` 块；图片、多模态、`server_tool_use`、`redacted_thinking`、文档/搜索/MCP 等内容，以及未知 SSE 事件、字段或增量均明确拒绝。DeepSeek 文档列出部分这些 block 为已支持或忽略，但 Harness 当前没有对应本地执行或保真路径，因此不会静默丢弃。通过完整消息结束标记、参数 JSON 与现有 Agent 预算校验后，工具仍逐次走本地审批；只读子代理限定原有精确路径规则。Mock 不会被拿来模拟该 provider；若某个 provider 没有流式能力，CLI 会明确拒绝流式请求。
+
+Anthropic SSE 使用与现有 provider 相同的有界 UTF-8/SSE 解析器：跨网络块处理中文和 LF/CRLF 边界，限制 4 MiB 响应、2 MiB 助手内容、512 KiB 单行/事件、16,384 个事件及最多 120 秒总时限；响应读取时约每 250 ms 检查取消。只有收到完整 `message_stop` 才返回工具调用；错误或截断响应不会触发该轮工具。标准 `input_tokens` / `output_tokens` 字段若出现会用于统计，但 DeepSeek 尚未在该兼容指南中明示这两个响应字段；usage 缺失或无效时按该请求完整 `max_tokens` 额度保守扣除，不推测缓存命中。终端输出沿用控制字符可见转义与疑似凭据脱敏；网络错误不显示原始异常、请求头、URL 或响应体。非流式 `complete()` 存在，但它仅在发送前和收到响应后检查取消，CLI 使用有界 SSE。
+
+本次实现只通过本机 loopback 合成 HTTP fixture 与离线测试；没有请求真实模型服务，也没有读取、设置或输出凭据。测试证明本地协议适配与已有 Agent 循环的组合行为，不证明远端兼容服务的完整产品验收。
+
 ### 有界 SSE 流式交互
 
-OpenAI 兼容模式在 CLI 中使用 SSE 逐段显示中文文本；UTF-8 解码器和事件解析器可跨任意网络分块处理中文、LF/CRLF 行界与多行 `data`。请求必须返回 `text/event-stream`，并收到完成状态及 `[DONE]`；响应上限为 4 MiB、助手文本和推理合计上限为 2 MiB、单行/单事件上限为 512 KiB、最多 16,384 个事件、总时限最多 120 秒。取消事件在响应体读取期间每 250 ms 检查一次；建连和响应头等待受 provider 超时限制。网络错误只附加固定分类、阶段、HTTP 状态、已收字节数和耗时；POSIX `ETIMEDOUT` / `EAGAIN` 和 Winsock `10060` / `10035` 均按超时阶段归类；不显示原始异常、请求头、URL 或响应体。响应由上下文管理器关闭，HTTP 状态错误也会显式关闭。
+CLI 的 OpenAI 兼容模式和 DeepSeek Anthropic 兼容模式均使用有界 SSE 逐段显示中文文本；UTF-8 解码器和事件解析器可跨任意网络分块处理中文及 LF/CRLF 行界。OpenAI 兼容流要求完成状态及 `[DONE]`；Anthropic 兼容流按 `message_start`、content block、`message_delta`、`message_stop` 校验。响应上限为 4 MiB、助手文本和推理合计上限为 2 MiB、单行/单事件上限为 512 KiB、最多 16,384 个事件、总时限最多 120 秒。取消事件在响应体读取期间每 250 ms 检查一次；建连和响应头等待受 provider 超时限制。网络错误只附加固定分类、阶段、HTTP 状态、已收字节数和耗时；POSIX `ETIMEDOUT` / `EAGAIN` 和 Winsock `10060` / `10035` 均按超时阶段归类；不显示原始异常、请求头、URL 或响应体。响应由上下文管理器关闭，HTTP 状态错误也会显式关闭。
 
 SSE 保留 Python `urllib` 的 HTTP 代理 CONNECT 和 TLS 验证路径，轮询取消时使用其响应 socket 的短超时与 `read1()`；未使用 `select`。若响应不提供可用于有界读取的 socket，会明确报错。离线测试通过本机 CONNECT 代理和测试专用证书检查代理隧道、TLS 主机名与证书校验、分块中文、慢读和截断；测试证书只为 `sse-fixture.invalid` 使用，客户端仍要求有效证书且开启主机名检查。普通 JSON `complete()` 仍走非流式 `read()`，其取消检查只在发送前和收到响应后执行。
 
-工具调用片段会先在内存中累积并校验，收到完整结束标记后才交给既有 Agent 循环；工具仍逐次审批。截断、无效或超限流不会返回不完整工具调用，因此不能触发该轮工具。当前 SSE 只支持单个候选项、普通文本、`reasoning_content` 和函数工具调用；多模态、`logprobs`、未知增量字段等会明确报错。Mock 默认离线且不使用 SSE；请求流式输出的 provider 若没有 `complete_streaming` 会明确拒绝。流式文本可能在完整状态尚未到达前已显示；取消或传输失败后不完整轮次不会写入会话，已显示片段不会自动撤回。控制字符会以可见转义显示，疑似凭据片段在终端输出前脱敏。单元与本机 fixture 测试不等于完整产品验收，也不能确定之前那次没有诊断字段的 SSE 失败原因。
+工具调用片段会先在内存中累积并校验，收到协议完整结束标记后才交给既有 Agent 循环；工具仍逐次审批。截断、无效或超限流不会返回不完整工具调用，因此不能触发该轮工具。当前支持 OpenAI 兼容的单候选文本、`reasoning_content` 和函数工具调用，以及 DeepSeek Anthropic 兼容的文本、签名 thinking 与标准工具块；不支持多模态、`logprobs`、未签名/未知增量和其他 Anthropic 内容块。Mock 默认离线且不使用 SSE；请求流式输出的 provider 若没有 `complete_streaming` 会明确拒绝。流式文本可能在完整状态尚未到达前已显示；取消或传输失败后不完整轮次不会写入会话，已显示片段不会自动撤回。控制字符会以可见转义显示，疑似凭据片段在终端输出前脱敏。单元与本机 fixture 测试不等于完整产品验收；本轮 DeepSeek Anthropic 兼容行为也没有在线验证。
 
 ## 权限与边界
 
@@ -131,7 +141,7 @@ SSE 保留 Python `urllib` 的 HTTP 代理 CONNECT 和 TLS 验证路径，轮询
 实际修改时，在 `/模式 执行` 下直接描述单文件更改。若模型提出 `write_file`，CLI 会先显示新建/覆盖类型及完整 diff，再等待本次单独确认；检查差异后输入 `y` 写入，其他输入都拒绝。要恢复已批准写入，运行 `/撤销` 并再次审阅差异确认。该工具只编辑文本，不会运行或验证项目代码。
 - 模型输出、文件内容、工具结果、目标文本和历史摘要都是不可信数据，不能修改权限规则。未知工具一律拒绝。
 - 单次提问最多 4 轮模型回复、每轮最多执行 4 个工具调用、每个模型响应最多接收 16 个调用；输出预算默认 2048 个 provider completion tokens。按剩余请求槽分配每次 `max_tokens`；缺少 usage 时完整扣除该请求额度。重复调用编号、格式错误参数或超过单次额度的响应会在任何工具执行前终止当前轮次。
-- 当前没有 shell、通用命令执行、隔离 worktree、PTC 执行或 Anthropic provider。子代理只允许两种只读工具，并且仅限用户预先批准的精确路径。
+- 当前没有 shell、通用命令执行、隔离 worktree、PTC 执行或官方 Claude provider。Anthropic 消息协议只作为 DeepSeek 的兼容接口使用。子代理只允许两种只读工具，并且仅限用户预先批准的精确路径。
 - Windows 路径/中文文件的普通读写测试在本机通过。当前 Debian 测试覆盖 symlink 与 hard link 逃逸；junction 和 Windows 链接策略由跨平台 CI 验证。测试不会更改系统链接权限。
 
 ## 离线回归

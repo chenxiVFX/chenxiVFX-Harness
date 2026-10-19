@@ -180,6 +180,29 @@ class WorkspaceConfigTests(unittest.TestCase):
         self.assertEqual(openai_default.model, "deepseek-flash")
         self.assertEqual(openai_default.base_url, "https://api.deepseek.com")
 
+        anthropic_compat_default = resolve_config(
+            WorkspaceConfig(provider="deepseek-anthropic"),
+            True,
+            SimpleNamespace(provider=None, model=None, base_url=None, token_budget=None, max_output_tokens=None),
+            environment={},
+        )
+        self.assertEqual(anthropic_compat_default.provider, "deepseek-anthropic")
+        self.assertEqual(anthropic_compat_default.model, "deepseek-flash")
+        self.assertEqual(anthropic_compat_default.base_url, "https://api.deepseek.com/anthropic")
+
+    def test_deepseek_anthropic_config_rejects_claude_aliases_and_other_routes(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "不接受 Claude 模型别名"):
+            validate_workspace_config(WorkspaceConfig(provider="deepseek-anthropic", model="claude-sonnet-4-5"))
+        for base_url in (
+            "https://api.deepseek.com",
+            "https://api.deepseek.com/v1",
+            "https://example.invalid/anthropic",
+            "https://api.deepseek.com:444/anthropic",
+        ):
+            with self.subTest(base_url=base_url):
+                with self.assertRaises(ConfigError):
+                    validate_workspace_config(WorkspaceConfig(provider="deepseek-anthropic", base_url=base_url))
+
     def test_environment_and_cli_errors_do_not_echo_values(self) -> None:
         secret = "sk-" + "B" * 24
         cli = SimpleNamespace(provider=None, model=None, base_url=None, token_budget=None, max_output_tokens=None)
@@ -218,7 +241,8 @@ class WorkspaceConfigTests(unittest.TestCase):
                 result = run_console(args, output=outputs.append)
             factory.assert_not_called()
         self.assertEqual(result, 2)
-        self.assertIn("Anthropic provider 尚未实现", "\n".join(outputs))
+        self.assertIn("未接入官方 Claude 服务", "\n".join(outputs))
+        self.assertIn("deepseek-anthropic", "\n".join(outputs))
 
     def test_chinese_config_commands_persist_without_saving_a_key(self) -> None:
         inputs = iter(
@@ -276,6 +300,38 @@ class WorkspaceConfigTests(unittest.TestCase):
         self.assertIn("下次启动设置", "\n".join(outputs))
         self.assertIn("密钥不会写入配置文件", "\n".join(outputs))
 
+    def test_chinese_config_selects_deepseek_anthropic_without_persisting_credentials(self) -> None:
+        inputs = iter([
+            "/配置 提供商 deepseek-anthropic",
+            "/配置 模型 deepseek-v4-pro",
+            "/配置 端点 https://api.deepseek.com/anthropic",
+            "/配置",
+            "/帮助",
+            "/退出",
+        ])
+        outputs: list[str] = []
+        args = SimpleNamespace(workspace=self.temp.name, ignore_config=False)
+        with patch.dict(os.environ, {}, clear=False):
+            for name in (
+                "HARNESS_PROVIDER", "HARNESS_MODEL", "HARNESS_BASE_URL",
+                "HARNESS_TOKEN_BUDGET", "HARNESS_MAX_OUTPUT_TOKENS",
+            ):
+                os.environ.pop(name, None)
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()):
+                result = run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append)
+        loaded, exists = self.store.load()
+        serialized = self.path.read_text(encoding="utf-8")
+        self.assertEqual(result, 0)
+        self.assertTrue(exists)
+        self.assertEqual(loaded.provider, "deepseek-anthropic")
+        self.assertEqual(loaded.model, "deepseek-v4-pro")
+        self.assertEqual(loaded.base_url, "https://api.deepseek.com/anthropic")
+        self.assertNotIn("api_key", serialized.casefold())
+        self.assertNotIn("ANTHROPIC_API_KEY", serialized)
+        self.assertIn("DeepSeek Anthropic Messages 兼容", "\n".join(outputs))
+        self.assertIn("DeepSeek Anthropic 兼容模式使用各自协议的有界 SSE", "\n".join(outputs))
+        self.assertIn("Claude", "\n".join(outputs))
+
     def test_corrupt_file_can_be_bypassed_without_being_read_or_overwritten(self) -> None:
         self.path.parent.mkdir(parents=True)
         broken = "{ definitely not json"
@@ -293,7 +349,8 @@ class WorkspaceConfigTests(unittest.TestCase):
 class ConfigParserTests(unittest.TestCase):
     def test_help_documents_supported_providers_and_persistence(self) -> None:
         help_text = build_parser().format_help()
-        self.assertIn("仅 DeepSeek 兼容模式", help_text)
+        self.assertIn("deepseek-anthropic", help_text)
+        self.assertIn("仅连接", help_text)
         self.assertIn("--ignore-config", help_text)
 
     def test_invalid_numeric_cli_value_is_not_echoed(self) -> None:

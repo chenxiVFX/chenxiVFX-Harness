@@ -239,7 +239,10 @@ class Agent:
                 if not isinstance(assistant_message, dict) or assistant_message.get("role") != "assistant":
                     raise ProviderError("模型响应格式无效。")
                 assistant_message = dict(assistant_message)
-                if set(assistant_message) - {"role", "content", "reasoning_content", "tool_calls"}:
+                if set(assistant_message) - {
+                    "role", "content", "reasoning_content", "tool_calls",
+                    "deepseek_anthropic_content",
+                }:
                     raise ProviderError("模型响应格式无效。")
                 if assistant_message.get("content") is not None and not isinstance(
                     assistant_message.get("content"), str
@@ -248,6 +251,15 @@ class Agent:
                 reasoning_content = assistant_message.get("reasoning_content")
                 if reasoning_content is not None and not isinstance(reasoning_content, str):
                     raise ProviderError("模型响应格式无效。")
+                native_content = assistant_message.get("deepseek_anthropic_content")
+                if native_content is not None:
+                    if not isinstance(native_content, list) or len(native_content) > 256:
+                        raise ProviderError("模型原生 Anthropic 内容格式无效。")
+                    try:
+                        if len(json.dumps(native_content, ensure_ascii=False).encode("utf-8")) > 2 * 1024 * 1024:
+                            raise ProviderError("模型原生 Anthropic 内容超过本地上限。")
+                    except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+                        raise ProviderError("模型原生 Anthropic 内容格式无效。") from None
                 if response.tool_calls:
                     raw_calls = assistant_message.get("tool_calls")
                     if raw_calls is not None:

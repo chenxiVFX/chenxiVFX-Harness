@@ -235,7 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         default=argparse.SUPPRESS,
-        help="模型提供商：mock 或 openai（仅 DeepSeek 兼容模式；默认 mock）",
+        help="模型提供商：mock、openai 或 deepseek-anthropic（后两者仅连接 DeepSeek；默认 mock）",
     )
     parser.add_argument("--model", default=argparse.SUPPRESS, help="覆盖工作区配置和 HARNESS_MODEL")
     parser.add_argument(
@@ -326,8 +326,8 @@ TTY 且提供 Python readline 时，Tab 补全命令名和固定选项（如 /�
 目录列表只返回名称和类型，每次也要人工确认；不读取目录项文件内容。
 敏感凭据路径默认禁止读取或修改。当前版本不会运行 shell 命令。
 工作区配置保存在 .harness/config/settings.json；优先级为默认值、工作区配置、环境变量、命令行。
-配置不接受或保存密钥；目前只支持 mock 和 DeepSeek OpenAI 兼容模式，Anthropic 未实现。
-OpenAI 兼容模式使用有界 SSE 流式文本；工具片段完整校验后仍走现有逐次审批循环。
+配置不接受或保存密钥；目前支持 mock、DeepSeek OpenAI 兼容模式，以及 DeepSeek 专用 Anthropic Messages 兼容入口。它不连接官方 Claude 账号或接受 Anthropic 密钥。
+OpenAI 与 DeepSeek Anthropic 兼容模式使用各自协议的有界 SSE；工具片段完整校验后仍走现有逐次审批循环。
 """
 
 
@@ -628,8 +628,8 @@ def run_console(
                     f"本轮预算：{agent.token_budget}；本轮输出上限：{agent.max_output_tokens} tokens\n"
                     f"每次提问最多模型请求：{agent.max_provider_requests}；请求总时限：{getattr(provider, 'stream_timeout', DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS):g} 秒\n"
                     f"新子任务运行时限：{subagent_manager.timeout_seconds:g} 秒（审批与执行前排队不计）\n"
-                    f"OpenAI 密钥变量：{DEEPSEEK_API_KEY_ENV}；仅 OpenAI 模式从环境读取，不展示或写入配置\n"
-                    "当前只支持 mock 和 DeepSeek OpenAI 兼容模式；Anthropic 未实现。Shell：禁用"
+                    f"DeepSeek 密钥变量：{DEEPSEEK_API_KEY_ENV}；仅 DeepSeek 兼容模式从环境读取，不展示或写入配置\n"
+                    "当前支持 mock、DeepSeek OpenAI 兼容和 DeepSeek Anthropic Messages 兼容模式；不支持官方 Claude 账号。Shell：禁用"
                 )
                 continue
 
@@ -650,7 +650,7 @@ def run_console(
                 changed_field = aliases.get(field_name)
                 if changed_field is None or not raw_value:
                     output(
-                        "用法：/配置 [提供商 mock|openai | 模型 <名称>|默认 | "
+                        "用法：/配置 [提供商 mock|openai|deepseek-anthropic | 模型 <名称>|默认 | "
                         "端点 <DeepSeek HTTPS URL>|默认 | 预算 <1024–1000000> | "
                         "输出上限 <1–65536> | 重置]"
                     )

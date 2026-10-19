@@ -46,17 +46,19 @@ from cvfx_harness.cli import (
 from cvfx_harness.providers import (
     AssistantTurn,
     DEEPSEEK_API_KEY_ENV,
+    DeepSeekAnthropicProvider,
     MockProvider,
     OpenAICompatibleProvider,
     ProviderCancelled,
     ProviderError,
     ProviderStreamError,
     ToolCall,
+    _AnthropicEventAccumulator,
     _SSEParser,
     _stream_transport_category,
     provider_from_environment,
 )
-from cvfx_harness.tools import ActionRequest, Workspace, WorkspaceError, run_tool
+from cvfx_harness.tools import ActionRequest, TOOL_SCHEMAS, Workspace, WorkspaceError, run_tool
 from cvfx_harness.usage import ProviderUsage
 
 def make_test_temp(prefix: str = "case-") -> tempfile.TemporaryDirectory:
@@ -186,6 +188,13 @@ def fixture_sse_frames(events: list[dict[str, object]], *, done: bool = True) ->
     if done:
         frames += b"data: [DONE]\r\n\r\n"
     return frames
+
+
+def fixture_anthropic_sse(events: list[dict[str, object]]) -> bytes:
+    return b"".join(
+        f"event: {event['type']}\r\ndata: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\r\n\r\n".encode("utf-8")
+        for event in events
+    )
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -1488,6 +1497,558 @@ class CliTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_anthropic_sse_parser_decodes_chinese_when_every_utf8_byte_is_split(self) -> None:
+        wire = fixture_anthropic_sse([
+            {"type": "message_start", "message": {"type": "message", "role": "assistant", "content": []}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "跨块中文✓"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+            {"type": "message_stop"},
+        ])
+        pieces: list[str] = []
+        accumulator = _AnthropicEventAccumulator(pieces.append)
+        parser = _SSEParser(accumulator.handle)
+        for byte in wire:
+            if parser.feed(bytes([byte])):
+                break
+        provider = DeepSeekAnthropicProvider("http://127.0.0.1:32123/anthropic", "", "deepseek-flash")
+        turn = provider._turn_from_payload(accumulator.payload())
+        self.assertTrue(parser.done)
+        self.assertEqual(pieces, ["跨块中文✓"])
+        self.assertEqual(turn.content, "跨块中文✓")
+
+    def test_deepseek_anthropic_sse_uses_fixed_route_and_streams_split_utf8_without_credentials(self) -> None:
+        captured: dict[str, object] = {}
+        wire = fixture_anthropic_sse([
+            {
+                "type": "message_start",
+                "message": {
+                    "type": "message", "id": "msg_fixture", "role": "assistant",
+                    "model": "deepseek-flash", "content": [], "stop_reason": None,
+                    "usage": {"input_tokens": 7, "output_tokens": 0},
+                },
+            },
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "你"}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "好，世界"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 4}},
+            {"type": "message_stop"},
+        ])
+
+        def serve(handler, request_body: bytes) -> None:
+            captured["path"] = handler.path
+            captured["x_api_key"] = handler.headers.get("x-api-key")
+            captured["authorization"] = handler.headers.get("Authorization")
+            captured["version"] = handler.headers.get("anthropic-version")
+            captured["accept"] = handler.headers.get("Accept")
+            captured["request"] = json.loads(request_body.decode("utf-8"))
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            handler.send_header("Content-Length", str(len(wire)))
+            handler.end_headers()
+            for offset in range(0, len(wire), 3):
+                handler.wfile.write(wire[offset:offset + 3])
+                handler.wfile.flush()
+
+        server, worker = local_http_fixture(serve)
+        pieces: list[str] = []
+        try:
+            provider = DeepSeekAnthropicProvider(
+                f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash",
+                timeout=2, stream_timeout=2,
+            )
+            turn = provider.complete_streaming(
+                [
+                    {"role": "system", "content": "固定合成系统提示"},
+                    {"role": "user", "content": "合成中文请求"},
+                ],
+                [],
+                max_tokens=32,
+                on_text_delta=pieces.append,
+            )
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+        request = captured["request"]
+        self.assertEqual(turn.content, "你好，世界")
+        self.assertEqual(pieces, ["你", "好，世界"])
+        self.assertEqual(turn.usage, ProviderUsage(7, 4, 11))
+        self.assertEqual(captured["path"], "/anthropic/v1/messages")
+        self.assertIsNone(captured["x_api_key"])
+        self.assertIsNone(captured["authorization"])
+        self.assertEqual(captured["version"], "2023-06-01")
+        self.assertEqual(captured["accept"], "text/event-stream")
+        self.assertEqual(request["model"], "deepseek-flash")
+        self.assertEqual(request["max_tokens"], 32)
+        self.assertTrue(request["stream"])
+        self.assertEqual(request["thinking"], {"type": "disabled"})
+        self.assertEqual(request["system"], "固定合成系统提示")
+
+    def test_deepseek_anthropic_nonstream_complete_uses_same_fixed_route(self) -> None:
+        captured: dict[str, object] = {}
+        response_body = json.dumps({
+            "id": "msg_fixture",
+            "type": "message",
+            "role": "assistant",
+            "model": "deepseek-flash",
+            "content": [{"type": "text", "text": "本地合成 JSON 答复"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 3, "output_tokens": 4},
+        }, ensure_ascii=False).encode("utf-8")
+
+        def serve(handler, request_body: bytes) -> None:
+            captured["path"] = handler.path
+            captured["x_api_key"] = handler.headers.get("x-api-key")
+            captured["authorization"] = handler.headers.get("Authorization")
+            captured["request"] = json.loads(request_body.decode("utf-8"))
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(response_body)))
+            handler.end_headers()
+            handler.wfile.write(response_body)
+
+        server, worker = local_http_fixture(serve)
+        try:
+            provider = DeepSeekAnthropicProvider(
+                f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash", timeout=2
+            )
+            turn = provider.complete(
+                [{"role": "user", "content": "合成非流式问题"}], [], max_tokens=24
+            )
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+        request = captured["request"]
+        self.assertEqual(turn.content, "本地合成 JSON 答复")
+        self.assertEqual(turn.usage, ProviderUsage(3, 4, 7))
+        self.assertEqual(captured["path"], "/anthropic/v1/messages")
+        self.assertIsNone(captured["x_api_key"])
+        self.assertIsNone(captured["authorization"])
+        self.assertFalse(request["stream"])
+        self.assertEqual(request["max_tokens"], 24)
+
+    def test_deepseek_anthropic_tool_loop_preserves_signed_thinking_and_requires_file_approval(self) -> None:
+        temp = make_test_temp(prefix="anthropic-tool-loop-")
+        root = Path(temp.name)
+        (root / "资料").mkdir()
+        (root / "资料" / "合成.txt").write_text("仅本地合成内容：你好", encoding="utf-8")
+        responses = [
+            fixture_anthropic_sse([
+                {"type": "message_start", "message": {"type": "message", "role": "assistant", "content": [], "usage": {"input_tokens": 8}}},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "合成私有推理"}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "fixture-signature"}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_fixture_1", "name": "read_file", "input": {}}},
+                {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": '{"path":"资料/合成.txt"}'}},
+                {"type": "content_block_stop", "index": 1},
+                {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 5}},
+                {"type": "message_stop"},
+            ]),
+            fixture_anthropic_sse([
+                {"type": "message_start", "message": {"type": "message", "role": "assistant", "content": [], "usage": {"input_tokens": 12}}},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "已读取合成内容。"}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 4}},
+                {"type": "message_stop"},
+            ]),
+        ]
+        captured: list[dict[str, object]] = []
+
+        def serve(handler, request_body: bytes) -> None:
+            captured.append(json.loads(request_body.decode("utf-8")))
+            body = responses.pop(0)
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            handler.wfile.flush()
+
+        server, worker = local_http_fixture(serve)
+        approvals: list[ActionRequest] = []
+        displayed: list[str] = []
+        try:
+            provider = DeepSeekAnthropicProvider(
+                f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash",
+                timeout=2, stream_timeout=2,
+            )
+            agent = Agent(provider, Workspace(root), approve_action=lambda request: approvals.append(request) or True, max_output_tokens=128)
+            answer = agent.ask("请读取合成文件", on_text_delta=displayed.append)
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+            temp.cleanup()
+
+        self.assertEqual(answer, "已读取合成内容。")
+        self.assertEqual(displayed, ["已读取合成内容。"])
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(len(captured), 2)
+        first_assistant = next(item for item in captured[1]["messages"] if item["role"] == "assistant")
+        self.assertEqual(first_assistant["content"][0], {
+            "type": "thinking", "thinking": "合成私有推理", "signature": "fixture-signature",
+        })
+        tool_result_messages = [item for item in captured[1]["messages"] if item["role"] == "user"]
+        self.assertTrue(any(
+            block.get("type") == "tool_result"
+            and block.get("tool_use_id") == "toolu_fixture_1"
+            and "仅本地合成内容：你好" in block.get("content", "")
+            for message in tool_result_messages
+            for block in (message["content"] if isinstance(message["content"], list) else [])
+        ))
+
+    def test_deepseek_anthropic_missing_usage_is_left_for_conservative_agent_reservation(self) -> None:
+        with make_test_temp(prefix="anthropic-missing-usage-") as temp:
+            wire = fixture_anthropic_sse([
+                {"type": "message_start", "message": {"type": "message", "role": "assistant", "content": []}},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "完成"}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+                {"type": "message_stop"},
+            ])
+
+            def serve(handler, _request_body: bytes) -> None:
+                handler.send_response(200)
+                handler.send_header("Content-Type", "text/event-stream")
+                handler.send_header("Content-Length", str(len(wire)))
+                handler.end_headers()
+                handler.wfile.write(wire)
+
+            server, worker = local_http_fixture(serve)
+            try:
+                provider = DeepSeekAnthropicProvider(
+                    f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash",
+                    timeout=2, stream_timeout=2,
+                )
+                agent = Agent(provider, Workspace(temp), approve_action=lambda _request: False, max_output_tokens=16, max_provider_requests=1)
+                self.assertEqual(agent.ask("合成问题", on_text_delta=lambda _text: None), "完成")
+            finally:
+                server.shutdown()
+                worker.join(timeout=2)
+                server.server_close()
+        self.assertEqual(agent.usage.requests, 1)
+        self.assertEqual(agent.usage.estimated_output_tokens, 16)
+        self.assertEqual(agent.usage.provider_usage_reports, 0)
+
+    def test_deepseek_anthropic_redirect_is_not_followed_and_target_is_never_contacted(self) -> None:
+        target_hits: list[bool] = []
+
+        def target_serve(handler, _request_body: bytes) -> None:
+            target_hits.append(True)
+            handler.send_response(200)
+            handler.end_headers()
+
+        target, target_worker = local_http_fixture(target_serve)
+
+        def redirect_serve(handler, _request_body: bytes) -> None:
+            handler.send_response(302)
+            handler.send_header("Location", f"http://127.0.0.1:{target.server_port}/collect")
+            handler.send_header("Content-Length", "0")
+            handler.end_headers()
+
+        redirect, redirect_worker = local_http_fixture(redirect_serve)
+        try:
+            provider = DeepSeekAnthropicProvider(
+                f"http://127.0.0.1:{redirect.server_port}/anthropic", "", "deepseek-flash",
+                timeout=2, stream_timeout=2,
+            )
+            with self.assertRaises(ProviderStreamError) as caught:
+                provider.complete_streaming(
+                    [{"role": "user", "content": "合成请求"}], [], on_text_delta=lambda _text: None
+                )
+        finally:
+            redirect.shutdown()
+            redirect_worker.join(timeout=2)
+            redirect.server_close()
+            target.shutdown()
+            target_worker.join(timeout=2)
+            target.server_close()
+        self.assertEqual(target_hits, [])
+        self.assertEqual(caught.exception.diagnostics.http_status, 302)
+        self.assertNotIn("Location", str(caught.exception))
+
+    def test_deepseek_anthropic_rejects_unknown_event_content_type_and_response_overflow(self) -> None:
+        cases = [
+            (
+                b'event: message_start\r\ndata: {"type":"ping"}\r\n\r\n',
+                "text/event-stream",
+                "事件名与数据类型不一致",
+            ),
+            (
+                b'event: message_start\r\ndata: {"type":"message_start","type":"ping"}\r\n\r\n',
+                "text/event-stream",
+                "JSON 格式无效",
+            ),
+            (
+                fixture_anthropic_sse([
+                    {"type": "message_start", "message": {"type": "message", "role": "assistant", "content": []}},
+                    {"type": "content_block_start", "index": 0, "content_block": {"type": "redacted_thinking", "data": "synthetic"}},
+                ]),
+                "text/event-stream",
+                "尚未支持的内容块",
+            ),
+            (
+                fixture_anthropic_sse([
+                    {"type": "message_start", "message": {"type": "message", "role": "assistant", "content": []}},
+                    {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+                    {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "synthetic-signature"}},
+                    {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "迟到文本"}},
+                ]),
+                "text/event-stream",
+                "签名之后",
+            ),
+            (b'{"type":"message"}', "application/json", "没有返回 text/event-stream"),
+        ]
+        for wire, content_type, expected_error in cases:
+            with self.subTest(expected_error=expected_error):
+                def serve(handler, _request_body: bytes) -> None:
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", content_type)
+                    handler.send_header("Content-Length", str(len(wire)))
+                    handler.end_headers()
+                    handler.wfile.write(wire)
+
+                server, worker = local_http_fixture(serve)
+                try:
+                    provider = DeepSeekAnthropicProvider(
+                        f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash",
+                        timeout=2, stream_timeout=2,
+                    )
+                    with self.assertRaises(ProviderStreamError) as caught:
+                        provider.complete_streaming(
+                            [{"role": "user", "content": "合成请求"}], [], on_text_delta=lambda _text: None
+                        )
+                finally:
+                    server.shutdown()
+                    worker.join(timeout=2)
+                    server.server_close()
+                self.assertIn(expected_error, str(caught.exception))
+
+        large_wire = b"data: " + b"x" * 2048 + b"\n\n"
+
+        def overflow_serve(handler, _request_body: bytes) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.end_headers()
+            handler.wfile.write(large_wire)
+
+        server, worker = local_http_fixture(overflow_serve)
+        try:
+            provider = DeepSeekAnthropicProvider(
+                f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash",
+                timeout=2, stream_timeout=2,
+            )
+            with patch("cvfx_harness.providers.MAX_STREAM_RESPONSE_BYTES", 1024):
+                with self.assertRaises(ProviderStreamError) as caught:
+                    provider.complete_streaming(
+                        [{"role": "user", "content": "合成请求"}], [], on_text_delta=lambda _text: None
+                    )
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+        self.assertEqual(caught.exception.diagnostics.category, "size_limit")
+
+    def test_deepseek_anthropic_cancellation_and_total_deadline_interrupt_reads(self) -> None:
+        reached: list[bool] = []
+
+        def unused_serve(handler, _request_body: bytes) -> None:
+            reached.append(True)
+            handler.send_response(200)
+            handler.end_headers()
+
+        server, worker = local_http_fixture(unused_serve)
+        cancelled = threading.Event()
+        cancelled.set()
+        try:
+            provider = DeepSeekAnthropicProvider(
+                f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash",
+                timeout=2, stream_timeout=2,
+            )
+            with self.assertRaises(ProviderCancelled):
+                provider.complete_streaming(
+                    [{"role": "user", "content": "合成请求"}], [], cancellation_event=cancelled,
+                    on_text_delta=lambda _text: None,
+                )
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+        self.assertEqual(reached, [])
+
+        release = threading.Event()
+        ping = b": loopback keepalive\n\n"
+
+        def slow_serve(handler, _request_body: bytes) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.end_headers()
+            handler.wfile.write(ping)
+            handler.wfile.flush()
+            release.wait(timeout=1)
+
+        server, worker = local_http_fixture(slow_serve)
+        cancellation_event = threading.Event()
+        timer = threading.Timer(0.03, cancellation_event.set)
+        timer.start()
+        try:
+            provider = DeepSeekAnthropicProvider(
+                f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash",
+                timeout=2, stream_timeout=2,
+            )
+            with self.assertRaises(ProviderCancelled):
+                provider.complete_streaming(
+                    [{"role": "user", "content": "合成请求"}], [], cancellation_event=cancellation_event,
+                    on_text_delta=lambda _text: None,
+                )
+        finally:
+            release.set()
+            timer.join(timeout=1)
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+        release.clear()
+        server, worker = local_http_fixture(slow_serve)
+        try:
+            provider = DeepSeekAnthropicProvider(
+                f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash",
+                timeout=2, stream_timeout=2,
+            )
+            with self.assertRaises(ProviderStreamError) as caught:
+                provider.complete_streaming(
+                    [{"role": "user", "content": "合成请求"}], [], on_text_delta=lambda _text: None,
+                    timeout_seconds=0.1,
+                )
+        finally:
+            release.set()
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+        self.assertEqual(caught.exception.diagnostics.category, "read_timeout")
+
+    def test_deepseek_anthropic_provider_factory_ignores_anthropic_key_name(self) -> None:
+        class RecordingEnvironment(dict[str, str]):
+            looked_up: list[str] = []
+
+            def get(self, key: str, default: str | None = None):
+                self.looked_up.append(key)
+                if key == "ANTHROPIC_API_KEY":
+                    raise AssertionError("compatibility mode must not inspect the official Claude key")
+                return super().get(key, default)
+
+        environment = RecordingEnvironment()
+        provider = provider_from_environment(
+            "deepseek-anthropic",
+            base_url_override="http://127.0.0.1:32123/anthropic",
+            environment=environment,
+        )
+        self.assertIsInstance(provider, DeepSeekAnthropicProvider)
+        self.assertNotIn("ANTHROPIC_API_KEY", environment.looked_up)
+        request = provider._request(
+            provider._request_body([{"role": "user", "content": "合成"}], [], max_tokens=2, stream=False),
+            stream=False,
+        )
+        self.assertIsNone(request.get_header("Authorization"))
+
+    def test_deepseek_anthropic_subagent_sends_only_canonical_read_tool_schema(self) -> None:
+        wire = fixture_anthropic_sse([
+            {"type": "message_start", "message": {"type": "message", "role": "assistant", "content": []}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "合成子代理答复"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+            {"type": "message_stop"},
+        ])
+        captured: dict[str, object] = {}
+
+        def serve(handler, request_body: bytes) -> None:
+            captured["request"] = json.loads(request_body.decode("utf-8"))
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Length", str(len(wire)))
+            handler.end_headers()
+            handler.wfile.write(wire)
+
+        server, worker = local_http_fixture(serve)
+        try:
+            provider = DeepSeekAnthropicProvider(
+                f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash",
+                timeout=2, stream_timeout=2,
+            )
+            read_tools = [
+                schema for schema in TOOL_SCHEMAS
+                if schema["function"]["name"] in {"read_file", "list_directory"}
+            ]
+            turn = provider.complete_subagent(
+                [
+                    {"role": "system", "content": "你是只读子代理。"},
+                    {"role": "user", "content": "检查本地合成路径"},
+                ],
+                tools=[read_tools[0]],
+                timeout_seconds=5,
+                max_output_tokens=32,
+                cancellation_event=threading.Event(),
+            )
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+        request = captured["request"]
+        self.assertEqual(turn.content, "合成子代理答复")
+        self.assertEqual(request["max_tokens"], 32)
+        self.assertEqual([tool["name"] for tool in request["tools"]], ["read_file"])
+        self.assertTrue(all(tool["name"] not in {"write_file", "execute_command"} for tool in request["tools"]))
+
+    def test_deepseek_anthropic_rejects_malformed_stop_reason_and_incomplete_tool_stream(self) -> None:
+        with self.assertRaisesRegex(ProviderError, "stop_reason"):
+            DeepSeekAnthropicProvider(
+                "http://127.0.0.1:32123/anthropic", "", "deepseek-flash"
+            )._turn_from_payload({
+                "type": "message", "role": "assistant", "content": [], "stop_reason": [],
+            })
+
+        with make_test_temp(prefix="anthropic-incomplete-tool-") as temp:
+            wire = fixture_anthropic_sse([
+                {"type": "message_start", "message": {"type": "message", "role": "assistant", "content": []}},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_incomplete", "name": "read_file", "input": {}}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": '{"path":"secret.txt"}'}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+            ])
+
+            def serve(handler, _request_body: bytes) -> None:
+                handler.send_response(200)
+                handler.send_header("Content-Type", "text/event-stream")
+                handler.send_header("Content-Length", str(len(wire)))
+                handler.end_headers()
+                handler.wfile.write(wire)
+
+            server, worker = local_http_fixture(serve)
+            approvals: list[ActionRequest] = []
+            try:
+                provider = DeepSeekAnthropicProvider(
+                    f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash",
+                    timeout=2, stream_timeout=2,
+                )
+                agent = Agent(provider, Workspace(temp), approve_action=lambda request: approvals.append(request) or True, max_output_tokens=16, max_provider_requests=1)
+                with self.assertRaises(ProviderStreamError):
+                    agent.ask("合成问题", on_text_delta=lambda _text: None)
+            finally:
+                server.shutdown()
+                worker.join(timeout=2)
+                server.server_close()
+        self.assertEqual(approvals, [])
+
     def test_usage_parser_reports_cache_hits_only_when_provider_supplies_valid_counts(self) -> None:
         usage = OpenAICompatibleProvider._parse_usage({
             "prompt_tokens": 100,

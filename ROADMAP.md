@@ -9,10 +9,10 @@
 | Mock provider | 已实现 / 离线可测 | 默认离线，不发请求、不读密钥 |
 | OpenAI 兼容 Chat Completions | 已实现 / 离线可测 | stdlib HTTP、`reasoning_content` 工具往返、usage、`max_tokens` 上限、429 不重试、脱敏错误；CLI 默认 SSE 流式输出，具备大小/时限/事件边界和取消检查 |
 | 有界 SSE 中文流式交互 | 已实现 / 离线可测 | UTF-8 跨块、CRLF/LF 与多行 data；最多 4 MiB 响应、2 MiB 助手文本、512 KiB 行/事件、16,384 个事件、120 秒；固定安全分类/阶段/HTTP 状态/字节数/耗时；loopback CONNECT/TLS 代理路径有合成 fixture；工具调用累积并完整校验后沿用 Agent 审批循环；未完成流不执行工具 |
-| DeepSeek API key 读取 | 已实现 / 离线可测 | OpenAI 模式读取 `DEEPSEEK_API_KEY`，只允许 HTTPS `api.deepseek.com:443`；Mock 不查询该值，配置页不显示。Network secret 的基本对话与合成目录只读工具闭环均已有限在线验证；其他工具与完整产品流程仍未验收 |
+| DeepSeek Anthropic 兼容 Messages API | 已实现 / 离线可测 | 独立 `deepseek-anthropic` provider，固定 `https://api.deepseek.com/anthropic/v1/messages`、仅 DeepSeek 模型与 `DEEPSEEK_API_KEY`；有界 Anthropic SSE、签名 thinking 保留、工具往返沿用 Agent 审批；远端事件与 usage 未在线验证，不接官方 Claude |
+| DeepSeek API key 读取 | 已实现 / 离线可测 | 两种 DeepSeek provider 在所选模式下读取 `DEEPSEEK_API_KEY`，只允许 HTTPS `api.deepseek.com:443`；Anthropic 兼容模式另限 `/anthropic` 并拒绝重定向。Mock 不查询密钥，配置页不显示；既有 OpenAI 通路曾有限在线验证，Anthropic 兼容通路只做离线 fixture |
 | 受限真实 DeepSeek smoke | 已完成（有限验收） | 独立新环境通过 `api.deepseek.com:443` 的网络 secret 代理，以 `deepseek-flash` 发起一次、128-token 上限、无工具的合成请求；HTTP 200，答复“连接成功”，usage 输入 36 / 输出 43 / 总计 79。只证明认证与基本对话通路，不证明多轮工具闭环 |
 | 受限真实目录工具闭环 | 已完成（有限验收） | 两次 `api.deepseek.com:443` / `deepseek-flash` 请求，单次 `max_tokens=256`、合计上限 512；仅批准合成 `synthetic/hello.txt` 的只读列表，HTTP 200×2，usage 输入 1022 / 输出 82 / 总计 1104；不代表完整产品通过 |
-| Anthropic provider / 更多供应商 | 待实现 | 尚无独立协议适配；当前用户要求的 `deepseek-flash` 只配置了兼容接口 |
 | 多轮工具循环 | 已实现 / 离线可测 | 最多 4 轮、每轮最多执行 4 项，回填工具结果；重复调用编号、格式错误或超预算时关闭当前轮次 |
 | 工作区文件引用、目录列表与读写 | 已实现 / 离线可测 | 模型写入复用现有预览/审批/备份/撤销；新建/覆盖分别标识，每项独立确认；UTF-8 文本≤64 KiB，拒绝清空/删除、控制字符二进制、敏感/链接/越界路径；批准后再次核对并原子替换 |
 | junction / symlink / hard link 逃逸 | 部分实现 / 跨平台 CI 通过 | Linux 默认运行 symlink / hard link 集成用例；Windows 运行 junction 与可创建的 symlink / hard link 用例；Windows 系统策略拒绝 fixture 时会明确跳过 |
@@ -23,11 +23,11 @@
 | 可审核上下文压缩 | 已实现 / 离线可测 | 本地有损摘要，确认后应用；纳入当前目标与可识别的完整用户限制，摘要上限 32 KiB；工具组校验配对后整组保留/丢弃；拒绝不完整轮次；不可信 `user` 消息，疑似凭据脱敏，历史审批不延续为当前授权 |
 | Token / 预算统计 | 已实现 / 离线可测 | 上下文预算只提示；`/统计` 分别显示固定前缀和会话消息的独立启发式估算；provider usage 可选报告缓存输入命中数；usage 缺失时仍保证各请求上限之和不超过预算 |
 | Cache-friendly 稳定前缀 | 部分实现 / 离线可测 | 静态 system prompt 与有序工具 schema 保持固定；本地分项不是缓存命中量；只显示 provider 明确报告的缓存 tokens；没有缓存命中率承诺或远端命中验证 |
-| 子代理 | 已实现 / 离线可测（Mock 与 OpenAI 兼容） | 每会话最多 3 项、并发 2、最多 2 轮；独立审批与取消；只读工具限精确预授权路径；无写入/shell/递归；可查看、收取不可信结果 |
+| 子代理 | 已实现 / 离线可测（Mock 与两个 DeepSeek 协议适配器） | 每会话最多 3 项、并发 2、最多 2 轮；独立审批与取消；只读工具限精确预授权路径；无写入/shell/递归；Anthropic 兼容远端行为未在线验证 |
 | PTC（Programmatic Tool Calling） | 待实现 / 术语假设 | 暂按“模型组合调用工具/程序化工具调用”记录；未实现脚本或工具执行链 |
 | PowerShell/cmd 命令执行 | 待实现 | 当前严格关闭；需要先设计工作区隔离和 Windows 真实进程权限边界 |
 | 完整 TUI、快捷键、恢复中断任务 | 待实现 | 已有 `/命令`、受限多行输入和可用时的 readline 命令 Tab 补全；没有输入历史、全屏 TUI、快捷键编辑器或中断任务恢复 |
-| 通用模型配置文件、Provider 插件与 PTC 配置 | 待实现 | 目前仅环境变量配置 OpenAI 兼容提供商；密钥不入仓 |
+| 通用模型配置文件、Provider 插件与 PTC 配置 | 待实现 | 现有 provider 设置由非敏感工作区/环境/CLI 字段解析；没有插件框架或 PTC 配置，密钥不入仓 |
 
 ## 本轮验收记录（2026-10-18）
 
@@ -42,7 +42,7 @@
 ## 本轮迭代验收记录（2026-10-19）
 
 - Debian 13 / Python 3.12 云端：按实际平台文件系统区分路径大小写断言；Windows 分支仍要求 Harness 解析回磁盘目录项实际大小写，POSIX 分支验证 Harness 保留输入大小写并按实际卷行为读文件。
-- OpenAI provider 仅在选择 OpenAI 模式时读取 `DEEPSEEK_API_KEY`，该环境密钥限定 HTTPS `api.deepseek.com:443`；Mock 不查询该变量。认证值不出现在 `/配置`、消息体或 provider 的默认表示中。
+- DeepSeek OpenAI 与 Anthropic 兼容 provider 只在选择对应 DeepSeek 模式时读取 `DEEPSEEK_API_KEY`，并限定 HTTPS `api.deepseek.com:443`；Anthropic 兼容路径还固定 `/anthropic` 且禁用重定向。Mock 不查询密钥，兼容 provider 不读取 `ANTHROPIC_API_KEY`；认证值不出现在 `/配置`、消息体或 provider 的默认表示中。
 - 用合成值、stub 响应及 `127.0.0.1` 本地 HTTP fixture 验证了请求构造与响应解析；没有读取本任务环境的密钥值、没有配置凭据、没有访问外部 API。
 - Codex Cloud Network secret placeholder 代理通路已由独立新环境的一次 DeepSeek 认证/对话 smoke 有限验证；工具调用与多轮消息仍未在线验证。
 - `compileall` 与中文 mock CLI 冒烟通过；`python3 -m unittest discover -s tests -v` 共 53 项，50 项通过，3 项 Windows 链接创建测试按策略跳过，无失败。
@@ -107,7 +107,7 @@
 
 - 补齐 provider/model/Base URL/上下文预算/输出上限的工作区持久配置；支持中文 `/配置` 子命令、启动来源展示、环境变量与 CLI 高优先级覆盖、损坏配置的 `--ignore-config` 恢复入口。
 - 配置路径为 `.harness/config/settings.json`，严格 schema，不保存 API key；拒绝未知/凭据字段、userinfo、query、fragment、危险 scheme、非 DeepSeek host 和非 443 端口，错误不回显输入值。
-- 目前仅支持 Mock 和 DeepSeek OpenAI 兼容模式；Anthropic/其他服务明确未实现。DeepSeek 网络密钥的 HTTPS `api.deepseek.com:443` 目标限制保持强制。
+- 在该轮配置实现提交时，仅支持 Mock 和 DeepSeek OpenAI 兼容模式；Anthropic 及其他服务当时未实现。DeepSeek 网络密钥的 HTTPS `api.deepseek.com:443` 目标限制保持强制。本文件后续章节记录新增的 DeepSeek Anthropic 兼容入口；该入口仍不代表官方 Claude provider。
 - 配置测试仅使用临时工作区、合成数据和 patched provider；不读取或写入密钥、不发真实请求。
 - 测试统计审计：`c6dab6e`、`3f2f670`、`cacfb7c` 均有 65 个测试方法，比较中没有删除或合并；旧版三个链接用例受 opt-in gate 跳过，因此“65 通过、3 跳过”措辞错误，按代码口径应是 65 总、62 通过、3 跳过。当前添加 14 个配置测试后共 79 项。
 - Debian 13 / Python 3.12 当前本地结果：79 总、78 通过、1 跳过（Windows-only junction）；symlink 与 hardlink 集成测试均执行通过。远端 Windows/Linux 矩阵将在推送后记录；未调用真实 API。
@@ -162,6 +162,15 @@
 - 工具兼容范围：流完整校验后继续走现有 Agent 工具审批循环；未完成/错误 SSE 不会把部分工具调用交给 Agent。Mock、无流式接口 provider、多候选、多模态、logprobs 和未知增量仍明确拒绝。单元测试和本机代理 fixture 不等同完整产品验收。
 - Debian / Python 3.12 本地离线回归：125 项，124 通过、1 项 Windows-only junction 跳过；editable install、安装自检、`compileall` 与 `git diff --check` 通过。Windows/Linux × Python 3.11/3.12 四格 CI 均通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39217266384)）。本机与 CI 单元测试不等同完整产品验收。
 - 本轮及后续离线开发没有真实 API 请求。沿用用户提供的账本：已知实际用量 1,222，未明失败请求保留 629 预留，预算占用 1,851 / 2,000,000；失败请求的真实费用仍未知，本分配余量 19,371。
+
+## DeepSeek Anthropic 兼容 Messages API（2026-10-19）
+
+- 新增独立 `deepseek-anthropic` provider，固定请求 `https://api.deepseek.com/anthropic/v1/messages`，模型只接受 `deepseek-flash` 和 `deepseek-v4-pro`。只在该模式读取 `DEEPSEEK_API_KEY` 并使用 `x-api-key`；不查询 `ANTHROPIC_API_KEY`，不支持官方 Claude 服务、账号或模型别名。HTTPS 保持标准证书校验，重定向不跟随，错误不显示响应体、URL、请求头或原始异常。
+- Messages 请求映射 system、user/assistant 文本和本地函数 schema；工具调用/结果继续走既有 Agent 的预算、路径校验与逐项审批。子代理同样受只读工具和预授权路径限制；任何协议未完成、工具 JSON 不完整或 stop_reason 不匹配的响应都不会执行工具。
+- 有界 SSE 使用既有 UTF-8/SSE 解析器，接受 Anthropic `message_start`、content block、`message_delta` 与 `message_stop` 序列；支持 text、`tool_use` 和带签名 `thinking`。请求默认关闭 thinking；若端点仍返回 thinking，不显示且在内存工具上下文保留签名。多模态、redacted/document/search/MCP 内容与未知事件明确拒绝。终端控制字符和疑似凭据沿用既有显示脱敏。
+- DeepSeek 兼容指南未列出 SSE 事件细节或响应 usage 字段；实现按 Anthropic Messages 协议解释事件序列，并仅在返回标准 `input_tokens` / `output_tokens` 时记 usage。该两项均为协议推断，尚未用真实 DeepSeek Anthropic endpoint 验证；缺失/无效 usage 时按请求完整 `max_tokens` 保守预留，不报告缓存命中。远端兼容性仍是未实现验收项。
+- 回归只使用 loopback HTTP fixture 与合成消息，覆盖跨字节中文、固定 URL 路径和无凭据请求、签名 thinking/工具往返、现有文件审批、缺 usage 预留、重定向拒绝、不完整工具流不审批、未知内容/事件、响应大小限制、总时限和取消。未访问真实模型或读取/设置/输出凭据；测试不等于完整产品验收。
+- Linux / Python 3.12 本地离线回归：150 项，149 通过、1 项 Windows-only junction 跳过；loopback fixture 不发送 API 密钥或 Authorization。`compileall`、editable install、安装自检与 `git diff --check` 均通过。四矩阵 CI 在代码推送后记录；全程保持父任务账本 `1222 known + 629 unknown reserve` 不变，没有产生真实模型 usage。
 
 ## 参考项目复用边界
 
