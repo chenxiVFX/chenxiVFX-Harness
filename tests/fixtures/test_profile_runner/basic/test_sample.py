@@ -8,4 +8,5 @@ class SyntheticUserTest(unittest.TestCase):
         print("api_key=synthetic-secret-value")
         print("terminal=\x1b[2J")
         print("parent_marker=" + os.environ.get("CVFX_SYNTHETIC_PARENT_MARKER", "missing"))
+        print("secret_marker=" + os.environ.get("CVFX_SYNTHETIC_ENV_SECRET", "missing"))
         self.assertEqual(2 + 2, 4)

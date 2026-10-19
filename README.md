@@ -44,7 +44,7 @@ Enter 提交当前输入，Ctrl+J 插入换行；TUI 生成期间会暂停输入
 
 ### Windows 独立程序试验
 
-仓库的 `Windows standalone packaging experiment` Actions 工作流会在 Windows x64 runner 上构建一个含 Python 运行时的单文件 `.exe`，随后在不依赖系统 Python 的子进程环境中检查 `--help`、离线 Mock 中文交互和含中文/空格的工作区路径。构建工具仅用于 CI，版本和 Windows 轮子哈希锁定在 [`packaging/windows-build-requirements.txt`](packaging/windows-build-requirements.txt)；应用的 TUI 运行依赖固定在 `pyproject.toml`。
+仓库的 `Windows standalone packaging experiment` Actions 工作流会在 Windows x64 runner 上构建一个含 Python 运行时的单文件 `.exe`，随后在不依赖系统 Python 的子进程环境中检查 `--help`、离线 Mock 中文交互、含中文/空格的工作区路径，以及 EXE 驱动的合成 unittest/pytest profile。Harness 单文件本身无需系统 Python；运行用户测试时，profile 必须另行选择一个外部 Python 绝对路径，pytest 也必须已安装在该外部解释器中。Harness 不会安装 Python 或 pytest，也不会把 pytest 打进包。构建工具仅用于 CI，版本和 Windows 轮子哈希锁定在 [`packaging/windows-build-requirements.txt`](packaging/windows-build-requirements.txt)；pytest 验证依赖单独锁定并只用于开发 CI 的合成测试。
 
 从对应 Actions 运行页面下载 `windows-x64-cvfx-harness-py312` 文件，解压后可运行 `cvfx-harness.exe --help` 或 `cvfx-harness.exe --workspace . --provider mock`。单文件启动时会把依赖解压到系统临时目录，启动会比源码或目录包慢一些，且需要临时目录可写。包中包含可执行文件、中文说明、第三方许可证通知和 SHA-256 校验文件；CI 构建不打包仓库文档、配置或工作区文件。构建与自检仅使用 Mock 和合成输入，不连接真实模型。这个未签名包只是试验，不是正式发布；Windows 可能显示 SmartScreen 或 Defender 提示，请保持系统保护开启并遵循组织策略。Actions 文件保留 14 天，不上传到发布页或包注册表。
 
@@ -65,7 +65,7 @@ Enter 提交当前输入，Ctrl+J 插入换行；TUI 生成期间会暂停输入
 | `/检查点 <名称>` | 手写进度摘要，经脱敏预览和确认后保存；不自动收集工具结果 |
 | `/压缩 [保留轮数]` | 先预览本地摘要和将丢弃的旧轮次，确认后再应用 |
 | `/统计`、`/预算 [tokens]` | 查看当前估算上下文、累计用量和提供商报告；`/预算` 临时设置本轮预算 |
-| `/测试 列表|添加|移除` | 管理用户配置的 Python `unittest`/`pytest` 测试目标；模型只能按 ID 选择，不可提供命令或参数 |
+| `/测试 列表|添加|运行|移除` | 管理固定 Python `unittest`/`pytest` 测试目标；添加时用户独立选择外部 Python，模型只能选择可运行配置的 ID |
 | `/子代理 提交 [--读取 路径 ... --] 任务甲 \| 任务乙` | 每项单独批准后提交最多 3 个隔离子任务；最多 4 个精确只读路径 |
 | `/子代理 列表 [编号]` | 查看子任务状态和本会话共享预算 |
 | `/子代理 取消 <编号>` | 取消排队或运行中的子任务 |
@@ -77,7 +77,7 @@ Enter 提交当前输入，Ctrl+J 插入换行；TUI 生成期间会暂停输入
 
 `/多行` 以换行合并文本，最多 64 KiB UTF-8；只有单独一行 `/提交` 会发送。无 TTY 时可直接把命令和多行块逐行写入 stdin；EOF 会结束会话，未结束的多行块会丢弃。Harness 不保存输入历史或审批回答。纯文本模式不做补全。交互 TUI 补全固定中文命令、固定枚举、安全工作区相对路径，以及 `/恢复 ` 后的本地会话名；路径和会话名建议最多扫描 1000 个目录项、显示 50 个候选，不读取会话内容。Tab 只填入选择，按 Enter 提交恢复命令；鼠标只选择，不会自动提交。恢复的是经过校验的历史上下文，旧审批和运行授权不会恢复，旧工具调用不会执行；替换已有上下文前仍需确认。文件路径补全不会执行命令，也不会批准动作。
 
-`/测试 添加 <ID>` 会逐项询问框架、工作目录和目标路径，支持中文及空格路径。配置保存在 `.harness/config/test_profiles.json`，模型文件工具不能读取或修改；只含 ID、框架和相对路径，不接受 argv 或 shell 命令。只有用户明确要求运行测试时，模型才能选择一个已保存 ID。Harness 固定用当前 Python 解释器运行 `unittest discover` 或 `pytest -q`；每次执行前会展示确切解释器、argv、工作目录、120 秒时限、32 KiB 合并输出上限，并要求逐次批准。一次用户请求最多启动一个测试进程。
+`/测试 添加 <ID>` 会逐项询问框架、外部 Python 可执行文件绝对路径、工作目录和目标路径，支持中文及空格路径。解释器必须是现存普通可执行文件；配置保存在 `.harness/config/test_profiles.json`，模型文件工具不能读取或修改。配置只包含用户选择的解释器、固定框架和工作区相对路径，不接受 argv、shell 命令或模型提供的路径。旧配置没有解释器时保持禁用，用户可重新录入同一 ID。只有用户明确要求运行测试时，模型才能选择已通过路径校验的配置 ID；`/测试 运行 <ID>` 可由用户直接发起本地测试。运行固定为外部解释器的 `-m unittest discover -s <目标>` 或 `-m pytest -q <目标>`；每次执行前展示确切解释器、argv、工作目录、120 秒时限、32 KiB 合并输出上限，并逐次审批。直接 CLI 输出只留在本地；模型工具分享输出仍需单独审批。一次提问至多启动一个测试进程。pytest 不属于 Harness 运行依赖，Harness 不会安装它。
 
 测试代码以当前用户权限运行，不是沙箱；网络访问没有被屏蔽，工作区路径检查也不能限制测试代码访问用户可访问的其他资源。子进程不会继承凭据或其他运行时环境变量；Windows 仅传递系统路径和临时目录。Linux 使用独立进程组，对普通子进程取消/超时会终止该组，但自行 `setsid` 脱离的进程不保证被捕获；Windows 在挂起进程状态下先分配 kill-on-close Job Object，再恢复运行。测试输出先在本地展示，做凭据样式脱敏和终端控制字符转义；是否将最多 16 KiB 脱敏输出发送给模型会另外逐次确认。拒绝分享时模型只收到测试状态和退出码。工具结果视为不可信内容，不写入会话存档。
 

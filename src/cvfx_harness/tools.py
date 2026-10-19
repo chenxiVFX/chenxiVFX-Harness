@@ -907,6 +907,7 @@ def build_tool_schemas(test_profile_ids: list[str] | tuple[str, ...] = ()) -> li
                     "name": "run_test_profile",
                     "description": (
                         "Run one exact user-owned Python test profile only when the user explicitly asks to run tests. "
+                        "The user configured and validated its external Python interpreter; never request or invent a path. "
                         "The local harness asks for per-run approval and separately asks before sharing redacted output. "
                         "This is not a shell and accepts no command, path, or arguments."
                     ),

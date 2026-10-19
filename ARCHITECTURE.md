@@ -57,7 +57,7 @@ socket 的读取超时设为剩余截止时间，不以短超时轮询后恢复�
 - 读操作每次单独批准；模型写入先区分新建/覆盖、预览完整差异，再单独批准，重新核对原始字节并创建可恢复备份后以同目录原子替换。输入拒绝、EOF、取消或无效内容均不写入；已有文件不能被空内容清空。
 - 写入只支持工作区内≤64 KiB 的 UTF-8 文本，拒绝 NUL/控制字符、二进制、链接路径和敏感路径；没有模型删除工具。多个模型写调用各自询问，不批量批准。撤销仍预览并再次确认，计划模式的工具层继续拒绝写入。
 - `.harness/backups` 与 `.harness/sessions` 是 Harness 私有状态，不能通过模型工具访问。
-- 用户测试 profile 放在 `.harness/config/test_profiles.json`，模型文件工具不能读取或修改。profile 只包含 ID、`unittest`/`pytest` 框架和工作区相对 cwd/target；命令分别固定为当前 `sys.executable -m unittest discover -s <target>` 或 `sys.executable -m pytest -q <target>`，`shell=False`，不接受模型 argv、脚本、环境变量或工作目录。
+- 用户测试 profile 放在 `.harness/config/test_profiles.json`，模型文件工具不能读取或修改。profile 只保存用户独立选择并校验的外部 Python 绝对路径、ID、`unittest`/`pytest` 框架和工作区相对 cwd/target；命令固定为 `<python> -m unittest discover -s <target>` 或 `<python> -m pytest -q <target>`，`shell=False`，不接受模型 argv、脚本、解释器路径、环境变量或工作目录。冻结 EXE 的 `sys.executable` 是 Harness 本身，因此测试执行明确使用外部解释器；没有配置解释器的旧 profile 保持禁用。
 - 每次测试都显示确切解释器、argv、cwd、120 秒总限时和 32 KiB 合并 stdout/stderr 上限，并要求用户逐次批准。输出在本地脱敏、转义控制字符后展示；分享最多 16 KiB 输出另需用户批准，拒绝时只回传状态和退出码。一次用户提问最多启动一次测试，没有持久授权或自动重试。
 - 测试代码以当前用户 OS 权限运行，不是沙箱；网络访问没有被屏蔽，测试代码可访问用户权限范围内的其他文件和资源。子进程不会继承凭据或其他运行时环境变量；Windows 仅传递系统路径和临时目录。Linux 用 `start_new_session=True` 和进程组终止普通子进程，恶意/自行 `setsid` 脱离的后代不保证受控；Windows 使用 `CREATE_SUSPENDED`，先将进程放入不允许 breakaway 的 kill-on-close Job Object，再恢复主线程，启动失败时在用户代码运行前终止。Windows 合成测试会从被运行的 fixture 中验证 Job Object 成员关系。
 - `.harness/config/settings.json` 只存 provider/model/Base URL/预算等非敏感设置，拒绝重复键、未识别字段和疑似凭据，不包含 API Key；仅支持 Mock 与 DeepSeek OpenAI 兼容模式。`--ignore-config` 只跳过此文件以便修复损坏配置。

@@ -4,7 +4,6 @@ import json
 import os
 import signal
 import subprocess
-import sys
 import threading
 import time
 import unicodedata
@@ -91,12 +90,19 @@ def _test_environment() -> dict[str, str]:
 
 
 def _command_for(profile: TestProfile, workspace: Workspace) -> tuple[list[str], Path]:
+    if not profile.python:
+        raise TestProfileError("测试配置尚未选择外部 Python 解释器。")
+    interpreter = TestProfileStore._validate_interpreter_path(
+        profile.python, require_file=True
+    )
+    if interpreter is None:
+        raise TestProfileError("测试配置尚未选择外部 Python 解释器。")
     target = workspace.root / Path(profile.target)
     cwd = workspace.root / Path(profile.cwd)
     if profile.framework == "unittest":
-        argv = [sys.executable, "-m", "unittest", "discover", "-s", str(target)]
+        argv = [interpreter, "-m", "unittest", "discover", "-s", str(target)]
     elif profile.framework == "pytest":
-        argv = [sys.executable, "-m", "pytest", "-q", str(target)]
+        argv = [interpreter, "-m", "pytest", "-q", str(target)]
     else:
         raise TestProfileError("测试框架无效；未启动测试进程。")
     return argv, cwd
@@ -302,11 +308,34 @@ if os.name == "nt":
                 raise OSError("job_query_failed")
             return int(info.ActiveProcesses)
 
-        def terminate(self) -> None:
-            if self.handle:
-                self._kernel32.TerminateJobObject(self.handle, 1)
+        def terminate(self) -> bool:
+            if not self.handle:
+                return False
+            try:
+                if self.active_processes() == 0:
+                    return True
+            except OSError:
+                return False
+            if not self._kernel32.TerminateJobObject(self.handle, 1):
+                return False
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    if self.active_processes() == 0:
+                        return True
+                except OSError:
+                    return False
+                time.sleep(PROCESS_POLL_SECONDS)
+            return False
 
         def close(self) -> None:
+            if self.handle:
+                try:
+                    if self.active_processes() > 0:
+                        self.terminate()
+                except OSError:
+                    # Closing the kill-on-close job below is the final cleanup path.
+                    pass
             if self.process_handle:
                 self._kernel32.CloseHandle(self.process_handle)
                 self.process_handle = None
@@ -351,15 +380,21 @@ def _start_process(argv: list[str], cwd: Path) -> tuple[subprocess.Popen[bytes],
     raise OSError("unsupported_process_supervision")
 
 
-def _terminate_tree(process: subprocess.Popen[bytes], job: Any | None) -> None:
+def _terminate_tree(process: subprocess.Popen[bytes], job: Any | None) -> bool:
     if os.name == "posix":
         _terminate_posix_tree(process)
+        # POSIX process-group signaling requests termination, but cannot prove
+        # containment of descendants that escaped with setsid(). Windows Job
+        # Objects provide an explicit active-process count and are verified below.
+        return True
     elif job is not None:
-        job.terminate()
+        confirmed = job.terminate()
         try:
             process.wait(timeout=2)
         except (OSError, subprocess.TimeoutExpired):
-            pass
+            confirmed = False
+        return confirmed
+    return False
 
 
 def execute_profile(
@@ -415,15 +450,18 @@ def execute_profile(
         while True:
             if cancellation_event is not None and cancellation_event.is_set():
                 status = "cancelled"
-                _terminate_tree(process, job)
+                if not _terminate_tree(process, job):
+                    status = "failed"
                 break
             if overflow.is_set():
                 status = "output_limit"
-                _terminate_tree(process, job)
+                if not _terminate_tree(process, job):
+                    status = "failed"
                 break
             if time.monotonic() >= deadline:
                 status = "timeout"
-                _terminate_tree(process, job)
+                if not _terminate_tree(process, job):
+                    status = "failed"
                 break
             return_code = process.poll()
             if os.name == "posix":
@@ -450,6 +488,21 @@ def execute_profile(
     finally:
         if job is not None:
             job.close()
+        elif os.name == "posix" and _group_exists_posix(process.pid):
+            # Also cover KeyboardInterrupt and unexpected runner failures.
+            _terminate_posix_tree(process)
+        if process.poll() is None:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
         if process.stdout is not None and not process.stdout.closed:
             process.stdout.close()
 
@@ -487,6 +540,7 @@ def run_test_profile_tool(
     approve_action: ApprovalCallback,
     cancellation_event: threading.Event | None = None,
     emit_output: Any | None = None,
+    share_output: bool = True,
 ) -> str:
     try:
         profile = profile_store.get(profile_id)
@@ -495,7 +549,7 @@ def run_test_profile_tool(
         return "没有可运行的匹配用户测试配置；未启动测试进程。"
     preview = (
         f"用户配置 ID：{profile.profile_id}\n"
-        f"Python 解释器：{sys.executable}\n"
+        f"Python 解释器：{argv[0]}\n"
         f"argv：{json.dumps(argv, ensure_ascii=False)}\n"
         f"工作目录：{cwd}\n"
         f"运行时限：{MAX_TEST_RUNTIME_SECONDS:g} 秒\n"
@@ -526,7 +580,7 @@ def run_test_profile_tool(
         return "审批后测试配置已更改；没有启动测试进程。"
     try:
         result = execute_profile(profile, workspace, cancellation_event=cancellation_event)
-    except (WorkspaceError, ValueError):
+    except (TestProfileError, WorkspaceError, ValueError):
         return "测试进程未能安全启动；系统错误详情已隐藏。"
 
     summary = _output_summary(result)
@@ -536,6 +590,9 @@ def run_test_profile_tool(
 
     if result.status == "cancelled":
         return f"{summary} 用户取消后的输出仅在本地显示；没有发送给模型。"
+
+    if not share_output:
+        return f"{summary} 测试输出仅在本地显示；没有发送给模型。"
 
     shared = _truncate_utf8(result.output, MAX_SHARED_TEST_OUTPUT_BYTES)
     if result.output_truncated and "[分享输出已截断]" not in shared:

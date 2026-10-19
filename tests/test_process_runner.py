@@ -29,6 +29,71 @@ from cvfx_harness.tools import ActionRequest, Workspace, WorkspaceError, run_too
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "test_profile_runner"
 
 
+def _process_is_alive(pid: int) -> bool:
+    proc_stat = Path(f"/proc/{pid}/stat")
+    if os.name == "posix" and proc_stat.exists():
+        try:
+            return proc_stat.read_text(encoding="ascii").rsplit(")", 1)[1].split()[0] != "Z"
+        except (OSError, IndexError):
+            return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == 5
+        try:
+            exit_code = wintypes.DWORD()
+            return bool(
+                kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                and exit_code.value == 259  # STILL_ACTIVE
+            )
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _terminate_process_for_test_cleanup(pid: int) -> None:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x0001, False, pid)
+        if handle:
+            try:
+                kernel32.TerminateProcess(handle, 1)
+            finally:
+                kernel32.CloseHandle(handle)
+        return
+    try:
+        import signal
+
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 class TestProcessRunner(unittest.TestCase):
     __test__ = False
 
@@ -40,13 +105,16 @@ class TestProcessRunner(unittest.TestCase):
         shutil.copytree(FIXTURES / fixture, project / "tests")
         workspace = Workspace(project)
         store = TestProfileStore(workspace)
-        profile = store.add("unit", "unittest", ".", "tests")
+        profile = store.add("unit", "unittest", sys.executable, ".", "tests")
         return temporary, workspace, store, profile
 
     def test_synthetic_user_profile_has_bounded_sanitized_output(self) -> None:
         temporary, workspace, _store, profile = self._project("basic")
         try:
-            with patch.dict(os.environ, {"CVFX_SYNTHETIC_PARENT_MARKER": "parent-only"}):
+            with patch.dict(os.environ, {
+                "CVFX_SYNTHETIC_PARENT_MARKER": "parent-only",
+                "CVFX_SYNTHETIC_ENV_SECRET": "synthetic-parent-only",
+            }):
                 result = execute_profile(profile, workspace, timeout_seconds=10)
             self.assertEqual(result.status, "passed")
             self.assertIn("合成测试通过", result.output)
@@ -54,6 +122,7 @@ class TestProcessRunner(unittest.TestCase):
             self.assertNotIn("synthetic-secret-value", result.output)
             self.assertIn("terminal=\\x1b", result.output)
             self.assertIn("parent_marker=missing", result.output)
+            self.assertIn("secret_marker=missing", result.output)
         finally:
             temporary.cleanup()
 
@@ -81,11 +150,14 @@ class TestProcessRunner(unittest.TestCase):
     def test_pytest_profile_uses_fixed_module_argv(self) -> None:
         temporary, workspace, store, _profile = self._project("basic")
         try:
-            profile = store.add("pytest-profile", "pytest", ".", "tests")
+            profile = store.add("pytest-profile", "pytest", sys.executable, ".", "tests")
             argv, cwd = _command_for(profile, workspace)
             self.assertEqual(
                 argv,
-                [sys.executable, "-m", "pytest", "-q", str(workspace.root / "tests")],
+                [
+                    os.path.abspath(sys.executable), "-m", "pytest", "-q",
+                    str(workspace.root / "tests"),
+                ],
             )
             self.assertEqual(cwd, workspace.root)
         finally:
@@ -128,14 +200,24 @@ class TestProcessRunner(unittest.TestCase):
             worker.join(timeout=4)
             self.assertFalse(worker.is_alive(), "runner did not finish after cancellation")
             self.assertEqual(results[0].status, "cancelled")
+            child_pid_file = child_dir / "child.pid"
+            child_pid = int(child_pid_file.read_text(encoding="ascii"))
             marker = child_dir / "child.counter"
             before = marker.read_text(encoding="utf-8").count("tick")
             time.sleep(0.2)
             after = marker.read_text(encoding="utf-8").count("tick")
             self.assertEqual(after, before)
+            self.assertFalse(
+                _process_is_alive(child_pid), "ordinary child survived runner cancellation"
+            )
         finally:
             event.set()
             worker.join(timeout=4)
+            child_pid_file = Path(temporary.name) / "tests" / "child.pid"
+            if child_pid_file.exists():
+                child_pid = int(child_pid_file.read_text(encoding="ascii"))
+                if _process_is_alive(child_pid):
+                    _terminate_process_for_test_cleanup(child_pid)
             temporary.cleanup()
 
     def test_windows_user_code_starts_only_after_job_assignment(self) -> None:
@@ -202,6 +284,7 @@ class TestProcessRunner(unittest.TestCase):
             self.assertEqual([item.operation for item in approvals], ["run_test", "share_test_output"])
             self.assertIn("Python 解释器：", approvals[0].diff)
             self.assertIn('"-m", "unittest", "discover"', approvals[0].diff)
+            self.assertIn(os.path.abspath(sys.executable), approvals[0].diff)
             self.assertIn("工作目录：", approvals[0].diff)
             self.assertIn("120 秒", approvals[0].diff)
             self.assertIn("32768 bytes", approvals[0].diff)
@@ -378,10 +461,17 @@ class TestProcessRunner(unittest.TestCase):
                     approve_action=lambda _request: False,
                     test_profile_store=store,
                 )
+                (Path(temporary.name) / "alternate").mkdir()
+
+                def change_profile(_request: ActionRequest) -> bool:
+                    store.remove(profile.profile_id)
+                    store.add(profile.profile_id, "unittest", profile.python, ".", "alternate")
+                    return True
+
                 changed = run_tool(
                     workspace,
                     ToolCall("t2", "run_test_profile", {"profile_id": profile.profile_id}),
-                    approve_action=lambda request: store.remove(profile.profile_id) or True,
+                    approve_action=change_profile,
                     test_profile_store=store,
                 )
             self.assertIn("拒绝", denied)

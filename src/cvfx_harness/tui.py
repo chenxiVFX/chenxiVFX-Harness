@@ -47,7 +47,7 @@ COMMANDS = (
 )
 ENUM_COMPLETIONS = {
     "/模式": ("计划", "执行"),
-    "/测试": ("列表", "添加", "移除"),
+    "/测试": ("列表", "添加", "运行", "移除"),
 }
 _APPROVAL_PROMPT = re.compile(r"\[y/N\]\s*$", re.IGNORECASE)
 

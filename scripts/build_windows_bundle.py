@@ -180,6 +180,10 @@ def _write_artifact_readme(path: Path) -> None:
 
 运行要求：Windows x64；此包内含所需 Python 运行时，无需安装系统 Python。
 
+Harness 本身可以在没有系统 Python 的 Windows 上启动。用户若配置并运行 unittest/pytest，
+必须另外通过 /测试 添加选择并校验一个外部 Python 可执行文件绝对路径；测试将由该解释器运行。
+Harness 不会安装 Python 或 pytest，也不会把 pytest 打包进 Harness。
+
 PowerShell 示例：
   .\\cvfx-harness.exe --help
   .\\cvfx-harness.exe --workspace . --provider mock
@@ -341,6 +345,55 @@ def main() -> int:
         if workspace.name.casefold() not in mock_result.stdout.casefold():
             _fail("打包程序未正确处理含空格和中文的工作区路径")
 
+        _record_stage("EXE 外部解释器合成 unittest/pytest profile 闭环")
+        fixtures = repository_root / "tests" / "fixtures" / "test_profile_runner"
+        with tempfile.TemporaryDirectory(prefix="cvfx test runner 中文 ") as temporary_workspace:
+            workspace = Path(temporary_workspace) / "用户测试工作区 with spaces"
+            workspace.mkdir()
+            shutil.copytree(
+                fixtures / "basic", workspace / "unit-tests",
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+            shutil.copytree(
+                fixtures / "pytest", workspace / "pytest-tests",
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+            profile_input = "\n".join([
+                "/测试 添加 ci-unit",
+                "unittest",
+                sys.executable,
+                ".",
+                "unit-tests",
+                "/测试 添加 ci-pytest",
+                "pytest",
+                sys.executable,
+                ".",
+                "pytest-tests",
+                "/测试 运行 ci-unit",
+                "是",
+                "/测试 运行 ci-pytest",
+                "是",
+                "/退出",
+                "",
+            ])
+            runner_result, _ = _run_executable(
+                executable,
+                [
+                    "--workspace", str(workspace), "--ignore-config", "--provider", "mock",
+                ],
+                environment=minimal_environment,
+                input_text=profile_input,
+            )
+        if runner_result.returncode != 0:
+            _fail("打包 EXE 的用户测试 profile 运行失败")
+        if (
+            "合成测试通过" not in runner_result.stdout
+            or "1 passed" not in runner_result.stdout
+            or runner_result.stdout.count("退出码为 0") < 2
+            or "pytest" not in runner_result.stdout
+        ):
+            _fail("打包 EXE 未用用户选择的外部解释器完成 unittest 与 pytest fixture")
+
         shutil.copy2(executable, output_dir / executable.name)
 
     final_executable = output_dir / "cvfx-harness.exe"
@@ -384,7 +437,7 @@ def main() -> int:
         f"首次 {values['help_first_ms']} ms；5 次中位数 {values['help_median_ms']} ms；"
         f"范围 {values['help_min_ms']}–{values['help_max_ms']} ms。"
     )
-    print("单文件 --help、UTF-8 Mock 对话、中文/空格工作区路径与 TUI 合成键盘自检通过。")
+    print("单文件 --help、UTF-8 Mock、中文路径、TUI 和外部解释器 unittest/pytest profile 合成自检通过。")
     return 0
 
 

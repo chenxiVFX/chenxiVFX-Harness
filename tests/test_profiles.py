@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -13,7 +14,7 @@ from cvfx_harness.cli import build_parser, run_console
 from cvfx_harness.profiles import TestProfileError, TestProfileStore
 from cvfx_harness.providers import MockProvider
 from cvfx_harness.tui import CommandCompleter
-from cvfx_harness.tools import Workspace, WorkspaceError
+from cvfx_harness.tools import ToolCall, Workspace, WorkspaceError, run_tool
 
 
 class TestProfileStoreTests(unittest.TestCase):
@@ -33,23 +34,44 @@ class TestProfileStoreTests(unittest.TestCase):
             workspace = Workspace(project)
             store = TestProfileStore(workspace)
 
-            profile = store.add("unit-tests", "unittest", ".", "tests with spaces")
+            profile = store.add("unit-tests", "unittest", sys.executable, ".", "tests with spaces")
             self.assertEqual(profile.framework, "unittest")
+            self.assertEqual(profile.python, os.path.abspath(sys.executable))
             self.assertEqual(store.get("UNIT-TESTS"), profile)
             self.assertEqual(store.load(), [profile])
             config_path = project / ".harness" / "config" / "test_profiles.json"
             payload = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(set(payload), {"version", "profiles"})
-            self.assertEqual(set(payload["profiles"][0]), {"id", "framework", "cwd", "target"})
+            self.assertEqual(
+                set(payload["profiles"][0]), {"id", "framework", "cwd", "target", "python"}
+            )
             with self.assertRaises(WorkspaceError):
                 workspace.resolve(".harness/config/test_profiles.json")
+            approvals = []
+            with self.assertRaises(WorkspaceError):
+                run_tool(
+                    workspace,
+                    ToolCall(
+                        "write-config",
+                        "write_file",
+                        {"path": ".harness/config/test_profiles.json", "content": "{}"},
+                    ),
+                    approve_action=lambda request: approvals.append(request) or True,
+                )
+            self.assertEqual(approvals, [])
 
             with self.assertRaises(TestProfileError):
-                store.add("UNIT-TESTS", "unittest", ".", "tests with spaces")
+                store.add("UNIT-TESTS", "unittest", sys.executable, ".", "tests with spaces")
             with self.assertRaises(TestProfileError):
-                store.add("unit -c bad", "unittest", ".", "tests with spaces")
+                store.add("unit -c bad", "unittest", sys.executable, ".", "tests with spaces")
             with self.assertRaises(TestProfileError):
-                store.add("pytest", "pytest", ".", "../outside")
+                store.add("pytest", "pytest", sys.executable, ".", "../outside")
+            with self.assertRaises(TestProfileError):
+                store.add("relative-python", "unittest", "python", ".", "tests with spaces")
+            with self.assertRaises(TestProfileError):
+                store.add(
+                    "python-directory", "unittest", str(project), ".", "tests with spaces"
+                )
 
             from prompt_toolkit.completion import CompleteEvent
             from prompt_toolkit.document import Document
@@ -67,7 +89,73 @@ class TestProfileStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(TestProfileError, "结构无效"):
                 store.load()
 
-    def test_cli_profile_management_handles_spaces_and_never_runs_tests(self) -> None:
+    def test_legacy_profile_is_disabled_until_user_selects_external_python(self) -> None:
+        with self._synthetic_project() as root:
+            project = Path(root)
+            (project / "tests").mkdir()
+            workspace = Workspace(project)
+            store = TestProfileStore(workspace)
+            config_path = project / ".harness" / "config" / "test_profiles.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                json.dumps({
+                    "version": 1,
+                    "profiles": [{
+                        "id": "old", "framework": "unittest", "cwd": ".", "target": "tests"
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            self.assertIsNone(store.load()[0].python)
+            self.assertEqual(store.runnable(), [])
+            with self.assertRaisesRegex(TestProfileError, "尚未选择外部 Python"):
+                store.get("old")
+            replaced = store.add("old", "unittest", sys.executable, ".", "tests")
+            self.assertEqual(store.get("old"), replaced)
+
+    def test_stale_interpreter_is_not_offered_and_user_can_remove_profile(self) -> None:
+        with self._synthetic_project() as root:
+            project = Path(root)
+            (project / "tests").mkdir()
+            workspace = Workspace(project)
+            store = TestProfileStore(workspace)
+            store.add("stale", "unittest", sys.executable, ".", "tests")
+            config_path = project / ".harness" / "config" / "test_profiles.json"
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            removed_interpreter = project / (
+                "removed-python.exe" if os.name == "nt" else "removed-python"
+            )
+            payload["profiles"][0]["python"] = str(removed_interpreter)
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(store.runnable(), [])
+            self.assertEqual(store.get("stale").python, str(removed_interpreter))
+            store.remove("stale")
+            self.assertEqual(store.load(), [])
+
+    def test_frozen_harness_executable_cannot_be_selected_as_its_python(self) -> None:
+        with self._synthetic_project() as root:
+            project = Path(root)
+            (project / "tests").mkdir()
+            workspace = Workspace(project)
+            store = TestProfileStore(workspace)
+            executable = project / "cvfx-harness.exe"
+            executable.write_bytes(b"synthetic harness executable marker")
+            executable.chmod(0o755)
+            with patch("cvfx_harness.profiles.sys.frozen", True, create=True), patch(
+                "cvfx_harness.profiles.sys.executable", str(executable)
+            ):
+                with self.assertRaisesRegex(TestProfileError, "Harness 自身"):
+                    store.add("self", "unittest", str(executable), ".", "tests")
+
+            not_python = project / (
+                "arbitrary-runner.exe" if os.name == "nt" else "arbitrary-runner"
+            )
+            not_python.write_bytes(b"synthetic executable marker")
+            not_python.chmod(0o755)
+            with self.assertRaisesRegex(TestProfileError, "不像受支持的 Python"):
+                store.add("arbitrary", "unittest", str(not_python), ".", "tests")
+
+    def test_cli_profile_management_handles_spaces_and_runs_only_after_approval(self) -> None:
         class CountingMock(MockProvider):
             def __init__(self) -> None:
                 super().__init__()
@@ -80,14 +168,24 @@ class TestProfileStoreTests(unittest.TestCase):
         with self._synthetic_project() as root:
             project = Path(root)
             (project / "tests with spaces").mkdir()
+            (project / "tests with spaces" / "test_cli.py").write_text(
+                "import unittest\n"
+                "class SyntheticCliProfile(unittest.TestCase):\n"
+                "    def test_cli_profile(self):\n"
+                "        print('synthetic CLI profile executed')\n",
+                encoding="utf-8",
+            )
             provider = CountingMock()
             outputs: list[str] = []
             inputs = iter([
                 "/测试 添加 unit",
                 "unittest",
+                sys.executable,
                 ".",
                 "tests with spaces",
                 "/测试 列表",
+                "/测试 运行 unit",
+                "是",
                 "/测试 移除 unit",
                 "是",
                 "/退出",
@@ -102,6 +200,9 @@ class TestProfileStoreTests(unittest.TestCase):
             self.assertEqual(provider.requests, 0)
             self.assertTrue(any("只保存配置，不会运行" in line for line in outputs))
             self.assertTrue(any("tests with spaces" in line for line in outputs))
+            self.assertTrue(any("synthetic CLI profile executed" in line for line in outputs))
+            self.assertTrue(any("Python 解释器：" in line for line in outputs))
+            self.assertTrue(any("输出仅在本地显示" in line for line in outputs))
             self.assertTrue(any("已移除测试配置" in line for line in outputs))
             self.assertEqual(TestProfileStore(Workspace(project)).load(), [])
 

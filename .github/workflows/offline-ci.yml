@@ -32,6 +32,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install hash-locked verification-only pytest from official PyPI
+        run: >-
+          python -m pip --isolated install --disable-pip-version-check --require-hashes
+          --only-binary=:all: --index-url https://pypi.org/simple
+          -r packaging/verification-test-requirements.txt
+
       - name: Install package
         run: python -m pip install --editable .
 
@@ -40,6 +46,9 @@ jobs:
 
       - name: Verify prompt_toolkit TUI with synthetic keyboard input
         run: python scripts/tui_selfcheck.py
+
+      - name: Run synthetic unittest and pytest user profiles
+        run: python scripts/test_runner_selfcheck.py
 
       - name: Compile project and tests
         run: python -m compileall -q src tests scripts

@@ -22,7 +22,7 @@
 | 安全会话保存/恢复 | 已实现 / 离线可测 | `.harness/sessions/`；默认存安全完整轮次；TUI `/恢复 ` 可补全并选择本地会话名；恢复校验归档、标明历史上下文，不恢复审批/执行授权，也不执行旧工具调用；`/检查点` 另存用户手写脱敏摘要，预览确认后才保存；不复制工具结果 |
 | 可审核上下文压缩 | 已实现 / 离线可测 | 本地有损摘要，确认后应用；纳入当前目标与可识别的完整用户限制，摘要上限 32 KiB；工具组校验配对后整组保留/丢弃；拒绝不完整轮次；不可信 `user` 消息，疑似凭据脱敏，历史审批不延续为当前授权 |
 | Token / 预算统计 | 已实现 / 离线可测 | 上下文预算只提示；`/统计` 分别显示固定前缀和会话消息的独立启发式估算；provider usage 可选报告缓存输入命中数；usage 缺失时仍保证各请求上限之和不超过预算 |
-| 用户测试配置与执行 | 已实现 / 离线可测 | `/测试` 配置固定 Python `unittest`/`pytest` profile；只存 ID、框架和工作区相对路径；模型工具只接收已配置 ID。逐次展示解释器/argv/cwd、120 秒与 32 KiB 上限审批；输出在本地脱敏展示后，发送最多 16 KiB 给模型另需同意；一次提问至多运行一个配置。不是沙箱：Linux 普通进程组无法保证捕获自行 `setsid` 脱离者；Windows 挂起启动、先分配 kill-on-close Job Object 再恢复 |
+| 用户测试配置与执行 | 已实现 / 离线可测 | 用户在 `/测试 添加` 选择独立外部 Python 绝对路径；profile 固定 ID、框架、工作区相对 cwd/target，不接受模型提供命令或路径；旧 profile 未选择解释器时禁用。模型只能选择可运行 ID；每次展示外部解释器/argv/cwd 与 120 秒、32 KiB 上限并逐次审批。`/测试 运行` 仅本地显示；模型工具分享最多 16 KiB 输出另需批准。Windows Job Object 先挂起启动、完成分配后再恢复，并在取消/超时/输出溢出后查询活动进程。非沙箱：Linux 普通进程组不保证捕获自行 `setsid` 脱离者；无 CPU/内存/磁盘配额。Harness EXE 自带 Python，但用户测试仍需独立外部 Python；pytest 仅为 CI 的 hash 锁定验证依赖，不打包或自动安装 |
 | Cache-friendly 稳定前缀 | 部分实现 / 离线可测 | 静态 system prompt 与固定工具 schema 顺序稳定；用户测试配置会在末尾增加动态 ID 枚举 schema；本地分项不是缓存命中量；只显示 provider 明确报告的缓存 tokens；没有缓存命中率承诺或远端命中验证 |
 | 子代理 | 已实现 / 离线可测（Mock 与两个 DeepSeek 协议适配器） | 每会话最多 3 项、并发 2、最多 2 轮；独立审批与取消；只读工具限精确预授权路径；无写入/shell/递归；Anthropic 兼容远端行为未在线验证 |
 | PTC（Programmatic Tool Calling） | 待实现 / 术语假设 | 暂按“模型组合调用工具/程序化工具调用”记录；未实现脚本或工具执行链 |
@@ -204,6 +204,13 @@
 - 环境白名单不包含运行时凭据；Linux 新建独立进程组并在超时/取消时终止普通进程树；Windows 以 `CREATE_SUSPENDED` 启动，分配 kill-on-close Job Object 后才恢复主线程，任何监督设置失败均在代码启动前失败关闭。输出最多保留 32 KiB；本地显示前做凭据样式脱敏和终端控制字符转义；向模型发送最多 16 KiB 输出要另行批准。拒绝分享时仅回传状态与退出码，工具轮次不可存档。
 - OpenAI 兼容 SSE loopback fixture 验证跨片段 ID/工具参数组装后按现有 Agent 循环执行 profile；fixture 只访问本机，不含认证头。合成静态测试项目覆盖正常/失败退出、输出截断、普通子进程超时和取消、子进程停止、重复模型请求拦截、审批期间 profile 变化和 Windows Job 成员关系。没有执行用户项目测试或真实模型请求；自动化结果不等于完整产品验收。
 - Linux / Python 3.12 清洁环境全量离线回归：206 项，205 通过、1 项 Windows-only junction 跳过；12 项受限测试运行器用例、`compileall`、安装自检和 `git diff --check` 均通过。提交 `c955e7e0f7ba51ba840aa2edcd74014798d0d79b` 的 Windows/Linux × Python 3.11/3.12 四矩阵 CI 已成功（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39262256476)）；Windows standalone 构建、审查、smoke 和 artifact 上传已成功（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39262256497)）。这些自动测试不等同完整产品验收。
+
+## Standalone 用户测试解释器与真实打包 profile 验证（2026-10-19）
+
+- 修复冻结版误用 `sys.executable`：用户 profile 新增独立外部 Python 绝对路径，由用户交互输入、规范化并校验为可用普通可执行文件；审批预览展示该解释器和完整 argv，审批后重新读取并比较 profile。旧版无解释器 profile 保持禁用，可由用户重新录入同一 ID。模型 schema 只暴露当前仍可运行的 profile ID，不能新增或修改解释器路径。
+- 新增本地 `/测试 运行 <ID>`，复用逐次执行审批，仅本地显示输出，不触发模型请求；模型工具沿用原有单独输出分享审批。profile 配置仍受工作区普通文件工具保护。
+- 两个 CI 工作流从官方 PyPI 安装单独 hash 锁定的 pytest 验证依赖，并在外部 Python 解释器中运行合成 unittest/pytest profile。Windows standalone workflow 还通过真正打包的 EXE 配置并运行两类本地 fixture，不需要 Harness 自身依赖系统 Python。pytest 不属于 Harness 运行依赖，不打包或自动安装。
+- Windows runner 终止路径会查询 Job Object 活动进程，并通过取消用例核验普通子进程已退出；环境回归确认未继承父进程合成敏感标记。Linux 仅保证普通进程组终止，不能保证捕获调用 `setsid` 脱离者；测试代码仍以当前用户权限运行，未提供 CPU、内存、磁盘或网络沙箱。
 
 ## 参考项目复用边界
 

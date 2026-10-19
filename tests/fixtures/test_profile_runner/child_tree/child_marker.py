@@ -1,8 +1,10 @@
+import os
 import time
 from pathlib import Path
 
 
 base = Path(__file__).parent
+(base / "child.pid").write_text(str(os.getpid()), encoding="ascii")
 (base / "child.started").write_text("started", encoding="utf-8")
 counter = base / "child.counter"
 while True:

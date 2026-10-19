@@ -48,7 +48,10 @@ _CLI_COMMANDS = (
     "/恢复", "/会话", "/多行", "/压缩", "/统计", "/预算", "/配置", "/测试", "/子代理",
     "/撤销", "/退出",
 )
-_CLI_ENUM_ARGUMENTS = {"/模式": ("计划", "执行"), "/测试": ("列表", "添加", "移除")}
+_CLI_ENUM_ARGUMENTS = {
+    "/模式": ("计划", "执行"),
+    "/测试": ("列表", "添加", "运行", "移除"),
+}
 _STREAM_SECRET_TAIL_CHARS = 16
 _STREAM_SECRET_RUN_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+/=-"
@@ -363,7 +366,8 @@ def _help_text() -> str:
   /配置 预算 <1024–1000000>
   /配置 输出上限 <1–65536>
   /测试 列表        列出用户保存的 Python unittest/pytest 配置
-  /测试 添加 [ID]   交互式保存固定测试配置；模型不能创建或更改配置
+  /测试 添加 [ID]   交互式保存固定测试配置和外部 Python 路径
+  /测试 运行 <ID>   审批后运行用户测试；输出只在本地显示
   /测试 移除 <ID>   确认后移除一条测试配置
   用户明确要求运行测试时，模型只能选择一个已保存 ID；每次运行与向模型分享输出都要分别审批
   /子代理 提交 [--读取 路径 ... --] 任务 | 任务
@@ -794,11 +798,12 @@ def run_console(
                     else:
                         lines = [
                             f"  {profile.profile_id}: Python {profile.framework}；"
+                            f"解释器 {profile.python or '未配置（旧配置需重新添加）'!r}；"
                             f"工作目录 {profile.cwd!r}；目标 {profile.target!r}"
                             for profile in profiles
                         ]
                         output(
-                            "用户测试配置（只含框架与工作区相对路径；"
+                            "用户测试配置（仅用户添加；解释器为绝对路径；"
                             "没有任意 argv 或 shell 命令）：\n" + "\n".join(lines)
                         )
                     continue
@@ -806,14 +811,42 @@ def run_console(
                 if subcommand in {"添加", "add"}:
                     profile_id = detail.strip() or input_fn("测试配置 ID> ").strip()
                     framework = input_fn("测试框架（unittest/pytest）> ").strip()
+                    interpreter = input_fn("外部 Python 可执行文件绝对路径> ").strip()
                     cwd = input_fn("工作目录（工作区相对路径）> ").strip()
                     target = input_fn("测试目标（工作区相对路径）> ").strip()
-                    profile = test_profile_store.add(profile_id, framework, cwd, target)
+                    profile = test_profile_store.add(
+                        profile_id, framework, interpreter, cwd, target
+                    )
                     output(
                         f"已保存测试配置 {_safe_terminal_text(profile.profile_id)!r}："
-                        f"Python {profile.framework}，cwd={_safe_terminal_text(profile.cwd)!r}，"
+                        f"Python {profile.framework}，"
+                        f"解释器={_safe_terminal_text(profile.python or '')!r}，"
+                        f"cwd={_safe_terminal_text(profile.cwd)!r}，"
                         f"target={_safe_terminal_text(profile.target)!r}。当前只保存配置，不会运行。"
                     )
+                    continue
+
+                if subcommand in {"运行", "run"}:
+                    profile_id = detail.strip()
+                    if not profile_id:
+                        output("用法：/测试 运行 <ID>")
+                        continue
+                    from .test_runner import run_test_profile_tool
+
+                    try:
+                        result = run_test_profile_tool(
+                            workspace,
+                            test_profile_store,
+                            profile_id,
+                            approve_action=approve_action,
+                            cancellation_event=cancellation_event,
+                            emit_output=output,
+                            share_output=False,
+                        )
+                    except (KeyboardInterrupt, ProviderCancelled):
+                        output("已取消本地测试运行；进程清理已启动。")
+                    else:
+                        output(result)
                     continue
 
                 if subcommand in {"移除", "remove"}:
@@ -836,7 +869,7 @@ def run_console(
                     output(f"已移除测试配置 {_safe_terminal_text(profile.profile_id)!r}。")
                     continue
 
-                output("用法：/测试 [列表|添加 [ID]|移除 <ID>]")
+                output("用法：/测试 [列表|添加 [ID]|运行 <ID>|移除 <ID>]")
             except (EOFError, KeyboardInterrupt):
                 output("已取消测试配置输入；没有保存或运行测试。")
             except TestProfileError as exc:

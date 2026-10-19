@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -10,11 +12,13 @@ from typing import Any
 from .sessions import contains_likely_secret
 from .tools import Workspace, WorkspaceError
 
-TEST_PROFILE_VERSION = 1
+TEST_PROFILE_VERSION = 2
 MAX_TEST_PROFILES = 20
 MAX_TEST_PROFILE_BYTES = 32 * 1024
 _PROFILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$")
-_PROFILE_FIELDS = {"id", "framework", "cwd", "target"}
+_PYTHON_EXECUTABLE_NAME = re.compile(r"^(?:python(?:3(?:\.\d+)?)?|pypy3(?:\.\d+)?)$")
+_PROFILE_FIELDS_V1 = {"id", "framework", "cwd", "target"}
+_PROFILE_FIELDS = {*_PROFILE_FIELDS_V1, "python"}
 
 
 class TestProfileError(RuntimeError):
@@ -29,6 +33,7 @@ class TestProfile:
     framework: str
     cwd: str
     target: str
+    python: str | None
 
 
 class TestProfileStore:
@@ -78,8 +83,58 @@ class TestProfileStore:
         except (OSError, WorkspaceError):
             raise TestProfileError("无法安全检查测试配置文件。") from None
 
-    def _validate_profile(self, value: Any) -> TestProfile:
-        if not isinstance(value, dict) or set(value) != _PROFILE_FIELDS:
+    @staticmethod
+    def _validate_interpreter_path(value: Any, *, require_file: bool) -> str | None:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 4096
+            or "\x00" in value
+            or any(ord(char) < 32 for char in value)
+            or contains_likely_secret(value)
+            or not Path(value).is_absolute()
+            or (os.name == "nt" and Path(value).suffix.casefold() != ".exe")
+        ):
+            raise TestProfileError("Python 解释器必须是无凭据的绝对可执行文件路径。")
+        if not require_file:
+            return value
+        try:
+            resolved = Path(value).resolve(strict=True)
+            info = resolved.stat()
+            # resolve() canonicalizes links/junctions, so reject a reparse final target.
+            usable = stat.S_ISREG(info.st_mode) and not Workspace._is_reparse_point(resolved)
+            if os.name == "nt":
+                usable = usable and os.access(resolved, os.R_OK)
+            else:
+                usable = usable and os.access(resolved, os.X_OK)
+            if not usable:
+                raise OSError("not an executable regular file")
+            if getattr(sys, "frozen", False):
+                try:
+                    harness_executable = Path(sys.executable).resolve(strict=True)
+                except (OSError, RuntimeError):
+                    harness_executable = None
+                if harness_executable == resolved:
+                    raise TestProfileError(
+                        "该路径是 Harness 自身；请另选外部 Python 可执行文件。"
+                    )
+            executable_name = Path(value).stem if os.name == "nt" else Path(value).name
+            if _PYTHON_EXECUTABLE_NAME.fullmatch(executable_name.casefold()) is None:
+                raise TestProfileError("解释器文件名不像受支持的 Python 可执行文件；未保存配置。")
+            # Keep the selected path spelling: on POSIX, venv/bin/python is
+            # commonly a symlink whose name is required for pyvenv.cfg discovery.
+            return os.path.abspath(os.path.normpath(value))
+        except TestProfileError:
+            raise
+        except (OSError, RuntimeError, UnicodeError, WorkspaceError):
+            raise TestProfileError("Python 解释器不可用；请选择现存的外部 Python 可执行文件。") from None
+
+    def _validate_profile(self, value: Any, *, require_interpreter: bool = False) -> TestProfile:
+        if not isinstance(value, dict) or not (
+            set(value) == _PROFILE_FIELDS or set(value) == _PROFILE_FIELDS_V1
+        ):
             raise TestProfileError("测试配置结构无效；仅支持用户定义的固定 Python 测试配置。")
         profile_id = self.validate_id(value.get("id"))
         framework = value.get("framework")
@@ -89,6 +144,9 @@ class TestProfileStore:
         target = value.get("target")
         if not isinstance(cwd, str) or not isinstance(target, str):
             raise TestProfileError("工作目录和测试目标必须是工作区相对路径。")
+        interpreter = self._validate_interpreter_path(
+            value.get("python"), require_file=require_interpreter
+        )
         if any(
             not item
             or len(item) > 4096
@@ -134,6 +192,7 @@ class TestProfileStore:
             framework=framework,
             cwd=cwd_path.relative_to(self.workspace.root).as_posix() or ".",
             target=target_path.relative_to(self.workspace.root).as_posix() or ".",
+            python=interpreter,
         )
 
     def load(self) -> list[TestProfile]:
@@ -156,7 +215,7 @@ class TestProfileStore:
             not isinstance(payload, dict)
             or set(payload) != {"version", "profiles"}
             or type(payload.get("version")) is not int
-            or payload.get("version") != TEST_PROFILE_VERSION
+            or payload.get("version") not in {1, TEST_PROFILE_VERSION}
             or not isinstance(payload.get("profiles"), list)
             or len(payload["profiles"]) > MAX_TEST_PROFILES
         ):
@@ -178,6 +237,7 @@ class TestProfileStore:
                     "framework": profile.framework,
                     "cwd": profile.cwd,
                     "target": profile.target,
+                    "python": profile.python,
                 }
                 for profile in profiles
             ],
@@ -193,16 +253,29 @@ class TestProfileStore:
         except WorkspaceError:
             raise TestProfileError("测试配置保存失败；工作区内部目录未修改。") from None
 
-    def add(self, profile_id: str, framework: str, cwd: str, target: str) -> TestProfile:
+    def add(
+        self, profile_id: str, framework: str, python: str, cwd: str, target: str
+    ) -> TestProfile:
         profile = self._validate_profile({
             "id": profile_id,
             "framework": framework,
+            "python": python,
             "cwd": cwd,
             "target": target,
-        })
+        }, require_interpreter=True)
         profiles = self.load()
-        if any(item.profile_id.casefold() == profile.profile_id.casefold() for item in profiles):
+        matching = [
+            item for item in profiles
+            if item.profile_id.casefold() == profile.profile_id.casefold()
+        ]
+        if any(item.python is not None for item in matching):
             raise TestProfileError("该测试配置 ID 已存在；请先移除或选择其他 ID。")
+        # A version-1 profile cannot run because it has no independently selected
+        # interpreter. Let the user re-enter the same ID to complete that profile.
+        profiles = [
+            item for item in profiles
+            if item.profile_id.casefold() != profile.profile_id.casefold()
+        ]
         self._save([*profiles, profile])
         return profile
 
@@ -218,5 +291,21 @@ class TestProfileStore:
         safe_id = self.validate_id(profile_id)
         for profile in self.load():
             if profile.profile_id.casefold() == safe_id.casefold():
+                if profile.python is None:
+                    raise TestProfileError("该旧测试配置尚未选择外部 Python；用 /测试 添加 重新配置。")
                 return profile
         raise TestProfileError("没有名为该 ID 的用户测试配置。")
+
+    def runnable(self) -> list[TestProfile]:
+        profiles: list[TestProfile] = []
+        for profile in self.load():
+            if profile.python is None:
+                continue
+            try:
+                resolved = self._validate_interpreter_path(profile.python, require_file=True)
+            except TestProfileError:
+                continue
+            profiles.append(TestProfile(
+                profile.profile_id, profile.framework, profile.cwd, profile.target, resolved
+            ))
+        return profiles
