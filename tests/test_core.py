@@ -1241,6 +1241,18 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.assertEqual([item["path"] for item in result["matches"]], ["glob-boundary/sub/direct.py"])
 
+    def test_text_search_path_fallback_checks_workspace_root(self) -> None:
+        (self.root / "root.txt").write_text("needle root fallback", encoding="utf-8")
+        with patch.object(Workspace, "_supports_dir_fd_operations", return_value=False):
+            result = json.loads(
+                run_tool(
+                    self.workspace,
+                    ToolCall("root-fallback", "search_text", {"query": "needle"}),
+                    approve_action=self.approve(),
+                )
+            )
+        self.assertEqual(result["matches"][0]["path"], "root.txt")
+
     def test_text_search_reports_a_gitignored_scope(self) -> None:
         (self.root / ".gitignore").write_text("private/\n", encoding="utf-8")
         private = self.root / "private"

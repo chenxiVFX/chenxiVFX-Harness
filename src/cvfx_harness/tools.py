@@ -1000,7 +1000,13 @@ class Workspace:
                     )
                     scan_target = scan_fd
                 else:
-                    self._assert_no_reparse_points(directory)
+                    if directory == self.root:
+                        if self._is_reparse_point(directory):
+                            raise WorkspaceError(
+                                "工作区根路径包含 symlink/junction；操作已取消。"
+                            )
+                    else:
+                        self._assert_no_reparse_points(directory)
                 try:
                     with os.scandir(scan_target) as iterator:
                         names: list[str] = []
