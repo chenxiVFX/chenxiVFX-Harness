@@ -1978,7 +1978,7 @@ class ProjectGuidanceTests(unittest.TestCase):
             workspace = Workspace(root)
             nested = root / "nested"
             nested.mkdir()
-            (root / "README.md").write_text("# 中文\n要求使用中文变量名。", encoding="utf-8")
+            (root / "README.md").write_bytes("# 中文\n要求使用中文变量名。".encode("utf-8"))
             (nested / "AGENTS.md").write_text("must not be discovered", encoding="utf-8")
             store = ProjectGuidanceStore(workspace)
 
