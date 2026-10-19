@@ -17,7 +17,8 @@
 | 工作区文件引用、目录列表与读写 | 已实现 / 离线可测 | 目录只返回名称/类型且逐次批准；文件读取与写入逐次批准；路径和敏感路径检查、写入差异预览与撤销备份 |
 | junction / symlink / hard link 逃逸 | 部分实现 / 跨平台 CI 通过 | Linux 默认运行 symlink / hard link 集成用例；Windows 运行 junction 与可创建的 symlink / hard link 用例；Windows 系统策略拒绝 fixture 时会明确跳过 |
 | 计划模式 | 已实现 / 离线可测 | 拒绝工具写入；没有 shell 工具 |
-| 目标模式 | 已实现（有限） | 目标仅作为不可信上下文；没有计划编排或权限变化 |
+| 用户计划步骤 | 已实现 / 离线可测 | 用户自写最多 3 步，五种可见状态；单次单步、最多 2 次请求/512 输出 tokens；崩溃恢复要求重新确认；不存模型输出/工具结果 |
+| 目标模式 | 已实现（有限） | 目标作为不可信上下文提供给当前步骤；模型不能拆步、扩大任务或改变权限 |
 | 安全会话保存/恢复 | 已实现 / 离线可测 | `.harness/sessions/`；默认存安全完整轮次；`/检查点` 另存用户手写脱敏摘要，预览确认后才保存；不复制工具结果 |
 | 可审核上下文压缩 | 已实现 / 离线可测 | 本地确定性摘要，用户确认后应用；不可信 `user` 消息，工具/引用/敏感轮次不概括 |
 | Token / 预算统计 | 已实现 / 离线可测 | 上下文预算只提示；每次提问的输出预算按请求槽预留并传入 provider `max_tokens`，usage 缺失时仍保证各请求上限之和不超过预算 |
@@ -106,6 +107,13 @@
 - Debian / Python 3.12：`python -m unittest discover -s tests -v` 共 90 项，89 通过、1 项 Windows-only junction 跳过；`compileall`、editable install、安装自检及 `git diff --check` 通过。
 - 当前工作树未调用真实模型 API、未读取环境凭据；SSE HTTP 用例只访问本机 loopback，且不发送 Authorization 头。代码提交 `cf6d4401e26c0ba988b7551a69c52656f2ce0030` 的四矩阵 GitHub Actions 均以 `completed / success` 结束（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39206980429)）。
 - 真实 API 用量账本（父任务累计）：历史已用 1,222 tokens（79 + 1,104 + 39）；本轮预分配上限 20,000，实际请求 0 次、失败 0 次、用量 0；累计仍为 1,222 / 2,000,000，余 1,998,778。未读取凭据或 Network secret。
+
+## 用户自编计划步骤（2026-10-19）
+
+- 新增 `/计划` 工作流：用户可编写最多 3 个步骤（每步最多 400 字符）；状态显式显示为 `pending`、`in-progress`、`completed`、`blocked`、`cancelled`。`/目标` 只作为不可信上下文提供，不让模型拆分目标或扩展授权。
+- 每次运行只执行一条用户步骤，先确认精确文本，再启动全新 Agent；最多 2 次 provider 请求、512 输出 tokens。只读文件/列目录沿用原有逐次审批，写入在工具层拦截。成功后须用户审阅并手动完成。
+- `.harness/plans/current.json` 只存用户步骤和状态；每步 400 字符，存档总计 4 KiB；校验 schema/大小/凭据形态/控制字符，并对确认后文件内容变化做二次校验。模型输出、工具结果、会话消息和审批不存档。重启时 `in-progress` 回到 `pending`，继续运行必须重新确认。
+- 本地离线回归：101 项，100 通过、1 项 Linux 平台跳过 junction 用例；`compileall`、安装自检、UTF-8 Mock 交互和 `git diff --check` 通过。只用合成数据、Mock/provider fixture；没有真实模型 API 请求、没有读取或打印凭据。测试结果不等同于完整产品验收。
 
 ## 参考项目复用边界
 

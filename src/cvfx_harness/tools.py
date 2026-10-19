@@ -356,7 +356,7 @@ class Workspace:
         )
 
     def internal_storage_dir(self, name: str, *, create: bool) -> Path | None:
-        if name not in {_BACKUP_DIR, "sessions", "config"}:
+        if name not in {_BACKUP_DIR, "sessions", "config", "plans"}:
             raise WorkspaceError("未授权的 Harness 内部存储目录。")
         control = self.root / _CONTROL_DIR
         storage_dir = control / name
