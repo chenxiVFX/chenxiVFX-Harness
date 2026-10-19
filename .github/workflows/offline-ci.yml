@@ -38,6 +38,9 @@ jobs:
       - name: Verify installed CLI and UTF-8 mock interaction
         run: python scripts/selfcheck.py
 
+      - name: Verify prompt_toolkit TUI with synthetic keyboard input
+        run: python scripts/tui_selfcheck.py
+
       - name: Compile project and tests
         run: python -m compileall -q src tests scripts
 

@@ -26,7 +26,7 @@
 | 子代理 | 已实现 / 离线可测（Mock 与两个 DeepSeek 协议适配器） | 每会话最多 3 项、并发 2、最多 2 轮；独立审批与取消；只读工具限精确预授权路径；无写入/shell/递归；Anthropic 兼容远端行为未在线验证 |
 | PTC（Programmatic Tool Calling） | 待实现 / 术语假设 | 暂按“模型组合调用工具/程序化工具调用”记录；未实现脚本或工具执行链 |
 | PowerShell/cmd 命令执行 | 待实现 | 当前严格关闭；需要先设计工作区隔离和 Windows 真实进程权限边界 |
-| 完整 TUI、快捷键、恢复中断任务 | 待实现 | 已有 `/命令`、受限多行输入和可用时的 readline 命令 Tab 补全；没有输入历史、全屏 TUI、快捷键编辑器或中断任务恢复 |
+| 全屏中文 TUI | 已实现 / 离线可测 | 固定底部多行输入、实时固定命令/枚举建议、键盘与鼠标导航、逐次审批默认拒绝、非 TTY / `--plain` 纯文本回退；不保存输入历史；终端与中文 IME 兼容仍需人工验收 |
 | 通用模型配置文件、Provider 插件与 PTC 配置 | 待实现 | 现有 provider 设置由非敏感工作区/环境/CLI 字段解析；没有插件框架或 PTC 配置，密钥不入仓 |
 
 ## 本轮验收记录（2026-10-18）
@@ -178,6 +178,15 @@
 - 两种 SSE provider 共用一个响应体读取 guard：调用线程负责读取、协议解析与回调，单个 watchdog 仅在取消或截止时间到达时 shutdown 当前响应 socket，并在所有退出路径停止和 join。正常停顿继续等待，真正超时直接结束；不恢复已超时的文件缓冲、不自动重试、不新增模型工具或执行权限。
 - 新增正常停顿恢复、分块头拆分、持续慢滴、取消、KeyboardInterrupt、超时不重读及 watchdog 回收验证，覆盖 OpenAI/Anthropic、HTTP/验证证书的 CONNECT/TLS 两种传输。保留大小限制、完成标记、工具审批和错误脱敏；建连/响应头的网络栈取消与硬截止限制已在架构文档明示。
 - Debian / Python 3.12 离线回归：157 项，156 通过、1 项 Windows-only junction 跳过；测试不等同完整产品验收。用量账本不写入仓库，真实工具闭环、子代理及 Anthropic endpoint 的验收范围独立判断。
+
+## 全屏中文 TUI 首发闸门（2026-10-19）
+
+- TTY 默认使用固定版本 `prompt-toolkit 3.0.53` 与 `wcwidth 0.9.2`；非 TTY、`TERM=dumb` 或 `--plain` 保留纯文本入口。Windows 单文件构建锁定轮子哈希、扫描依赖清单并携带第三方许可证通知。
+- 实现顶部模型/工作区标识、滚动会话区、固定底部输入和状态栏；`/` 实时列出固定中文命令及简介，`/模式` 仅补固定枚举。Tab 或 Enter 可填入建议；Enter 再提交完整输入，Ctrl+J 换行，Esc 先关建议再取消，Ctrl+C 先清草稿再请求取消。
+- 审批面板显示动作预览，默认拒绝；键盘/鼠标只切换“是/否”，必须另按 Enter 才会给当前操作单次授权。多行粘贴拒绝；模型/工具输出会转义终端控制字符、遮蔽疑似凭据并限制缓冲输出长度。
+- TUI 把输入桥接到既有 CLI Agent/工具循环，沿用预算、目录/文件逐项审批、计划拦截和取消事件；没有增加 shell 或模型代码执行。PTY 与合成按键用于验证渲染入口和操作流程，不等同 Windows Terminal/ConPTY 或真实中文输入法验收。
+- 交互组件测试、隔离合成键盘自检和 POSIX PTY 测试只使用本地合成内容与 Mock；Windows standalone workflow 会在打包 EXE 内运行 TUI 合成键盘自检。中文 IME 和终端缩放/鼠标差异仍待人工兼容测试。
+- Linux / Python 3.12 离线回归：177 项，176 通过、1 项 Windows-only junction 跳过；editable install、自检、TUI 合成键盘自检、`compileall` 与 `git diff --check` 通过。没有真实模型请求或凭据读取；这些测试不等同完整产品验收。Windows/Linux × Python 3.11/3.12 与 Windows standalone 构建结果待推送后记录。
 
 ## 参考项目复用边界
 

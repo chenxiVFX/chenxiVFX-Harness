@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: "3.12.10"
 
-      - name: Install hash-locked build-only packager
+      - name: Install hash-locked packager and TUI requirements
         run: >-
           python -m pip --isolated install --disable-pip-version-check --require-hashes
           --only-binary=:all: --index-url https://pypi.org/simple
@@ -68,6 +68,7 @@ jobs:
             "- Executable: $env:EXE_BYTES bytes ($env:EXE_MIB MiB); SHA-256 ``$env:EXE_SHA256``"
             "- Internal archive audit: $env:ARCHIVE_MEMBERS entries inspected; no forbidden document/config names found"
             "- --help start/exit on windows-2022, first observed run: $env:HELP_FIRST_MS ms; 5-run median: $env:HELP_MEDIAN_MS ms; range: $env:HELP_MIN_MS–$env:HELP_MAX_MS ms"
-            '- Smoke checks passed: --help, UTF-8 offline Mock Chinese interaction, and Chinese/space workspace path with Python absent from the child PATH.'
+            '- Smoke checks passed: --help, UTF-8 offline Mock Chinese interaction, synthetic TUI keyboard/completion/startup/exit, and Chinese/space workspace path with Python absent from the child PATH.'
+            '- Bundle includes prompt-toolkit and wcwidth; the downloadable files include third-party license notices.'
             '- The build is unsigned; no signing, release, registry upload, or real model request was used.'
           ) | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8

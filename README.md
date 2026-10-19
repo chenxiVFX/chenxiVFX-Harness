@@ -6,7 +6,7 @@ Windows 优先、中文交互的 AI 编程命令行工具。当前版本包含�
 
 ## 环境与安装
 
-需要 Python 3.11 或更新版本。项目没有第三方运行时依赖。Windows PowerShell 中，在仓库目录运行：
+需要 Python 3.11 或更新版本。交互式 TTY 使用固定版本的 `prompt-toolkit` 与 `wcwidth`；核心 provider、工作区与审批逻辑仍使用 Python 标准库。Windows PowerShell 中，在仓库目录运行：
 
 ```powershell
 python -m venv .venv
@@ -28,13 +28,21 @@ python -m venv .venv
 .\run.ps1 --workspace . --provider mock
 ```
 
-安装后可运行 `cvfx-harness --workspace . --provider mock` 或 `python -m cvfx_harness`。默认提供商为 `mock`，不会读取密钥或发起网络请求。终端使用 UTF-8；Ctrl+C 取消当前输入、多行草稿或模型请求后返回提示符，不重放输入；EOF 结束会话，未完成的多行草稿不会提交。
+安装后可运行 `cvfx-harness --workspace . --provider mock` 或 `python -m cvfx_harness`。默认提供商为 `mock`，不会读取密钥或发起网络请求。双向 TTY 默认启动全屏中文界面；非 TTY、`TERM=dumb` 或 `--plain` 使用原纯文本 CLI。
+
+### 交互式终端
+
+输入区固定在底部，上方保留会话输出；新文本会跟随到底部，手动向上滚动后不会被新输出拉回。行首输入 `/` 会实时筛选两列中文命令建议。↑/↓ 选择，Tab 填入，Enter 提交输入；Esc 先关闭建议，再取消当前输入。`/模式 ` 只补全固定选项。`@文件` 引用仍需手动输入路径，不会递归扫描工作区，也不会在补全时泄露敏感路径。
+
+Enter 提交当前输入，Ctrl+J 插入换行；Ctrl+C 首次清空草稿，再次按下会取消当前输入或请求。审批面板显示精确动作和 diff，默认选择“否”；用 ↑/↓、Tab 或鼠标选择，按 Enter 才确认本次操作，Esc 取消。点击建议只会填入候选，点击审批选项只切换选择，不会执行动作。不会保存输入历史或审批答案，也没有永久授权模式。
+
+启用 TTY 全屏渲染后，终端的 Unicode 字符宽度、鼠标能力与输入法组合仍取决于宿主。当前项目在 CI 中使用 prompt_toolkit 的合成输入和 Linux PTY 验证键位、布局启动/退出；Windows runner 使用其 Win32 输入模拟验证。尚未完成 Windows Terminal、PowerShell/ConPTY 和各中文 IME 组合的人工兼容验收。
 
 ### Windows 独立程序试验
 
-仓库的 `Windows standalone packaging experiment` Actions 工作流会在 Windows x64 runner 上构建一个含 Python 运行时的单文件 `.exe`，随后在不依赖系统 Python 的子进程环境中检查 `--help`、离线 Mock 中文交互和含中文/空格的工作区路径。构建工具仅用于 CI，版本和 Windows 轮子哈希锁定在 [`packaging/windows-build-requirements.txt`](packaging/windows-build-requirements.txt)；源码安装仍无第三方运行时依赖。
+仓库的 `Windows standalone packaging experiment` Actions 工作流会在 Windows x64 runner 上构建一个含 Python 运行时的单文件 `.exe`，随后在不依赖系统 Python 的子进程环境中检查 `--help`、离线 Mock 中文交互和含中文/空格的工作区路径。构建工具仅用于 CI，版本和 Windows 轮子哈希锁定在 [`packaging/windows-build-requirements.txt`](packaging/windows-build-requirements.txt)；应用的 TUI 运行依赖固定在 `pyproject.toml`。
 
-从对应 Actions 运行页面下载 `windows-x64-cvfx-harness-py312` 文件，解压后可运行 `cvfx-harness.exe --help` 或 `cvfx-harness.exe --workspace . --provider mock`。单文件启动时会把依赖解压到系统临时目录，启动会比源码或目录包慢一些，且需要临时目录可写。包中只有可执行文件、中文说明和 SHA-256 校验文件；CI 构建不打包仓库文档、配置或工作区文件。构建与自检仅使用 Mock 和合成输入，不连接真实模型。这个未签名包只是试验，不是正式发布；Windows 可能显示 SmartScreen 或 Defender 提示，请保持系统保护开启并遵循组织策略。Actions 文件保留 14 天，不上传到发布页或包注册表。
+从对应 Actions 运行页面下载 `windows-x64-cvfx-harness-py312` 文件，解压后可运行 `cvfx-harness.exe --help` 或 `cvfx-harness.exe --workspace . --provider mock`。单文件启动时会把依赖解压到系统临时目录，启动会比源码或目录包慢一些，且需要临时目录可写。包中包含可执行文件、中文说明、第三方许可证通知和 SHA-256 校验文件；CI 构建不打包仓库文档、配置或工作区文件。构建与自检仅使用 Mock 和合成输入，不连接真实模型。这个未签名包只是试验，不是正式发布；Windows 可能显示 SmartScreen 或 Defender 提示，请保持系统保护开启并遵循组织策略。Actions 文件保留 14 天，不上传到发布页或包注册表。
 
 ## 可用命令
 
@@ -62,7 +70,7 @@ python -m venv .venv
 | `/多行` | 逐行撰写一个问题；单独输入 `/提交` 发送，`/取消` 或 Ctrl+C 丢弃 |
 | `/退出` | 结束会话 |
 
-`/多行` 以换行合并文本，最多 64 KiB UTF-8；只有单独一行 `/提交` 会发送。无 TTY 时可直接把命令和多行块逐行写入 stdin；EOF 会结束会话，未结束的多行块会丢弃。Harness 不保存输入历史或审批回答。TTY 的 Python `readline` 可用时，Tab 补全命令名及固定枚举值（例如 `/模式 计` 补成 `/模式 计划`）；不补全文件路径、自由文本或凭据。没有 readline 的 Windows 终端可用 `/命令` 查找。补全不会执行命令，也不会批准动作。
+`/多行` 以换行合并文本，最多 64 KiB UTF-8；只有单独一行 `/提交` 会发送。无 TTY 时可直接把命令和多行块逐行写入 stdin；EOF 会结束会话，未结束的多行块会丢弃。Harness 不保存输入历史或审批回答。纯文本模式不做路径补全。交互 TUI 仅补全固定中文命令和固定枚举值，不补全文件路径、自由文本或凭据。补全不会执行命令，也不会批准动作。
 
 在提问里用 `@相对路径` 引用文件；路径含空格时写 `@{资料/需求 文档.txt}`，多行问题中也可使用。每次引用读取都要确认；内容随后会发送给所选提供商。模型也可请求逐次确认的目录列表，列表只包含名称与类型，不读取条目正文。EOF 时文件/目录审批默认拒绝。敏感路径、工作区外路径、链接逃逸和非 UTF-8 文本默认拒绝。当前没有 shell 执行工具，PowerShell/cmd 命令不会执行。
 

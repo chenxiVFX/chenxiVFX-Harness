@@ -1,0 +1,650 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import queue
+import re
+import threading
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from prompt_toolkit import Application
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Dimension, HSplit, Layout, VSplit, Window
+from prompt_toolkit.layout.containers import Float, FloatContainer, ConditionalContainer
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.styles import Style
+from prompt_toolkit.widgets import Button, Frame, TextArea
+
+from .sessions import redact_likely_secrets
+
+MAX_TRANSCRIPT_CHARS = 200_000
+POLL_INTERVAL_SECONDS = 0.025
+COMMANDS = (
+    ("/帮助", "显示完整说明"), ("/命令", "列出中文命令"),
+    ("/状态", "查看模型和工作区"), ("/模式", "切换计划或执行"),
+    ("/目标", "设置会话目标"), ("/计划", "查看或执行计划"),
+    ("/保存", "保存安全会话"), ("/检查点", "保存手写摘要"),
+    ("/恢复", "恢复安全会话"), ("/会话", "列出本地会话"),
+    ("/多行", "撰写多行问题"), ("/压缩", "预览并压缩上下文"),
+    ("/统计", "查看上下文用量"), ("/预算", "设置本轮预算"),
+    ("/配置", "查看非敏感配置"), ("/子代理", "管理隔离子任务"),
+    ("/撤销", "预览并撤销写入"), ("/退出", "结束会话"),
+)
+ENUM_COMPLETIONS = {
+    "/模式": ("计划", "执行"),
+}
+_APPROVAL_PROMPT = re.compile(r"\[y/N\]\s*$", re.IGNORECASE)
+
+
+def _safe_text(value: str) -> str:
+    """Keep model/user-controlled terminal control characters visible as text."""
+    from .cli import _safe_terminal_text
+
+    redacted, _count = redact_likely_secrets(value)
+    return _safe_terminal_text(redacted)
+
+
+class CommandCompleter(Completer):
+    """Offer only fixed commands and fixed enum values; never inspect workspace paths."""
+
+    def get_completions(self, document, complete_event):
+        del complete_event
+        before = document.text_before_cursor
+        if "\n" in before:
+            return
+        if before.startswith("/模式 "):
+            prefix = before[len("/模式 ") :]
+            if " " in prefix:
+                return
+            for value in ENUM_COMPLETIONS["/模式"]:
+                if value.startswith(prefix):
+                    yield Completion(value, start_position=-len(prefix))
+            return
+        if before.startswith("/") and " " not in before:
+            for command, description in COMMANDS:
+                if command.startswith(before):
+                    yield Completion(
+                        command,
+                        start_position=-len(before),
+                        display_meta=description,
+                    )
+
+
+@dataclass
+class _InputRequest:
+    prompt: str
+    approval: bool
+    completed: threading.Event
+    value: str | None = None
+    error: BaseException | None = None
+
+
+class TerminalUI:
+    """Full-screen prompt_toolkit shell around the existing synchronous CLI loop."""
+
+    def __init__(
+        self,
+        worker: Callable[[TerminalUI], int],
+        *,
+        input: Any = None,
+        output: Any = None,
+    ) -> None:
+        self._worker_callable = worker
+        self._input = input
+        self._output = output
+        self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self._pending: _InputRequest | None = None
+        self._worker_thread: threading.Thread | None = None
+        self._worker_started = False
+        self._worker_done = False
+        self._worker_result = 2
+        self._cancel_event = threading.Event()
+        self._cancel_requested = False
+        self._request_ready = threading.Event()
+        self._status = "启动中"
+        self._notice = ""
+        self._prompt = ""
+        self._approval_text = ""
+        self._approval_choice_yes = False
+        self._last_output = ""
+        self._header_model = ""
+        self._header_workspace = ""
+        self._transcript = ""
+        self._follow_output = True
+        self.input_area = TextArea(
+            multiline=True,
+            completer=CommandCompleter(),
+            complete_while_typing=True,
+            wrap_lines=True,
+            focus_on_click=True,
+            height=Dimension(min=1, max=4),
+            style="class:input",
+        )
+        self._input_buffer = self.input_area.buffer
+        self.output_area = TextArea(
+            text="",
+            multiline=True,
+            read_only=True,
+            focusable=True,
+            focus_on_click=True,
+            wrap_lines=True,
+            scrollbar=True,
+            height=Dimension(min=4, weight=1),
+            style="class:transcript",
+        )
+        self._approval_area = TextArea(
+            text="",
+            multiline=True,
+            read_only=True,
+            focusable=False,
+            wrap_lines=True,
+            scrollbar=True,
+            height=Dimension(min=2, max=8),
+            style="class:approval",
+        )
+        self._approval_no_button = Button(
+            "● 否（默认）", handler=self._select_no, width=18
+        )
+        self._approval_yes_button = Button(
+            "○ 是（本次）", handler=self._select_yes, width=18
+        )
+        self._approval_container = ConditionalContainer(
+            Frame(
+                HSplit(
+                    [
+                        self._approval_area,
+                        VSplit(
+                            [self._approval_no_button, self._approval_yes_button],
+                            padding=1,
+                        ),
+                    ]
+                ),
+                title="待审批（仅本次授权）",
+            ),
+            Condition(lambda: bool(self._approval_text)),
+        )
+        input_block = HSplit(
+            [
+                Window(char="─", height=1, style="class:input.separator"),
+                Window(
+                    FormattedTextControl(lambda: self._prompt_label()),
+                    height=1,
+                    style="class:prompt",
+                ),
+                self.input_area,
+                Window(char="─", height=1, style="class:input.separator"),
+            ]
+        )
+        content = HSplit(
+            [
+                Window(
+                    FormattedTextControl(lambda: self._header_line()),
+                    height=1,
+                    style="class:header",
+                ),
+                self.output_area,
+                self._approval_container,
+                input_block,
+                Window(
+                    FormattedTextControl(lambda: self._status_line()),
+                    height=1,
+                    style="class:status",
+                ),
+            ]
+        )
+        self._bindings = self._build_key_bindings()
+        self._application = Application(
+            layout=Layout(
+                FloatContainer(
+                    content=content,
+                    floats=[
+                        Float(
+                            xcursor=True,
+                            ycursor=True,
+                            content=CompletionsMenu(max_height=8, scroll_offset=1),
+                            hide_when_covering_content=True,
+                        )
+                    ],
+                ),
+                focused_element=self.input_area,
+            ),
+            key_bindings=self._bindings,
+            style=Style.from_dict(
+                {
+                    "": "bg:#000000",
+                    "header": "bold fg:#ffffff bg:#000000",
+                    "status": "fg:#ffffff bg:#20232a",
+                    "prompt": "bold fg:#74c7ec",
+                    "input": "fg:#f2f2f2",
+                    "input.separator": "fg:#707784",
+                    "transcript": "fg:#d9e2ec",
+                    "approval": "fg:#f5d76e",
+                    "frame.border": "fg:#707784",
+                    "frame.label": "bold fg:#f5d76e",
+                    "button": "fg:#9aa0aa bg:#000000",
+                    "button.focused": "fg:#c6a0f6 bg:#000000 bold",
+                    "completion-menu.completion": "fg:#f2f2f2 bg:#263849",
+                    "completion-menu.completion.current": "fg:#1b1722 bg:#c6a0f6 bold",
+                    "completion-menu.meta.completion": "fg:#9fb3c8 bg:#263849",
+                }
+            ),
+            full_screen=True,
+            erase_when_done=False,
+            mouse_support=True,
+            input=input,
+            output=output,
+            refresh_interval=0.1,
+        )
+
+    @property
+    def cancellation_event(self) -> threading.Event:
+        return self._cancel_event
+
+    def input(self, prompt: str) -> str:
+        request = _InputRequest(
+            prompt=prompt,
+            approval=_APPROVAL_PROMPT.search(prompt) is not None,
+            completed=threading.Event(),
+        )
+        self._events.put(("input", request))
+        request.completed.wait()
+        if request.error is not None:
+            raise request.error
+        if request.value is None:
+            raise EOFError()
+        return request.value
+
+    def output(self, text: str) -> None:
+        self._events.put(("output", text))
+
+    def stream_write(self, text: str) -> None:
+        self._events.put(("stream", text))
+
+    def run(self) -> int:
+        self._worker_thread = threading.Thread(
+            target=self._run_worker,
+            name="cvfx-tui-cli-worker",
+            daemon=True,
+        )
+
+        def start_worker() -> None:
+            if self._worker_started:
+                return
+            self._worker_started = True
+            self._worker_thread.start()
+            self._application.create_background_task(self._poll_events())
+
+        try:
+            return int(self._application.run(pre_run=start_worker))
+        finally:
+            if self._pending is not None:
+                self._resolve_pending(error=KeyboardInterrupt())
+            self._cancel_event.set()
+            if self._worker_thread.is_alive():
+                self._worker_thread.join(timeout=2)
+
+    def _run_worker(self) -> None:
+        try:
+            result = self._worker_callable(self)
+            result = result if type(result) is int else 2
+        except BaseException:
+            # Never propagate raw exception text from worker code into the terminal.
+            result = 2
+            self._events.put(("output", "TUI 后台任务意外结束；原始错误信息已隐藏。"))
+        self._events.put(("done", result))
+
+    async def _poll_events(self) -> None:
+        while not self._worker_done:
+            handled = False
+            while True:
+                try:
+                    kind, value = self._events.get_nowait()
+                except queue.Empty:
+                    break
+                handled = True
+                if kind == "output":
+                    safe = _safe_text(str(value))
+                    self._last_output = safe
+                    if safe.startswith("chenxiVFX Harness v"):
+                        self._header_model = safe.removeprefix("chenxiVFX Harness ")
+                    elif safe.startswith("工作区："):
+                        self._header_workspace = safe.removeprefix("工作区：")
+                    else:
+                        self._append_transcript(safe + "\n")
+                    if "已取消当前" in safe:
+                        self._status = "已取消"
+                    elif self._pending is None:
+                        self._status = "运行中"
+                elif kind == "stream":
+                    self._append_transcript(_safe_text(str(value)))
+                    if self._pending is None:
+                        self._status = "运行中"
+                elif kind == "input" and isinstance(value, _InputRequest):
+                    self._pending = value
+                    self._prompt = _safe_text(value.prompt).strip()
+                    self._input_buffer.text = ""
+                    self._notice = ""
+                    if value.approval:
+                        self._status = "等待审批"
+                        self._approval_choice_yes = False
+                        self._update_approval_buttons()
+                        context = self._last_output
+                        if any(marker in context for marker in ("差异", "审批范围")):
+                            self._approval_text = _safe_text(context)
+                        else:
+                            self._approval_text = self._prompt
+                        self._approval_area.text = self._approval_text
+                    else:
+                        self._cancel_event.clear()
+                        self._cancel_requested = False
+                        self._approval_choice_yes = False
+                        self._approval_text = ""
+                        self._approval_area.text = ""
+                        self._status = "等待输入"
+                    self._request_ready.set()
+                elif kind == "done":
+                    self._worker_result = value if type(value) is int else 2
+                    self._worker_done = True
+                    self._status = "会话已结束" if self._worker_result == 0 else "会话结束（错误）"
+            if self._worker_done:
+                self._application.exit(result=self._worker_result)
+                return
+            if handled:
+                self._application.invalidate()
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+    def _build_key_bindings(self) -> KeyBindings:
+        bindings = KeyBindings()
+
+        @bindings.add("enter", eager=True)
+        def submit(event) -> None:
+            if self._pending is not None and (
+                event.app.layout.has_focus(self.input_area)
+                or event.app.layout.has_focus(self._approval_no_button)
+                or event.app.layout.has_focus(self._approval_yes_button)
+            ):
+                if (
+                    not self._pending.approval
+                    and event.app.layout.has_focus(self.input_area)
+                    and self._accept_completion_or_submit()
+                ):
+                    return
+                self._submit_input()
+
+        @bindings.add("tab", eager=True)
+        def accept_completion(event) -> None:
+            if self._pending is not None and self._pending.approval:
+                self._toggle_approval_choice()
+                return
+            if not event.app.layout.has_focus(self.input_area):
+                return
+            buffer = self._input_buffer
+            if buffer.complete_state is None:
+                buffer.start_completion(select_first=True)
+            completion_state = buffer.complete_state
+            if completion_state is not None:
+                if completion_state.current_completion is None:
+                    buffer.complete_next()
+                    completion_state = buffer.complete_state
+                if completion_state is not None and completion_state.current_completion is not None:
+                    buffer.apply_completion(completion_state.current_completion)
+
+        @bindings.add("up", eager=True)
+        def previous_completion(event) -> None:
+            if self._pending is not None and self._pending.approval:
+                self._select_yes()
+                return
+            if not event.app.layout.has_focus(self.input_area):
+                return
+            buffer = self._input_buffer
+            if buffer.complete_state is not None:
+                buffer.complete_previous()
+            else:
+                buffer.cursor_up()
+
+        @bindings.add("down", eager=True)
+        def next_completion(event) -> None:
+            if self._pending is not None and self._pending.approval:
+                self._select_no()
+                return
+            if not event.app.layout.has_focus(self.input_area):
+                return
+            buffer = self._input_buffer
+            if buffer.complete_state is not None:
+                buffer.complete_next()
+            else:
+                buffer.cursor_down()
+
+        @bindings.add("escape", eager=True)
+        def escape(event) -> None:
+            buffer = self._input_buffer
+            if buffer.complete_state is not None:
+                buffer.cancel_completion()
+                self._notice = "建议已关闭。"
+            elif self._pending is not None:
+                self._resolve_pending(error=KeyboardInterrupt())
+            elif not self._worker_done:
+                self._request_cancel()
+
+        @bindings.add("c-c", eager=True)
+        def clear_or_cancel(event) -> None:
+            buffer = self._input_buffer
+            if buffer.text:
+                buffer.text = ""
+                buffer.cancel_completion()
+                self._notice = "已清空草稿；尚未提交。"
+            elif self._pending is not None:
+                self._resolve_pending(error=KeyboardInterrupt())
+            elif not self._worker_done:
+                self._request_cancel()
+
+        @bindings.add("c-j", eager=True)
+        def insert_newline(event) -> None:
+            if self._pending is None or self._pending.approval:
+                self._notice = "审批回答只能单行输入。"
+                return
+            self._input_buffer.insert_text("\n")
+
+        @bindings.add("c-d", eager=True)
+        def end_of_input(event) -> None:
+            if self._pending is not None:
+                self._resolve_pending(eof=True)
+
+        @bindings.add("pageup", eager=True)
+        def scroll_output_up(event) -> None:
+            if self._input_buffer.complete_state is None:
+                self._move_output_cursor(-max(2, self.output_area.window.height.preferred or 10))
+
+        @bindings.add("pagedown", eager=True)
+        def scroll_output_down(event) -> None:
+            if self._input_buffer.complete_state is None:
+                self._move_output_cursor(max(2, self.output_area.window.height.preferred or 10))
+
+        @bindings.add("c-end", eager=True)
+        def output_bottom(event) -> None:
+            if self._input_buffer.complete_state is None:
+                self._follow_output = True
+                self.output_area.buffer.cursor_position = len(self.output_area.text)
+
+        return bindings
+
+    def _accept_completion_or_submit(self) -> bool:
+        """Return True when Enter filled a candidate instead of submitting."""
+        buffer = self._input_buffer
+        state = buffer.complete_state
+        if state is None or not state.completions:
+            return False
+
+        document = buffer.document
+        exact_match = any(
+            document.text[: document.cursor_position + completion.start_position]
+            + completion.text
+            + document.text[document.cursor_position:]
+            == buffer.text
+            for completion in state.completions
+        )
+        if exact_match:
+            buffer.cancel_completion()
+            return False
+
+        if state.current_completion is None:
+            buffer.complete_next()
+            state = buffer.complete_state
+        if state is not None and state.current_completion is not None:
+            buffer.apply_completion(state.current_completion)
+            return True
+        return False
+
+    def _submit_input(self) -> None:
+        request = self._pending
+        if request is None:
+            return
+        value = self._input_buffer.text
+        if request.approval and ("\n" in value or "\r" in value):
+            self._notice = "审批回答必须是单行；多行粘贴不会批准操作。"
+            self._input_buffer.text = ""
+            return
+        if request.approval and not value and self._approval_choice_yes:
+            value = "是"
+        if not request.approval and value:
+            self._append_transcript(f"\n你> {_safe_text(value)}\n")
+        elif request.approval:
+            self._append_transcript(f"\n审批回答：{_safe_text(value) or '（空，拒绝）'}\n")
+        self._resolve_pending(value=value)
+
+    def _resolve_pending(
+        self,
+        *,
+        value: str | None = None,
+        error: BaseException | None = None,
+        eof: bool = False,
+    ) -> None:
+        request = self._pending
+        if request is None:
+            return
+        request.value = None if eof else value
+        request.error = error
+        self._pending = None
+        self._prompt = ""
+        self._approval_text = ""
+        self._approval_area.text = ""
+        self._last_output = ""
+        self._input_buffer.text = ""
+        self._request_ready.clear()
+        self._status = "运行中"
+        request.completed.set()
+
+    def _request_cancel(self) -> None:
+        self._cancel_requested = True
+        self._cancel_event.set()
+        self._status = "正在取消"
+        self._notice = "已请求取消；等待当前安全检查点。"
+
+    def _append_transcript(self, text: str) -> None:
+        info = self.output_area.window.render_info
+        if info is not None:
+            at_bottom = info.vertical_scroll >= max(
+                0, info.content_height - info.window_height
+            )
+            if not at_bottom:
+                self._follow_output = False
+        old_cursor = self.output_area.buffer.cursor_position
+        self._transcript += text
+        if len(self._transcript) > MAX_TRANSCRIPT_CHARS:
+            excess = len(self._transcript) - MAX_TRANSCRIPT_CHARS
+            newline = self._transcript.find("\n", excess)
+            cut = newline + 1 if newline >= 0 else excess
+            self._transcript = "[较早的终端输出已折叠]\n" + self._transcript[cut:]
+            old_cursor = max(0, old_cursor - cut)
+        self.output_area.text = self._transcript
+        if self._follow_output:
+            self.output_area.buffer.cursor_position = len(self._transcript)
+        else:
+            self.output_area.buffer.cursor_position = min(old_cursor, len(self._transcript))
+
+    def _move_output_cursor(self, rows: int) -> None:
+        document = self.output_area.buffer.document
+        current_row, current_col = document.translate_index_to_position(
+            self.output_area.buffer.cursor_position
+        )
+        target_row = max(0, current_row + rows)
+        target_row = min(target_row, document.line_count - 1)
+        target_index = document.translate_row_col_to_index(target_row, 0)
+        self.output_area.buffer.cursor_position = target_index
+        self._follow_output = target_row >= document.line_count - 1
+
+    def _prompt_label(self) -> str:
+        if not self._pending:
+            return "等待后台任务…"
+        return self._prompt or "输入"
+
+    def _header_line(self) -> str:
+        parts = [self._header_model or "chenxiVFX Harness"]
+        if self._header_workspace:
+            parts.append(f"工作区：{self._header_workspace}")
+        return "  " + "  ·  ".join(parts)
+
+    def _select_no(self) -> None:
+        self._approval_choice_yes = False
+        self._update_approval_buttons()
+        self._notice = "当前选择：否；按 Enter 拒绝本次操作。"
+
+    def _select_yes(self) -> None:
+        self._approval_choice_yes = True
+        self._update_approval_buttons()
+        self._notice = "当前选择：是；按 Enter 仅批准本次操作。"
+
+    def _toggle_approval_choice(self) -> None:
+        if self._approval_choice_yes:
+            self._select_no()
+        else:
+            self._select_yes()
+
+    def _update_approval_buttons(self) -> None:
+        self._approval_no_button.text = (
+            "○ 否（默认）" if self._approval_choice_yes else "● 否（默认）"
+        )
+        self._approval_yes_button.text = (
+            "● 是（本次）" if self._approval_choice_yes else "○ 是（本次）"
+        )
+
+    def _status_line(self) -> str:
+        details = self._notice or "↑↓ 选择建议  Tab 填入  Enter 提交  Ctrl+J 换行  Ctrl+C 清空/取消  Esc 关闭建议/取消"
+        if self._pending is not None and self._pending.approval:
+            choice = "是" if self._approval_choice_yes else "否（默认）"
+            details = self._notice or f"选择 {choice}：Tab/↑↓ 切换或点击选项；Enter 确认；Esc 取消"
+        return f" 状态：{self._status}    {details}"
+
+
+def run_tui_console(args) -> int | None:
+    """Run the existing CLI in a worker, returning None when TUI setup is unsupported."""
+    from .cli import run_console
+
+    def worker(ui: TerminalUI) -> int:
+        return run_console(
+            args,
+            input_fn=ui.input,
+            output=ui.output,
+            stream_write=ui.stream_write,
+            cancellation_event=ui.cancellation_event,
+        )
+
+    ui = TerminalUI(worker)
+    try:
+        return ui.run()
+    except (EOFError, NotImplementedError, OSError):
+        if ui._worker_started:
+            return 2
+        return None
+
+
+def terminal_supports_tui(*, is_windows: bool, is_stdin_tty: bool, is_stdout_tty: bool, term: str | None) -> bool:
+    if not is_stdin_tty or not is_stdout_tty:
+        return False
+    if is_windows:
+        return True
+    return bool(term and term.casefold() != "dumb")

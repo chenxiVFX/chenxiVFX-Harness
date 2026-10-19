@@ -1314,7 +1314,7 @@ class CliTests(unittest.TestCase):
             process = subprocess.Popen(
                 [
                     sys.executable, "-m", "cvfx_harness", "--workspace", temp,
-                    "--provider", "mock",
+                    "--provider", "mock", "--plain",
                 ],
                 stdin=slave_fd,
                 stdout=slave_fd,

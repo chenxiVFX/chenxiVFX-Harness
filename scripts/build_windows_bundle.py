@@ -17,6 +17,7 @@ EXPECTED_ARTIFACT_FILES = {
     "cvfx-harness.exe",
     "README-standalone-zh-CN.txt",
     "SHA256SUMS.txt",
+    "THIRD_PARTY_NOTICES.txt",
 }
 FORBIDDEN_BUNDLE_NAMES = {
     ".env",
@@ -102,6 +103,13 @@ def _audit_bundle(executable: Path) -> int:
             break
     if forbidden_content_found:
         _fail("内嵌清单含不应分发的项目文档或配置")
+    normalized_members = [str(member).replace("\\", "/").casefold() for member in members]
+    required_components = ("cvfx_harness.tui", "prompt_toolkit", "wcwidth")
+    if any(
+        not any(component in member for member in normalized_members)
+        for component in required_components
+    ):
+        _fail("单文件包未包含中文 TUI 与其固定运行依赖")
     return len(members)
 
 
@@ -131,6 +139,14 @@ Mock 和合成输入；真实模型连接不在本试验范围内。
 
 SHA256SUMS.txt 列出可执行文件 SHA-256。可用以下命令核对：
   Get-FileHash .\\cvfx-harness.exe -Algorithm SHA256
+
+交互式终端会使用全屏中文界面。输入区中 Enter 提交、Ctrl+J 换行、Ctrl+C 清空草稿或
+取消当前请求；Esc 先关闭建议，再取消输入/请求。审批默认“否”，选择“是”并按 Enter
+才会授权单次操作；鼠标点击 Yes 只切换选项，不会直接批准。命令菜单只提供固定命令，
+不会扫描工作区路径。中文 IME 行为依赖终端，未完成 Windows Terminal、PowerShell、
+ConPTY 与各输入法组合的人工兼容验收。
+
+THIRD_PARTY_NOTICES.txt 包含随包依赖的许可证通知。
 
 此 CI 文件未签名，Windows 可能显示 SmartScreen 或 Defender 提示。请保持系统
 保护开启，并按组织策略处理；不要为运行本文件关闭系统保护。
@@ -168,7 +184,12 @@ def main() -> int:
         build_root = Path(temporary)
         entry = build_root / "entry.py"
         entry.write_text(
-            "from cvfx_harness.cli import main\nraise SystemExit(main())\n",
+            "import sys\n"
+            "if sys.argv[1:] == ['--_tui-selfcheck']:\n"
+            "    from tui_selfcheck import main\n"
+            "    raise SystemExit(main())\n"
+            "from cvfx_harness.cli import main\n"
+            "raise SystemExit(main())\n",
             encoding="utf-8",
             newline="\n",
         )
@@ -188,6 +209,12 @@ def main() -> int:
             "cvfx-harness",
             "--paths",
             str(package_search_path),
+            "--paths",
+            str(repository_root / "scripts"),
+            "--collect-all",
+            "prompt_toolkit",
+            "--collect-all",
+            "wcwidth",
             "--distpath",
             str(distribution_dir),
             "--workpath",
@@ -227,6 +254,14 @@ def main() -> int:
                 _fail("打包程序 --help 缺少中文说明或提供商选项")
             help_timings.append(elapsed_ms)
 
+        tui_result, _ = _run_executable(
+            executable,
+            ["--_tui-selfcheck"],
+            environment=minimal_environment,
+        )
+        if tui_result.returncode != 0 or "TUI 合成输入、命令补全和退出自检通过。" not in tui_result.stdout:
+            _fail("打包程序 TUI 启动、命令补全或退出自检失败")
+
         with tempfile.TemporaryDirectory(prefix="cvfx harness 中文 ") as temporary_workspace:
             workspace = Path(temporary_workspace) / "工作区 with spaces 中文"
             workspace.mkdir()
@@ -260,6 +295,7 @@ def main() -> int:
         newline="\n",
     )
     _write_artifact_readme(output_dir / "README-standalone-zh-CN.txt")
+    shutil.copy2(repository_root / "THIRD_PARTY_NOTICES.txt", output_dir / "THIRD_PARTY_NOTICES.txt")
 
     final_entries = list(output_dir.iterdir())
     final_files = {item.name for item in final_entries if item.is_file()}
@@ -282,7 +318,7 @@ def main() -> int:
         "help_max_ms": f"{max(help_timings):.1f}",
     }
     _write_github_output(values)
-    print("最终分发文件清单：cvfx-harness.exe、README-standalone-zh-CN.txt、SHA256SUMS.txt")
+    print("最终分发文件清单：cvfx-harness.exe、README-standalone-zh-CN.txt、THIRD_PARTY_NOTICES.txt、SHA256SUMS.txt")
     print(f"内嵌清单审查：{archive_member_count} 项；未发现禁止分发的文档或配置名称。")
     print(f"可执行文件大小：{exe_size} 字节（{values['exe_mib']} MiB）")
     print(f"可执行文件 SHA-256：{digest}")
@@ -291,7 +327,7 @@ def main() -> int:
         f"首次 {values['help_first_ms']} ms；5 次中位数 {values['help_median_ms']} ms；"
         f"范围 {values['help_min_ms']}–{values['help_max_ms']} ms。"
     )
-    print("单文件 --help、UTF-8 Mock 对话和中文/空格工作区路径自检通过。")
+    print("单文件 --help、UTF-8 Mock 对话、中文/空格工作区路径与 TUI 合成键盘自检通过。")
     return 0
 
 
