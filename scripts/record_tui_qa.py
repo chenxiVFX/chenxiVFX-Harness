@@ -23,6 +23,9 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+from cvfx_harness.plans import PlanStore
+from cvfx_harness.tools import Workspace
+
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[@-Z\\-_])")
 _PROMPT = re.compile(r"你\[(?:执行|计划)\]> ?")
 
@@ -38,6 +41,7 @@ class OfflineWalkthroughProvider:
         self.log_path = log_path
         self.plan_read_started = False
         self.plan_interrupt_after_result = False
+        self.cold_resume = False
         self.synthetic_workspace = log_path.parent / "合成工作区"
         self.synthetic_hashes = {
             relative: hashlib.sha256((self.synthetic_workspace / relative).read_bytes()).hexdigest()
@@ -79,6 +83,9 @@ class OfflineWalkthroughProvider:
         else:
             task_text = latest_user
         task_text = task_text.rsplit("\n\n", 1)[-1]
+        if self.cold_resume and "冷启动后按完成条件重新核对合成入口文件" in task_text:
+            self._log({"kind": "cold_resume_response", "used_limited_context": True})
+            return self._turn("冷启动合成步骤已按有限上下文重新检查。")
         if not tools:
             answer = (
                 '{"steps":[{"description":"检查中文配置读取路径",'
@@ -281,7 +288,13 @@ class OfflineWalkthroughProvider:
         return AssistantTurn(content, tool_calls or [])
 
 
-def _child(workspace: str, log_path: str, source_sha256: str) -> int:
+def _child(
+    workspace: str,
+    log_path: str,
+    source_sha256: str,
+    *,
+    cold_resume: bool = False,
+) -> int:
     # Do not pass inherited user credentials or other unrelated environment to the fixture.
     no_color = os.environ.get("CVFX_TUI_QA_NO_COLOR") == "1"
     os.environ.clear()
@@ -304,6 +317,7 @@ def _child(workspace: str, log_path: str, source_sha256: str) -> int:
     from cvfx_harness.tui import TerminalUI
 
     fixture = OfflineWalkthroughProvider(source_sha256, Path(log_path))
+    fixture.cold_resume = cold_resume
     cli.provider_from_environment = lambda *_args, **_kwargs: fixture
     cli.configure_console_encoding = lambda: None
     real_commit_write = Workspace.commit_write
@@ -1228,12 +1242,89 @@ def main() -> int:
             if not os.WIFEXITED(second_status) or os.WEXITSTATUS(second_status) != 0:
                 raise RuntimeError(f"restarted TUI child exited with status {second_status}")
 
+            # A separate clean synthetic workspace and a fresh TUI process
+            # exercise the actual cold-start continuation boundary: no goal,
+            # prior transcript, or unfinished change-set journal is present.
+            cold_workspace = base / "冷启动合成工作区"
+            cold_workspace.mkdir()
+            cold_source_sha256 = _prepare_workspace(cold_workspace)
+            cold_plan_store = PlanStore(Workspace(cold_workspace))
+            cold_plan_store.add("冷启动后按完成条件重新核对合成入口文件")
+            cold_plan_store.transition(1, "in-progress")
+            cold_plan_store.record_progress(1, "provider_request")
+            cold_plan_store.recover_unfinished()
+
+            child_pid, master_fd = pty.fork()
+            if child_pid == 0:
+                os._exit(
+                    _child(
+                        str(cold_workspace),
+                        str(log_path),
+                        cold_source_sha256,
+                        cold_resume=True,
+                    )
+                )
+            walk.child_pid = child_pid
+            walk.master_fd = master_fd
+            walk._ready = False
+            cold_start = len(walk.raw)
+            walk._input_ready_from = cold_start
+            walk.resize(100, 32)
+            walk.ready(start=cold_start)
+            walk.command(
+                "/继续 1",
+                expect="可补充本次续跑需要的目标/约束",
+                wait_ready=False,
+            )
+            walk.mark("plan-cold-resume-context")
+            walk.send("\r")  # Choose the saved-step-only context explicitly.
+            walk.wait(
+                "确认在仅掌握已保存的第 1 步上下文时启动新的 Agent 并继续？",
+                start=cold_start,
+            )
+            walk.mark("plan-cold-resume-confirmation")
+            walk.send("\t\r")
+            walk.wait("冷启动合成步骤已按有限上下文重新检查。", start=cold_start)
+            walk.wait("第 1 步保持 in-progress", start=cold_start)
+            walk.ready(start=cold_start)
+            if cold_plan_store.load().steps[0].status != "in-progress":
+                raise RuntimeError("cold-start continuation did not start the synthetic plan step")
+            walk.mark("plan-cold-resume-complete")
+            walk.command("/计划 完成 1", expect="第 1 步状态已设为 completed")
+            if cold_plan_store.load().steps[0].status != "completed":
+                raise RuntimeError("cold-start continuation completion did not persist")
+            cold_responses = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            if not any(
+                item.get("kind") == "cold_resume_response"
+                and item.get("used_limited_context") is True
+                for item in cold_responses
+            ):
+                raise RuntimeError("cold-start fixture did not use its fixed limited-context response")
+            walk.send("/退出\r")
+            deadline = time.monotonic() + 8
+            cold_status = None
+            while time.monotonic() < deadline:
+                walk._collect(0.1)
+                child, cold_status = os.waitpid(child_pid, os.WNOHANG)
+                if child:
+                    break
+            if cold_status is None:
+                os.kill(child_pid, signal.SIGTERM)
+                _, cold_status = os.waitpid(child_pid, 0)
+                raise RuntimeError("cold-start TUI child did not exit after /退出")
+            if not os.WIFEXITED(cold_status) or os.WEXITSTATUS(cold_status) != 0:
+                raise RuntimeError(f"cold-start TUI child exited with status {cold_status}")
+
             walk.save_cast()
             recorded_output = "".join(event[2] for event in walk.events if event[1] == "o")
             if no_color and _has_sgr_color(recorded_output):
                 raise RuntimeError("NO_COLOR PTY output contained an ANSI color attribute")
             print(f"Recorded {len(walk.events)} PTY events to {output}")
-            print("Synthetic offline flow passed: project-guide preview/cancel/confirm/status, malicious guide blocked in plan mode, no subagent inheritance, config review/restart, questions, plan recovery, change-set compensation, session archive, compression, and narrow resize.")
+            print("Synthetic offline flow passed: project-guide preview/cancel/confirm/status, malicious guide blocked in plan mode, no subagent inheritance, config review/restart, questions, plan recovery and cold-start limited-context review, change-set compensation, session archive, compression, and narrow resize.")
             return 0
         except BaseException:
             if walk.raw:

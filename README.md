@@ -44,11 +44,11 @@ Enter 提交当前输入，Ctrl+J 插入换行；TUI 生成期间会暂停输入
 
 启用 TTY 全屏渲染后，终端的 Unicode 字符宽度、鼠标能力与输入法组合仍取决于宿主。当前项目在 CI 中使用 prompt_toolkit 的合成输入和 Linux PTY 验证键位、布局启动/退出；Windows runner 使用其 Win32 输入模拟验证。尚未完成 Windows Terminal、PowerShell/ConPTY 和各中文 IME 组合的人工兼容验收。
 
-查看[离线 Linux PTY 合成会话录屏](evidence/tui-synthetic-session.cast)和[本轮 TUI 证据说明](evidence/README.md)。录屏沿配置审阅、长中文对话、问卷取消/修改/提交与隐私选择、计划步骤确认、两文件一次审批、失败补偿及冲突留存、会话保存/恢复、压缩预览拒绝和窄终端布局走了一遍；关键帧保留各自原始分辨率。它不代表 Windows Terminal、PowerShell/ConPTY 或中文输入法的人工兼容验收。
+查看[离线 Linux PTY 合成会话录屏](evidence/tui-synthetic-session.cast)和[本轮 TUI 证据说明](evidence/README.md)。录屏沿配置审阅、长中文对话、问卷取消/修改/提交与隐私选择、计划步骤确认和独立冷启动有限上下文续跑、两文件一次审批、失败补偿及冲突留存、会话保存/恢复、压缩预览拒绝和窄终端布局走了一遍；关键帧保留各自原始分辨率。它不代表 Windows Terminal、PowerShell/ConPTY 或中文输入法的人工兼容验收。
 
 ### Windows 独立程序试验
 
-仓库的 `Windows standalone packaging experiment` Actions 工作流会在 Windows x64 runner 上构建一个含 Python 运行时的单文件 `.exe`，随后在不依赖系统 Python 的子进程环境中检查 `--help`、离线 Mock 中文交互、含中文/空格的工作区路径，以及 EXE 驱动的合成 unittest/pytest profile。Harness 单文件本身无需系统 Python；运行用户测试时，profile 必须另行选择一个外部 Python 绝对路径，pytest 也必须已安装在该外部解释器中。Harness 不会安装 Python 或 pytest，也不会把 pytest 打进包。构建工具仅用于 CI，版本和 Windows 轮子哈希锁定在 [`packaging/windows-build-requirements.txt`](packaging/windows-build-requirements.txt)；pytest 验证依赖单独锁定并只用于开发 CI 的合成测试。
+仓库的 `Windows standalone packaging experiment` Actions 工作流会在 Windows x64 runner 上构建一个含 Python 运行时的单文件 `.exe`，随后在不依赖系统 Python 的子进程环境中检查 `--help`、离线 Mock 中文交互、含中文/空格的工作区路径、冷启动计划续跑的有限上下文审阅，以及 EXE 驱动的合成 unittest/pytest profile。Harness 单文件本身无需系统 Python；运行用户测试时，profile 必须另行选择一个外部 Python 绝对路径，pytest 也必须已安装在该外部解释器中。Harness 不会安装 Python 或 pytest，也不会把 pytest 打进包。构建工具仅用于 CI，版本和 Windows 轮子哈希锁定在 [`packaging/windows-build-requirements.txt`](packaging/windows-build-requirements.txt)；pytest 验证依赖单独锁定并只用于开发 CI 的合成测试。
 
 从对应 Actions 运行页面下载 `windows-x64-cvfx-harness-py312` 文件，解压后可运行 `cvfx-harness.exe --help` 或 `cvfx-harness.exe --workspace . --provider mock`。单文件启动时会把依赖解压到系统临时目录，启动会比源码或目录包慢一些，且需要临时目录可写。包中包含可执行文件、中文说明、第三方许可证通知和 SHA-256 校验文件；CI 构建不打包仓库文档、配置或工作区文件。构建与自检仅使用 Mock 和合成输入，不连接真实模型。这个未签名包只是试验，不是正式发布；Windows 可能显示 SmartScreen 或 Defender 提示，请保持系统保护开启并遵循组织策略。Actions 文件保留 14 天，不上传到发布页或包注册表。
 
@@ -60,7 +60,7 @@ Enter 提交当前输入，Ctrl+J 插入换行；TUI 生成期间会暂停输入
 
 | 命令 | 用途 |
 | --- | --- |
-| `/命令` | 列出可用中文命令；`/帮助` 显示参数与交互说明 |
+| `/帮助`、`/命令` | `/帮助` 显示参数与交互说明；`/命令` 列出可用中文命令 |
 | `/状态`、`/配置` | 查看有效设置及来源；`/配置 编辑` 可暂存、审阅并确认提供商、模型、端点、预算和 TUI 快捷键 |
 | `/项目说明 [文件名]`、`/项目说明 清除` | 本地预览并确认根目录 `AGENTS.md` 或明确指定的项目说明；查看 `/状态` 中确认和实际请求版本 |
 | `/快捷键`、`/按键` | 查看当前工作区 F2–F8 映射及纯文本 CLI 差异 |

@@ -44,6 +44,8 @@ if (-not (Test-Path -LiteralPath $workspace -PathType Container)) { throw '工�
 .\cvfx-harness.exe --workspace "$workspace" --provider mock
 ```
 
+如果 `.harness/config/settings.json` 缺失，`/配置 编辑` 会从内置默认值开始；如果配置损坏或字段无效，请用 `--ignore-config --provider mock` 离线启动，再运行 `/配置 编辑`。该选项不会读取损坏文件；只有审阅并确认保存后才会替换它。取消编辑会保留原文件。
+
 输入一个范围清楚的小修改请求，并使用工作区相对路径说明目标。如果模型需要先读取文件，会单独显示读取审批；写入前会显示目标与完整差异。仔细核对后再批准：TUI 默认拒绝，选择“是”并按 Enter；纯文本模式输入 `y`、`yes` 或 `是`。每次写入都单独审批，没有永久授权。
 
 ## 为 Python 项目配置并运行测试
@@ -60,5 +62,7 @@ if (-not (Test-Path -LiteralPath $workspace -PathType Container)) { throw '工�
 ## 保存并退出
 
 如需保存可安全存档的普通对话，运行 `/保存 首次试用`，再运行 `/退出`。会话文件保存在工作区 `.harness/sessions/`，是未加密的本地 JSON；文件内容和工具结果不会进入普通对话存档，不要把存档当作加密备份。若项目由 Git 管理，提交前再次检查 `.harness/` 的忽略状态。
+
+若计划步骤在请求中断或程序重启后变为“受阻”，先检查当前工作区，再运行 `/继续 <编号>`。冷启动时旧目标、聊天、问卷和工具结果不会恢复；可输入一条仅本次发送且不存档的补充目标/约束，或留空按已保存步骤的有限上下文继续。两种情况都要审阅最终说明并明确确认；工具调用和审批不会重放。
 
 Windows Terminal、PowerShell/ConPTY 与中文输入法组合尚未完成人工兼容验收。若全屏界面在你的终端无法正常输入，可用 `--plain` 启动纯文本界面；这不改变单次审批要求。

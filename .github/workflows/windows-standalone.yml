@@ -74,7 +74,7 @@ jobs:
             "- Executable: $env:EXE_BYTES bytes ($env:EXE_MIB MiB); SHA-256 ``$env:EXE_SHA256``"
             "- Internal archive audit: $env:ARCHIVE_MEMBERS entries inspected; no forbidden document/config names found"
             "- --help start/exit on windows-2022, first observed run: $env:HELP_FIRST_MS ms; 5-run median: $env:HELP_MEDIAN_MS ms; range: $env:HELP_MIN_MS–$env:HELP_MAX_MS ms"
-            '- Smoke checks passed: --help, UTF-8 offline Mock Chinese interaction, synthetic TUI keyboard/completion/startup/exit, and EXE-driven synthetic unittest/pytest profiles using the explicitly selected CI Python interpreter.'
+            '- Smoke checks passed: --help, UTF-8 offline Mock Chinese interaction, synthetic TUI keyboard/completion/startup/exit, cold-start plan continuation with limited-context review, and EXE-driven synthetic unittest/pytest profiles using the explicitly selected CI Python interpreter.'
             '- The Harness EXE runs without system Python; user test profiles require a separately selected external Python executable. Pytest is not bundled or installed by the Harness.'
             '- Bundle includes prompt-toolkit and wcwidth; the downloadable files include third-party license notices.'
             '- The build is unsigned; no signing, release, registry upload, or real model request was used.'

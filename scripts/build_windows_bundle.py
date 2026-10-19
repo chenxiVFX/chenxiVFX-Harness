@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -191,6 +192,7 @@ def _write_artifact_readme(path: Path) -> None:
   .\\cvfx-harness.exe --workspace "$workspace" --provider mock
 
 Mock 完全离线，不读取密钥或连接模型。输入“你好”试用中文，再用 /状态核对工作区，/退出结束。
+若工作区配置损坏或字段无效，可加 --ignore-config --provider mock 离线启动，再用 /配置 编辑从默认值重新审阅；该启动方式不会读取损坏文件，只有确认保存后才替换它。
 在 Mock 会话中可用 /配置 编辑 保存非敏感的提供商、模型与端点；选择 openai 表示 DeepSeek OpenAI
 兼容接口。设置保存在工作区 .harness/config/settings.json，不包含密钥；Harness 不会修改项目 .gitignore。
 TUI 可在 /配置 编辑 中审阅设置有限的 F2–F8 中文命令快捷键；映射只填入本地只读命令草稿，仍需按 Enter；
@@ -210,6 +212,8 @@ TUI 可在 /配置 编辑 中审阅设置有限的 F2–F8 中文命令快捷键
 
 可用 /保存 首次试用 保存安全的普通对话，然后 /退出。会话是工作区 .harness/sessions/ 中未加密的
 JSON；不要存入敏感信息。提交项目之前，确认项目自身的 .gitignore 已忽略 .harness/。
+
+计划步骤中断后不会自动续跑。先检查当前工作区，再用 /继续 <编号> 审阅本次可用上下文并明确确认；冷启动不会恢复旧目标、聊天、问卷或工具结果。
 
 交互式终端会使用全屏中文界面。输入区中 Enter 提交、Ctrl+J 换行、Ctrl+C 清空草稿或
 取消当前请求；Esc 先关闭建议，再取消输入/请求。审批默认“否”，选择“是”并按 Enter
@@ -363,6 +367,81 @@ def main() -> int:
         if workspace.name.casefold() not in mock_result.stdout.casefold():
             _fail("打包程序未正确处理含空格和中文的工作区路径")
 
+        _record_stage("EXE 冷启动计划续跑与有限上下文审阅")
+        with tempfile.TemporaryDirectory(prefix="cvfx plan resume 中文 ") as temporary_workspace:
+            workspace = Path(temporary_workspace) / "计划续跑工作区"
+            workspace.mkdir()
+            create_plan_result, _ = _run_executable(
+                executable,
+                [
+                    "--workspace", str(workspace), "--ignore-config", "--provider", "mock",
+                ],
+                environment=minimal_environment,
+                input_text="/计划 添加 单文件重启后核验合成步骤\n/退出\n",
+            )
+            if create_plan_result.returncode != 0:
+                _fail("打包 EXE 未能建立合成计划续跑 fixture")
+
+            plan_path = workspace / ".harness" / "plans" / "current.json"
+            try:
+                plan_snapshot = json.loads(plan_path.read_text(encoding="utf-8"))
+                if not isinstance(plan_snapshot, dict):
+                    raise ValueError("plan snapshot must be an object")
+                plan_steps = plan_snapshot.get("steps")
+                if not isinstance(plan_steps, list) or len(plan_steps) != 1:
+                    raise ValueError("expected one synthetic plan step")
+                if not isinstance(plan_steps[0], dict):
+                    raise ValueError("synthetic plan step must be an object")
+                plan_steps[0]["status"] = "blocked"
+                plan_snapshot["progress"] = {
+                    "step_index": 1,
+                    "phase": "provider_request",
+                    "last_tool": "",
+                    "last_result": "none",
+                    "interruption_cause": "process_restarted",
+                }
+                plan_path.write_bytes(
+                    json.dumps(
+                        plan_snapshot,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+                _fail("无法准备单文件包冷启动续跑的合成中断计划")
+
+            resume_result, _ = _run_executable(
+                executable,
+                [
+                    "--workspace", str(workspace), "--ignore-config", "--provider", "mock",
+                ],
+                environment=minimal_environment,
+                input_text="/继续 1\n\n是\n/退出\n",
+            )
+            if resume_result.returncode != 0:
+                _fail("打包 EXE 冷启动续跑合成流程返回失败状态")
+            expected_resume_markers = (
+                "当前进程目标为空",
+                "补充本次续跑需要的目标/约束",
+                "聊天历史、问卷答案和工具结果没有恢复",
+                "确认在仅掌握已保存的第 1 步上下文时启动新的 Agent 并继续？",
+                "第 1 步保持 in-progress",
+            )
+            if any(marker not in resume_result.stdout for marker in expected_resume_markers):
+                _fail("打包 EXE 未显示并确认有限的冷启动计划上下文")
+            try:
+                resumed_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                _fail("打包 EXE 冷启动续跑后无法读取合成计划状态")
+            resumed_steps = resumed_plan.get("steps") if isinstance(resumed_plan, dict) else None
+            if (
+                not isinstance(resumed_steps, list)
+                or len(resumed_steps) != 1
+                or not isinstance(resumed_steps[0], dict)
+                or resumed_steps[0].get("status") != "in-progress"
+            ):
+                _fail("打包 EXE 冷启动续跑没有将合成步骤设为进行中")
+
         _record_stage("EXE 外部解释器合成 unittest/pytest profile 闭环")
         fixtures = repository_root / "tests" / "fixtures" / "test_profile_runner"
         with tempfile.TemporaryDirectory(prefix="cvfx test runner 中文 ") as temporary_workspace:
@@ -455,7 +534,7 @@ def main() -> int:
         f"首次 {values['help_first_ms']} ms；5 次中位数 {values['help_median_ms']} ms；"
         f"范围 {values['help_min_ms']}–{values['help_max_ms']} ms。"
     )
-    print("单文件 --help、UTF-8 Mock、中文路径、TUI 和外部解释器 unittest/pytest profile 合成自检通过。")
+    print("单文件 --help、UTF-8 Mock、中文路径、TUI、冷启动计划续跑上下文审阅和外部解释器 unittest/pytest profile 合成自检通过。")
     return 0
 
 
