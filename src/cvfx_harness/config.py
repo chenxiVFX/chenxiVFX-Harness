@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -32,6 +33,7 @@ _CONFIG_KEYS = {
     "token_budget",
     "max_output_tokens",
 }
+_SAVE_WITHOUT_REVISION_CHECK = object()
 
 
 class ConfigError(RuntimeError):
@@ -163,14 +165,44 @@ class WorkspaceConfigStore:
             result[key] = value
         return result
 
-    def load(self) -> tuple[WorkspaceConfig, bool]:
+    def _revision_at_path(
+        self, path: Path, *, metadata_only: bool = False
+    ) -> str | tuple[str, ...] | None:
+        if not self._check_file(path):
+            return None
+        try:
+            if metadata_only:
+                info = path.stat()
+                return (
+                    "stat",
+                    str(info.st_dev),
+                    str(info.st_ino),
+                    str(info.st_size),
+                    str(info.st_mtime_ns),
+                    str(info.st_ctime_ns),
+                    str(getattr(info, "st_nlink", 1)),
+                )
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            raise ConfigError("无法安全检查工作区配置文件。") from None
+
+    def revision(self) -> tuple[str, ...] | None:
+        """Return metadata-only revision for files deliberately ignored at startup."""
+        path = self._path(create=False)
+        return None if path is None else self._revision_at_path(path, metadata_only=True)
+
+    def load_snapshot(
+        self,
+    ) -> tuple[WorkspaceConfig, bool, str | tuple[str, ...] | None]:
+        """Load validated settings together with a revision for optimistic updates."""
         path = self._path(create=False)
         if path is None or not self._check_file(path):
-            return WorkspaceConfig(), False
+            return WorkspaceConfig(), False, None
         try:
             raw = path.read_bytes()
             if len(raw) > MAX_CONFIG_BYTES:
                 raise ConfigError("工作区配置超过 16 KiB 上限。")
+            revision = hashlib.sha256(raw).hexdigest()
             if contains_likely_secret(raw.decode("utf-8")):
                 raise ConfigError("配置文件疑似含有凭据；为避免泄露已拒绝读取。请移除凭据后重试。")
             payload = json.loads(
@@ -192,17 +224,34 @@ class WorkspaceConfigStore:
                 token_budget=payload.get("token_budget", DEFAULT_TOKEN_BUDGET),
                 max_output_tokens=payload.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS),
             )
-            return validate_workspace_config(config), True
+            return validate_workspace_config(config), True, revision
         except ConfigError:
             raise
         except (TypeError, ValueError):
             raise ConfigError("工作区配置格式无效；没有使用其中的设置。") from None
 
-    def save(self, config: WorkspaceConfig) -> None:
+    def load(self) -> tuple[WorkspaceConfig, bool]:
+        config, exists, _revision = self.load_snapshot()
+        return config, exists
+
+    def save(
+        self,
+        config: WorkspaceConfig,
+        *,
+        expected_revision: str | tuple[str, ...] | None | object = _SAVE_WITHOUT_REVISION_CHECK,
+    ) -> None:
         validated = validate_workspace_config(config)
         path = self._path(create=True)
         assert path is not None
         self._check_file(path)
+        if expected_revision is not _SAVE_WITHOUT_REVISION_CHECK:
+            metadata_only = (
+                isinstance(expected_revision, tuple)
+                and bool(expected_revision)
+                and expected_revision[0] == "stat"
+            )
+            if self._revision_at_path(path, metadata_only=metadata_only) != expected_revision:
+                raise ConfigError("配置文件已被其他来源修改；没有覆盖新配置，请重新查看后重试。")
         encoded = json.dumps(validated.to_dict(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(encoded) > MAX_CONFIG_BYTES or contains_likely_secret(encoded.decode("utf-8")):
             raise ConfigError("配置未保存：内容超出上限或疑似含有凭据。")

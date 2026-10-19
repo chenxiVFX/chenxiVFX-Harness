@@ -29,7 +29,12 @@ from prompt_toolkit.widgets import Button, TextArea
 from wcwidth import wcswidth
 
 from .profiles import TestProfileError, TestProfileStore
-from .sessions import SessionError, SessionStore, redact_likely_secrets
+from .sessions import (
+    SessionError,
+    SessionStore,
+    contains_likely_secret,
+    redact_likely_secrets,
+)
 from .tools import Workspace, WorkspaceError
 
 MAX_TRANSCRIPT_CHARS = 200_000
@@ -42,12 +47,14 @@ COMMANDS = (
     ("/恢复", "恢复安全会话"), ("/会话", "列出本地会话"),
     ("/多行", "撰写多行问题"), ("/压缩", "预览、压缩或撤销"),
     ("/统计", "查看本地估算和 provider usage"), ("/预算", "设置本地估算阈值"),
-    ("/配置", "查看非敏感配置"), ("/测试", "管理固定 Python 测试配置"),
+    ("/配置", "查看或交互审阅非敏感配置"), ("/测试", "管理固定 Python 测试配置"),
     ("/子代理", "管理隔离子任务"),
     ("/撤销", "预览并撤销写入"), ("/退出", "结束会话"),
 )
 ENUM_COMPLETIONS = {
     "/模式": ("计划", "执行"),
+    "/配置": ("显示", "编辑", "重置", "提供商", "模型", "端点", "预算", "输出上限"),
+    "/配置 提供商": ("mock", "openai", "deepseek-anthropic"),
     "/测试": ("列表", "添加", "运行", "移除"),
     "/计划": ("生成", "显示", "修订", "接受", "拒绝", "添加", "执行", "完成", "阻塞", "取消", "重试", "清空"),
     "/压缩": ("撤销",),
@@ -172,7 +179,9 @@ class CommandCompleter(Completer):
             return
         if "\n" in before:
             return
-        for command, values in ENUM_COMPLETIONS.items():
+        for command, values in sorted(
+            ENUM_COMPLETIONS.items(), key=lambda item: len(item[0]), reverse=True
+        ):
             marker = command + " "
             if before.startswith(marker):
                 prefix = before[len(marker) :]
@@ -721,7 +730,12 @@ class TerminalUI:
             if value:
                 self._conversation_started = True
                 self.output_area.window.height = Dimension(min=1, weight=1)
-                self._append_transcript(f"\n你> {_safe_text(value)}\n")
+                shown_value = (
+                    "[疑似凭据输入已隐藏]"
+                    if contains_likely_secret(value)
+                    else _safe_text(value)
+                )
+                self._append_transcript(f"\n你> {shown_value}\n")
         self._resolve_pending(value=value)
 
     def _resolve_pending(

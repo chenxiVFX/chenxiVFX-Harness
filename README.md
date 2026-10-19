@@ -55,7 +55,7 @@ Enter 提交当前输入，Ctrl+J 插入换行；TUI 生成期间会暂停输入
 | 命令 | 用途 |
 | --- | --- |
 | `/命令` | 列出可用中文命令；`/帮助` 显示参数与交互说明 |
-| `/状态`、`/配置` | 查看运行配置；`/配置` 还可设置提供商、模型、端点和持久预算；密钥值不显示 |
+| `/状态`、`/配置` | 查看有效设置及来源；`/配置 编辑` 可暂存、审阅并确认提供商、模型、端点和预算 |
 | `/模式 计划`、`/模式 执行` | 计划模式会阻止工具写入；执行模式仍逐次询问 |
 | `/目标 <内容>`、`/目标 清空` | 设置或清除仅作为上下文的会话目标 |
 | `/计划 生成 [需求]`、`/计划 修订` | 生成、审阅和编辑最多 3 条候选步骤、完成条件与建议工具；候选不会自动保存或执行 |
@@ -91,20 +91,21 @@ Enter 提交当前输入，Ctrl+J 插入换行；TUI 生成期间会暂停输入
 
 运行设置保存在工作区 `.harness/config/settings.json`，该目录由 `.gitignore` 排除且模型文件工具无法读取。配置只接收非敏感字段，不接受 API Key 或其他凭据。优先级从低到高为：内置默认值、工作区配置、`HARNESS_*` 环境变量、命令行参数。支持的环境变量为 `HARNESS_PROVIDER`、`HARNESS_MODEL`、`HARNESS_BASE_URL`、`HARNESS_TOKEN_BUDGET` 和 `HARNESS_MAX_OUTPUT_TOKENS`。
 
-交互配置示例：
+建议在 TUI 或纯文本交互中使用 `/配置 编辑`。它会先展示当前生效值和来源，再逐项收集工作区层设置，最后展示完整候选与高优先级覆盖后的生效值：
 
 ```text
-/配置 提供商 openai
-/配置 模型 deepseek-flash
-/配置 端点 https://api.deepseek.com
-/配置 预算 32768
-/配置 输出上限 2048
-/配置
+/配置 编辑
+提供商 [mock]（mock/openai/deepseek-anthropic）> openai
+模型 [deepseek-flash]（输入 默认 使用 deepseek-flash）> deepseek-flash
+Base URL [https://api.deepseek.com]（输入 默认 使用提供商默认值）> https://api.deepseek.com
+本地估算上下文阈值 [16384]（1024–1000000）> 32768
+输出 Token 上限 [2048]（1–65536）> 2048
+确认保存这些非敏感设置？输入 是 确认，其余取消 > 是
 ```
 
-`提供商`、`模型`和`端点`保存后需重启才会切换本轮 provider；预算配置在没有更高优先级覆盖时立即应用。`/预算 16384` 只改当前会话。用 `/配置 模型 默认` 或 `/配置 端点 默认` 清除相应工作区覆盖；`/配置 重置` 写回默认值，但环境变量和命令行仍优先。若配置文件损坏，可用 `--ignore-config` 忽略它启动，再通过 `/配置` 保存新设置。
+逐项输入时空行保留工作区当前值；更换 provider 会把模型和端点暂设为新 provider 的默认值，之后可自定义。`默认` 清除模型或端点覆盖。审阅前验证整个组合；确认前不会写盘，输入 `/取消`、Ctrl+C、Esc 或回答否都会丢弃草稿。保存时会核对配置文件版本；若编辑期间被其他来源修改，会保留新文件并提示重新打开编辑。`/配置` 查看本轮 provider、下次启动配置和各字段来源；原有 `/配置 提供商 ...` 等单字段命令仍可直接使用。提供商、模型和端点保存后需重启才会切换本轮 provider；本地预算和输出上限在无更高优先级覆盖时立即应用。`/预算 16384` 只改当前会话。`/配置 重置` 写回默认值，但环境变量和命令行仍优先。若配置文件损坏，可用 `--ignore-config` 忽略它启动，再通过 `/配置 编辑` 从默认值审阅并保存有效设置。
 
-当前支持离线 `mock`、DeepSeek OpenAI 兼容模式，以及独立的 `deepseek-anthropic` DeepSeek Anthropic 兼容模式。后者固定使用 `https://api.deepseek.com/anthropic` 路径，只接受 `deepseek-flash` 与 `deepseek-v4-pro`，不会连接官方 Claude 服务，也不接受 Claude 模型别名。两种 DeepSeek provider 只读取 `DEEPSEEK_API_KEY`；Anthropic 兼容模式不会查询 `ANTHROPIC_API_KEY`。凭据仍只从环境读取，绝不写进配置文件；请求仅发往固定 DeepSeek HTTPS 主机与协议路径，不接受重定向。不得把密钥放入 URL、命令行、项目文件、聊天或 Git。
+当前支持离线 `mock`、DeepSeek OpenAI 兼容模式，以及独立的 `deepseek-anthropic` DeepSeek Anthropic 兼容模式。后者固定使用 `https://api.deepseek.com/anthropic` 路径，只接受 `deepseek-flash` 与 `deepseek-v4-pro`，不会连接官方 Claude 服务，也不接受 Claude 模型别名。两种 DeepSeek provider 只读取 `DEEPSEEK_API_KEY`；Anthropic 兼容模式不会查询 `ANTHROPIC_API_KEY`。凭据仍只从环境读取，绝不写进配置文件；请求仅发往固定 DeepSeek HTTPS 主机与协议路径，不接受重定向。疑似凭据样式的聊天输入会在发给模型前拒绝，TUI 也会隐藏它的回显。不得把密钥放入 URL、命令行、项目文件、聊天或 Git。
 
 同样的非敏感设置也可在启动时用 `--provider`、`--model`、`--base-url`、`--token-budget` 和 `--max-output-tokens` 覆盖。超长或格式错误的输入不会被错误消息回显。配置文件损坏时可这样绕过并继续使用 Mock：
 

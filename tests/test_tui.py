@@ -121,8 +121,95 @@ class PromptToolkitTests(unittest.TestCase):
             item.text
             for item in completer.get_completions(Document("/压缩 撤"), CompleteEvent())
         ]
+        config_values = [
+            item.text
+            for item in completer.get_completions(Document("/配置 "), CompleteEvent())
+        ]
+        provider_values = [
+            item.text
+            for item in completer.get_completions(
+                Document("/配置 提供商 deepseek-a"), CompleteEvent()
+            )
+        ]
         self.assertEqual(plan_values, ["接受"])
         self.assertEqual(compression_values, ["撤销"])
+        self.assertIn("编辑", config_values)
+        self.assertEqual(provider_values, ["deepseek-anthropic"])
+
+    def test_tui_config_editor_reviews_then_persists_through_input_events(self) -> None:
+        from cvfx_harness.config import WorkspaceConfigStore
+
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-config-edit-") as workspace:
+            def drive(pipe, ui: TerminalUI) -> None:
+                self._wait_until(lambda: ui._pending is not None, "TUI did not request command input")
+                pipe.send_text("/配置 编辑\r")
+                self._wait_until(lambda: ui._prompt.startswith("提供商 ["), "config provider prompt missing")
+                pipe.send_text("deepseek-anthropic\r")
+                self._wait_until(lambda: ui._prompt.startswith("模型 ["), "config model prompt missing")
+                pipe.send_text("deepseek-v4-pro\r")
+                self._wait_until(lambda: ui._prompt.startswith("Base URL ["), "config endpoint prompt missing")
+                pipe.send_text("\r")
+                self._wait_until(lambda: ui._prompt.startswith("本地估算上下文阈值 ["), "config budget prompt missing")
+                pipe.send_text("\r")
+                self._wait_until(lambda: ui._prompt.startswith("输出 Token 上限 ["), "config output prompt missing")
+                pipe.send_text("\r")
+                self._wait_until(lambda: ui._prompt.startswith("确认保存这些非敏感设置"), "config review prompt missing")
+                self._wait_until(lambda: "待保存工作区设置（尚未写入）" in ui._transcript, "review summary missing")
+                pipe.send_text("是\r")
+                self._wait_until(lambda: "已保存到 .harness/config/settings.json" in ui._transcript, "config save confirmation missing")
+                pipe.send_text("/退出\r")
+
+            ui, rc = self._run_cli_ui(workspace, MockProvider(), drive)
+            saved, exists = WorkspaceConfigStore(Workspace(workspace)).load()
+            self.assertEqual(rc, 0)
+            self.assertTrue(exists)
+            self.assertEqual(saved.provider, "deepseek-anthropic")
+            self.assertEqual(saved.model, "deepseek-v4-pro")
+            self.assertIsNone(saved.base_url)
+            self.assertIn("提供商：deepseek-anthropic", ui._transcript)
+
+    def test_tui_escape_cancels_config_draft_without_persisting(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-config-cancel-") as workspace:
+            settings = Path(workspace) / ".harness" / "config" / "settings.json"
+
+            def drive(pipe, ui: TerminalUI) -> None:
+                self._wait_until(lambda: ui._pending is not None, "TUI did not request command input")
+                pipe.send_text("/配置 编辑\r")
+                self._wait_until(lambda: ui._prompt.startswith("提供商 ["), "config prompt missing")
+                pipe.send_text("\x1b")
+                self._wait_until(
+                    lambda: "已取消配置编辑；没有写入文件" in ui._transcript,
+                    "Escape did not cancel the config draft",
+                )
+                self.assertFalse(settings.exists())
+                pipe.send_text("/退出\r")
+
+            ui, rc = self._run_cli_ui(workspace, MockProvider(), drive)
+            self.assertEqual(rc, 0)
+            self.assertFalse(settings.exists())
+            self.assertIn("已取消配置编辑", ui._transcript)
+
+    def test_secret_like_chat_input_is_hidden_and_rejected_offline(self) -> None:
+        secret = "sk-" + "T" * 24
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-secret-input-") as workspace:
+            def drive(pipe, ui: TerminalUI) -> None:
+                self._wait_until(lambda: ui._pending is not None, "TUI did not request chat input")
+                pipe.send_text(secret + "\r")
+                self._wait_until(
+                    lambda: "疑似凭据输入已隐藏" in ui._transcript,
+                    "sensitive input was not hidden from transcript",
+                )
+                self._wait_until(
+                    lambda: "内容不会显示、发送给模型或保存" in ui._transcript,
+                    "sensitive input was not rejected",
+                )
+                pipe.send_text("/退出\r")
+
+            with patch("cvfx_harness.cli.Agent.ask") as ask:
+                ui, rc = self._run_cli_ui(workspace, MockProvider(), drive)
+            ask.assert_not_called()
+            self.assertEqual(rc, 0)
+            self.assertNotIn(secret, ui._transcript)
 
     def test_tui_plan_proposal_review_revision_and_acceptance_loop(self) -> None:
         from cvfx_harness.plans import PlanStore

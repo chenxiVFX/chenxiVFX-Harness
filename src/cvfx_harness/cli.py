@@ -16,6 +16,8 @@ from .agent import Agent, DEFAULT_MAX_OUTPUT_TOKENS, MIN_CONTEXT_COMPLETION_HEAD
 from .config import (
     CONFIG_RELATIVE_PATH,
     ConfigError,
+    DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL,
+    DEFAULT_DEEPSEEK_BASE_URL,
     WorkspaceConfig,
     WorkspaceConfigStore,
     resolve_config,
@@ -36,7 +38,12 @@ from .providers import (
 )
 from .plans import MAX_PLAN_STEPS, MAX_STEP_CHARS, PlanDraft, PlanError, PlanSnapshot, PlanStore, PlanStatus
 from .profiles import TestProfileError, TestProfileStore
-from .sessions import SessionError, SessionStore, redact_likely_secrets
+from .sessions import (
+    SessionError,
+    SessionStore,
+    contains_likely_secret,
+    redact_likely_secrets,
+)
 from .subagents import DelegationPlanError, SubagentManager, build_delegation_plan
 from .tools import ActionRequest, Workspace, WorkspaceError
 from .usage import DEFAULT_TOKEN_BUDGET
@@ -54,6 +61,7 @@ _CLI_ENUM_ARGUMENTS = {
     "/测试": ("列表", "添加", "运行", "移除"),
     "/压缩": ("撤销",),
     "/计划": ("生成", "显示", "修订", "接受", "拒绝", "添加", "执行", "完成", "阻塞", "取消", "重试", "清空"),
+    "/配置": ("显示", "编辑", "重置", "提供商", "模型", "端点", "预算", "输出上限"),
 }
 _STREAM_SECRET_TAIL_CHARS = 16
 _STREAM_SECRET_RUN_CHARS = frozenset(
@@ -434,7 +442,8 @@ def _help_text() -> str:
   /统计              分开展示本地估算、提供商 usage 与缓存命中字段
   /预算 [tokens]     查看或临时设置本地估算阈值（1024–1000000；不是账户额度）
   /配置              显示本轮和下次启动的非敏感设置；密钥值不会显示或保存
-  /配置 提供商 mock|openai
+  /配置 编辑         交互暂存、审阅并确认非敏感设置
+  /配置 提供商 mock|openai|deepseek-anthropic
   /配置 模型 <名称>|默认
   /配置 端点 <DeepSeek HTTPS URL>|默认
   /配置 预算 <1024–1000000>
@@ -473,11 +482,169 @@ def _completion_matches(line: str, text: str) -> tuple[str, ...]:
         return ()
     if " " not in line:
         return tuple(candidate for candidate in _CLI_COMMANDS if candidate.startswith(text))
+    provider_marker = "/配置 提供商 "
+    if line.startswith(provider_marker):
+        prefix = line[len(provider_marker) :]
+        if " " in prefix:
+            return ()
+        providers = ("mock", "openai", "deepseek-anthropic")
+        return tuple(candidate for candidate in providers if candidate.startswith(text))
     command, _, argument = line.partition(" ")
     choices = _CLI_ENUM_ARGUMENTS.get(command)
     if choices is None or " " in argument:
         return ()
     return tuple(candidate for candidate in choices if candidate.startswith(text))
+
+
+class _ConfigEditCancelled(Exception):
+    pass
+
+
+def _config_provider_defaults(provider: str) -> tuple[str, str | None]:
+    if provider == "mock":
+        return "mock", None
+    if provider == "openai":
+        return "deepseek-flash", DEFAULT_DEEPSEEK_BASE_URL
+    if provider == "deepseek-anthropic":
+        return "deepseek-flash", DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL
+    if provider == "anthropic":
+        raise ConfigError(
+            "未接入官方 Claude 服务；如使用 DeepSeek Anthropic 兼容入口，请选择 deepseek-anthropic。"
+        )
+    raise ConfigError("提供商无效；请选择 mock、openai 或 deepseek-anthropic。")
+
+
+def _config_source_summary(config) -> str:
+    return (
+        f"提供商：{config.provider}（{config.sources['provider']}）\n"
+        f"模型：{_safe_terminal_text(config.model)}（{config.sources['model']}）\n"
+        f"Base URL：{_safe_terminal_text(config.base_url or '无（mock）')}（{config.sources['base_url']}）\n"
+        f"本地估算上下文阈值：{config.token_budget}（{config.sources['token_budget']}）\n"
+        f"输出上限：{config.max_output_tokens}（{config.sources['max_output_tokens']}）"
+    )
+
+
+def _interactive_config_edit(
+    config_store: WorkspaceConfigStore,
+    args: argparse.Namespace,
+    *,
+    input_fn: Callable[[str], str],
+    output: Callable[[str], None],
+    ignore_config: bool = False,
+) -> tuple[WorkspaceConfig, bool] | None:
+    """Stage non-secret settings, review their effective sources, then save atomically."""
+
+    if ignore_config:
+        stored = WorkspaceConfig()
+        config_exists = False
+        revision = config_store.revision()
+        output("本次启动使用了 --ignore-config；编辑将从内置默认值开始，确认后会替换现有配置文件。")
+    else:
+        stored, config_exists, revision = config_store.load_snapshot()
+
+    effective = resolve_config(stored, config_exists, args)
+    output("当前生效设置（工作区配置之外的环境变量和命令行仍优先）：\n" + _config_source_summary(effective))
+    output(
+        "编辑工作区层的非敏感设置。逐项输入；空行保留当前工作区值，模型/Base URL 输入“默认”使用所选提供商默认值。\n"
+        "提供商：mock、openai、deepseek-anthropic。预算范围 1024–1000000，输出上限 1–65536。\n"
+        "任一提示输入 /取消 或按 Ctrl+C 可丢弃全部修改；此处不接受密钥。"
+    )
+
+    def ask(prompt: str) -> str:
+        value = input_fn(prompt).strip()
+        if value.casefold() in {"/取消", "/cancel", "取消", "cancel"}:
+            raise _ConfigEditCancelled
+        if len(value) > 4096:
+            raise ConfigError("配置值过长；没有保存任何修改。")
+        if contains_likely_secret(value):
+            raise ConfigError("拒绝疑似凭据输入；内容不会显示、保存或发送。请使用受支持的环境变量方式配置凭据。")
+        return value
+
+    draft = stored
+    try:
+        provider_value = ask(
+            f"提供商 [{draft.provider}]（mock/openai/deepseek-anthropic）> "
+        )
+        provider_changed = bool(provider_value and provider_value.casefold() != draft.provider)
+        if provider_value:
+            selected_provider = provider_value.casefold()
+            default_model, default_base_url = _config_provider_defaults(selected_provider)
+            # A protocol switch must not carry the previous provider's endpoint or model.
+            draft = replace(
+                draft,
+                provider=selected_provider,
+                model=None if provider_changed else draft.model,
+                base_url=None if provider_changed else draft.base_url,
+            )
+        else:
+            default_model, default_base_url = _config_provider_defaults(draft.provider)
+
+        model_hint = draft.model or default_model
+        model_value = ask(f"模型 [{model_hint}]（输入 默认 使用 {default_model}）> ")
+        if model_value:
+            draft = replace(
+                draft,
+                model=None if model_value.casefold() in {"默认", "default"} else model_value,
+            )
+
+        base_hint = draft.base_url or (default_base_url or "无（mock）")
+        base_value = ask(f"Base URL [{_safe_terminal_text(base_hint)}]（输入 默认 使用提供商默认值）> ")
+        if base_value:
+            draft = replace(
+                draft,
+                base_url=None if base_value.casefold() in {"默认", "default"} else base_value,
+            )
+
+        budget_value = ask(f"本地估算上下文阈值 [{draft.token_budget}]（1024–1000000）> ")
+        if budget_value:
+            draft = replace(
+                draft,
+                token_budget=(
+                    DEFAULT_TOKEN_BUDGET
+                    if budget_value.casefold() in {"默认", "default"}
+                    else int(budget_value)
+                ),
+            )
+
+        output_value = ask(f"输出 Token 上限 [{draft.max_output_tokens}]（1–65536）> ")
+        if output_value:
+            draft = replace(
+                draft,
+                max_output_tokens=(
+                    DEFAULT_MAX_OUTPUT_TOKENS
+                    if output_value.casefold() in {"默认", "default"}
+                    else int(output_value)
+                ),
+            )
+
+        draft = validate_workspace_config(draft)
+        if draft == stored:
+            output("配置没有变化；未写入文件。")
+            return None
+
+        after = resolve_config(draft, True, args)
+        output(
+            "待保存工作区设置（尚未写入）：\n"
+            + f"提供商：{draft.provider}\n"
+            + f"模型：{_safe_terminal_text(draft.model or _config_provider_defaults(draft.provider)[0])}\n"
+            + f"Base URL：{_safe_terminal_text(draft.base_url or _config_provider_defaults(draft.provider)[1] or '无（mock）')}\n"
+            + f"本地估算上下文阈值：{draft.token_budget}\n"
+            + f"输出上限：{draft.max_output_tokens}\n"
+            + "确认保存后的生效值（高优先级来源可能覆盖）：\n"
+            + _config_source_summary(after)
+        )
+        answer = ask("确认保存这些非敏感设置？输入 是 确认，其余取消 > ")
+        if answer.casefold() not in {"y", "yes", "是"}:
+            output("已取消配置编辑；没有写入文件。")
+            return None
+
+        config_store.save(draft, expected_revision=revision)
+        return draft, True
+    except _ConfigEditCancelled:
+        output("已取消配置编辑；没有写入文件。")
+        return None
+    except ValueError:
+        raise ConfigError("字段值无效；请检查数字范围。没有保存任何修改。") from None
 
 
 def _configure_command_line_editing(*, enabled: bool) -> tuple[bool, Callable[[], None]]:
@@ -631,8 +798,9 @@ def run_console(
         config_store = WorkspaceConfigStore(workspace)
         if getattr(args, "ignore_config", False):
             workspace_config, config_exists = WorkspaceConfig(), False
+            workspace_revision = config_store.revision()
         else:
-            workspace_config, config_exists = config_store.load()
+            workspace_config, config_exists, workspace_revision = config_store.load_snapshot()
         startup_config = resolve_config(workspace_config, config_exists, args)
         provider = provider_from_environment(
             startup_config.provider,
@@ -826,6 +994,54 @@ def run_console(
                 )
                 continue
 
+            if parts[0].casefold() in {"编辑", "edit"}:
+                try:
+                    edited = _interactive_config_edit(
+                        config_store,
+                        args,
+                        input_fn=input_fn,
+                        output=output,
+                        ignore_config=getattr(args, "ignore_config", False),
+                    )
+                except ConfigError as exc:
+                    output(f"配置未保存：{exc}")
+                    continue
+                except KeyboardInterrupt:
+                    output("已取消配置编辑；没有写入文件。")
+                    continue
+                except EOFError:
+                    subagent_manager.cancel_all()
+                    output("\n收到 EOF；配置草稿已丢弃，会话结束。")
+                    return 0
+                if edited is not None:
+                    prior_config = workspace_config
+                    workspace_config, config_exists = edited
+                    workspace_revision = config_store.revision()
+                    startup_config = resolve_config(workspace_config, config_exists, args)
+                    if (
+                        workspace_config.token_budget != prior_config.token_budget
+                        and startup_config.sources["token_budget"] == "工作区配置"
+                    ):
+                        agent.token_budget = startup_config.token_budget
+                    if (
+                        workspace_config.max_output_tokens != prior_config.max_output_tokens
+                        and startup_config.sources["max_output_tokens"] == "工作区配置"
+                    ):
+                        agent.max_output_tokens = startup_config.max_output_tokens
+                    output(
+                        f"已保存到 {CONFIG_RELATIVE_PATH}。提供商、模型和端点的更改需下次启动生效；"
+                        "本地预算和输出上限在未被覆盖时已即时应用。"
+                    )
+                    for key in startup_config.sources:
+                        if startup_config.sources[key] not in {"工作区配置", "默认"}:
+                            output(f"{key} 的工作区值已保存，但当前仍由 {startup_config.sources[key]} 覆盖。")
+                    if startup_config.provider in {"openai", "deepseek-anthropic"}:
+                        output(
+                            f"DeepSeek 兼容模式只从环境变量 {DEEPSEEK_API_KEY_ENV} 读取密钥；"
+                            "密钥不会显示或写入配置。"
+                        )
+                continue
+
             field_name = parts[0].casefold()
             raw_value = parts[1] if len(parts) > 1 else ""
             aliases = {
@@ -836,6 +1052,7 @@ def run_console(
                 "输出上限": "max_output_tokens", "max_output_tokens": "max_output_tokens",
                 "max-output-tokens": "max_output_tokens",
             }
+            reset_provider_fields = False
             if field_name in {"重置", "reset"} and not raw_value:
                 new_config = WorkspaceConfig()
                 changed_field = "all"
@@ -843,15 +1060,27 @@ def run_console(
                 changed_field = aliases.get(field_name)
                 if changed_field is None or not raw_value:
                     output(
-                        "用法：/配置 [提供商 mock|openai|deepseek-anthropic | 模型 <名称>|默认 | "
+                        "用法：/配置 编辑 | [提供商 mock|openai|deepseek-anthropic | 模型 <名称>|默认 | "
                         "端点 <DeepSeek HTTPS URL>|默认 | 预算 <1024–1000000> | "
                         "输出上限 <1–65536> | 重置]"
                     )
                     continue
                 value = raw_value.strip()
+                if contains_likely_secret(value):
+                    output("配置未保存：拒绝疑似凭据输入；内容不会显示、保存或发送。")
+                    continue
                 try:
                     if changed_field == "provider":
-                        new_config = replace(workspace_config, provider=value)
+                        selected_provider = validate_workspace_config(
+                            WorkspaceConfig(provider=value)
+                        ).provider
+                        reset_provider_fields = selected_provider != workspace_config.provider
+                        new_config = replace(
+                            workspace_config,
+                            provider=selected_provider,
+                            model=None if reset_provider_fields else workspace_config.model,
+                            base_url=None if reset_provider_fields else workspace_config.base_url,
+                        )
                     elif changed_field == "model":
                         new_config = replace(workspace_config, model=None if value.casefold() in {"默认", "default"} else value)
                     elif changed_field == "base_url":
@@ -871,9 +1100,10 @@ def run_console(
                     continue
 
             try:
-                config_store.save(new_config)
+                config_store.save(new_config, expected_revision=workspace_revision)
                 workspace_config = new_config
                 config_exists = True
+                workspace_revision = config_store.revision()
                 startup_config = resolve_config(workspace_config, config_exists, args)
             except ConfigError as exc:
                 output(f"配置未保存：{exc}")
@@ -887,6 +1117,8 @@ def run_console(
             output(f"已将非敏感设置保存到 {CONFIG_RELATIVE_PATH}。")
             if changed_field in {"provider", "model", "base_url", "all"}:
                 output("提供商、模型或端点在下次启动时生效；本轮仍使用启动时的 provider。")
+            if reset_provider_fields:
+                output("提供商已切换；模型和 Base URL 已重置为新提供商的默认值，可再单独设置。")
             for key in ({"token_budget", "max_output_tokens"} if changed_field == "all" else {changed_field}):
                 if key in startup_config.sources and startup_config.sources[key] not in {"工作区配置", "默认"}:
                     output(f"该配置值已保存，但本次启动由更高优先级的 {startup_config.sources[key]} 覆盖。")
@@ -1619,6 +1851,10 @@ def run_console(
                 output(f"撤销失败：{exc}")
             except KeyboardInterrupt:
                 output("已取消撤销审批；文件未修改。")
+            continue
+
+        if contains_likely_secret(line):
+            output("已拒绝疑似凭据输入；内容不会显示、发送给模型或保存。请使用受支持的环境变量方式配置凭据。")
             continue
 
         try:

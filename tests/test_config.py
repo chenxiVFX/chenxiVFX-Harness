@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from cvfx_harness.cli import build_parser, run_console
+from cvfx_harness.cli import _completion_matches, build_parser, run_console
 from cvfx_harness.config import (
     CONFIG_RELATIVE_PATH,
     ConfigError,
@@ -55,6 +55,19 @@ class WorkspaceConfigTests(unittest.TestCase):
         self.assertFalse(self.path.is_symlink())
         if os.name != "nt":
             self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+    def test_optimistic_save_preserves_a_concurrent_configuration_change(self) -> None:
+        self.store.save(WorkspaceConfig(provider="openai", model="deepseek-flash"))
+        _loaded, _exists, revision = self.store.load_snapshot()
+        external = WorkspaceConfig(model="external-edit")
+        self.store.save(external)
+
+        with self.assertRaisesRegex(ConfigError, "其他来源修改"):
+            self.store.save(
+                WorkspaceConfig(provider="openai", model="deepseek-v4-pro"),
+                expected_revision=revision,
+            )
+        self.assertEqual(self.store.load()[0], external)
 
     def test_unknown_or_secret_config_fields_are_rejected_without_echo(self) -> None:
         secret = "sk-" + "A" * 24
@@ -332,21 +345,201 @@ class WorkspaceConfigTests(unittest.TestCase):
         self.assertIn("DeepSeek Anthropic 兼容模式使用各自协议的有界 SSE", "\n".join(outputs))
         self.assertIn("Claude", "\n".join(outputs))
 
+    def test_interactive_editor_reviews_and_switches_provider_as_one_change(self) -> None:
+        self.store.save(
+            WorkspaceConfig(
+                provider="openai",
+                model="deepseek-flash",
+                base_url="https://api.deepseek.com/v1",
+                token_budget=24000,
+            )
+        )
+        answers = iter(
+            ["/配置 编辑", "deepseek-anthropic", "", "", "", "", "是", "/退出"]
+        )
+        outputs: list[str] = []
+        args = build_parser().parse_args(["--workspace", self.temp.name])
+        with patch.dict(os.environ, {}, clear=False):
+            for name in (
+                "HARNESS_PROVIDER", "HARNESS_MODEL", "HARNESS_BASE_URL",
+                "HARNESS_TOKEN_BUDGET", "HARNESS_MAX_OUTPUT_TOKENS",
+            ):
+                os.environ.pop(name, None)
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()):
+                result = run_console(
+                    args,
+                    input_fn=lambda _prompt: next(answers),
+                    output=outputs.append,
+                )
+
+        saved, exists = self.store.load()
+        joined = "\n".join(outputs)
+        self.assertEqual(result, 0)
+        self.assertTrue(exists)
+        self.assertEqual(saved.provider, "deepseek-anthropic")
+        self.assertIsNone(saved.model)
+        self.assertIsNone(saved.base_url)
+        self.assertEqual(saved.token_budget, 24000)
+        effective = resolve_config(
+            saved,
+            exists,
+            SimpleNamespace(provider=None, model=None, base_url=None, token_budget=None, max_output_tokens=None),
+            environment={},
+        )
+        self.assertEqual(effective.model, "deepseek-flash")
+        self.assertEqual(effective.base_url, "https://api.deepseek.com/anthropic")
+        self.assertIn("待保存工作区设置（尚未写入）", joined)
+        self.assertIn("确认保存后的生效值", joined)
+        self.assertIn("下次启动", joined)
+
+    def test_single_field_provider_switch_resets_incompatible_protocol_defaults(self) -> None:
+        self.store.save(
+            WorkspaceConfig(
+                provider="openai",
+                model="custom-model",
+                base_url="https://api.deepseek.com/v1",
+            )
+        )
+        answers = iter(["/配置 提供商 deepseek-anthropic", "/退出"])
+        outputs: list[str] = []
+        args = build_parser().parse_args(["--workspace", self.temp.name])
+        with patch.dict(os.environ, {}, clear=False):
+            for name in (
+                "HARNESS_PROVIDER", "HARNESS_MODEL", "HARNESS_BASE_URL",
+                "HARNESS_TOKEN_BUDGET", "HARNESS_MAX_OUTPUT_TOKENS",
+            ):
+                os.environ.pop(name, None)
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()):
+                result = run_console(args, input_fn=lambda _prompt: next(answers), output=outputs.append)
+
+        loaded, exists = self.store.load()
+        self.assertEqual(result, 0)
+        self.assertTrue(exists)
+        self.assertEqual(loaded.provider, "deepseek-anthropic")
+        self.assertIsNone(loaded.model)
+        self.assertIsNone(loaded.base_url)
+        self.assertIn("模型和 Base URL 已重置", "\n".join(outputs))
+
+    def test_interactive_editor_cancellation_and_protocol_error_leave_file_unchanged(self) -> None:
+        original = WorkspaceConfig(
+            provider="openai",
+            model="deepseek-flash",
+            base_url="https://api.deepseek.com/v1",
+            token_budget=22000,
+        )
+        self.store.save(original)
+        original_bytes = self.path.read_bytes()
+        args = build_parser().parse_args(["--workspace", self.temp.name])
+
+        for answers in (
+            ["/配置 编辑", "/取消", "/退出"],
+            ["/配置 编辑", "deepseek-anthropic", "", "https://api.deepseek.com/v1", "", "", "/退出"],
+        ):
+            outputs: list[str] = []
+            answer_iter = iter(answers)
+            with patch.dict(os.environ, {}, clear=False):
+                for name in (
+                    "HARNESS_PROVIDER", "HARNESS_MODEL", "HARNESS_BASE_URL",
+                    "HARNESS_TOKEN_BUDGET", "HARNESS_MAX_OUTPUT_TOKENS",
+                ):
+                    os.environ.pop(name, None)
+                with patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()):
+                    result = run_console(
+                        args,
+                        input_fn=lambda _prompt: next(answer_iter),
+                        output=outputs.append,
+                    )
+            self.assertEqual(result, 0)
+            self.assertEqual(self.path.read_bytes(), original_bytes)
+            self.assertEqual(self.store.load()[0], original)
+
+        self.assertTrue(any("仅允许 HTTPS api.deepseek.com:443/anthropic" in line for line in outputs))
+
+    def test_interactive_editor_does_not_overwrite_changes_made_while_prompting(self) -> None:
+        args = build_parser().parse_args(["--workspace", self.temp.name])
+        external = WorkspaceConfig(model="external-edit")
+        answers = iter(["/配置 编辑", "openai", "", "", "", "", "/退出"])
+        outputs: list[str] = []
+
+        def input_with_competing_edit(prompt: str) -> str:
+            if prompt.startswith("确认保存"):
+                self.store.save(external)
+                return "是"
+            return next(answers)
+
+        with patch.dict(os.environ, {}, clear=False):
+            for name in (
+                "HARNESS_PROVIDER", "HARNESS_MODEL", "HARNESS_BASE_URL",
+                "HARNESS_TOKEN_BUDGET", "HARNESS_MAX_OUTPUT_TOKENS",
+            ):
+                os.environ.pop(name, None)
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()):
+                result = run_console(args, input_fn=input_with_competing_edit, output=outputs.append)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(self.store.load()[0], external)
+        self.assertIn("配置文件已被其他来源修改", "\n".join(outputs))
+
+    def test_plain_chat_key_is_discarded_before_provider_call(self) -> None:
+        secret = "sk-" + "D" * 24
+        answers = iter([secret, "/退出"])
+        outputs: list[str] = []
+        args = build_parser().parse_args(["--workspace", self.temp.name])
+        with patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()):
+            with patch("cvfx_harness.cli.Agent.ask") as ask:
+                result = run_console(
+                    args,
+                    input_fn=lambda _prompt: next(answers),
+                    output=outputs.append,
+                )
+        ask.assert_not_called()
+        self.assertEqual(result, 0)
+        self.assertNotIn(secret, "\n".join(outputs))
+        self.assertIn("不会显示、发送给模型或保存", "\n".join(outputs))
+
+    def test_interactive_config_never_accepts_or_echoes_a_key(self) -> None:
+        secret = "sk-" + "E" * 24
+        answers = iter(["/配置 编辑", "openai", secret, "/退出"])
+        outputs: list[str] = []
+        args = build_parser().parse_args(["--workspace", self.temp.name])
+        with patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()):
+            result = run_console(
+                args,
+                input_fn=lambda _prompt: next(answers),
+                output=outputs.append,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertFalse(self.path.exists())
+        self.assertNotIn(secret, "\n".join(outputs))
+        self.assertIn("拒绝疑似凭据输入", "\n".join(outputs))
+
     def test_corrupt_file_can_be_bypassed_without_being_read_or_overwritten(self) -> None:
         self.path.parent.mkdir(parents=True)
-        broken = "{ definitely not json"
+        broken = '{ "api_key": "sk-' + "F" * 24 + '"'
         self.path.write_text(broken, encoding="utf-8")
         inputs = iter(["/退出"])
         outputs: list[str] = []
         args = SimpleNamespace(workspace=self.temp.name, ignore_config=True)
         with patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()):
-            result = run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append)
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("ignored config must not be read")) as read_bytes:
+                result = run_console(
+                    args, input_fn=lambda _prompt: next(inputs), output=outputs.append
+                )
+                read_bytes.assert_not_called()
 
         self.assertEqual(result, 0)
         self.assertEqual(self.path.read_text(encoding="utf-8"), broken)
 
 
 class ConfigParserTests(unittest.TestCase):
+    def test_config_completer_offers_editor_and_only_supported_providers(self) -> None:
+        self.assertIn("编辑", _completion_matches("/配置 编辑", "编辑"))
+        self.assertEqual(
+            _completion_matches("/配置 提供商 deepseek-a", "deepseek-a"),
+            ("deepseek-anthropic",),
+        )
+
     def test_help_documents_supported_providers_and_persistence(self) -> None:
         help_text = build_parser().format_help()
         self.assertIn("deepseek-anthropic", help_text)
