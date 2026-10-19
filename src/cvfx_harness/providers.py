@@ -743,7 +743,6 @@ class OpenAICompatibleProvider:
                             # response data can still be consumed and EOF is bounded.
                             raw_socket = None
                     try:
-                        read_started_at = time.monotonic()
                         chunk = response.read1(8192)
                     except http.client.IncompleteRead as exc:
                         if isinstance(exc.partial, bytes):
@@ -761,10 +760,10 @@ class OpenAICompatibleProvider:
                         if (
                             category == "transport_error"
                             and stage == "response_body"
-                            and time.monotonic() - read_started_at >= poll_timeout * 0.5
+                            and deadline - time.monotonic() <= STREAM_READ_POLL_SECONDS
                         ):
-                            # Some platform transports surface their socket timeout as a
-                            # generic OSError; a poll-length read still has a safe timeout label.
+                            # Some platform transports surface the final poll timeout as a
+                            # generic OSError; keep that near-deadline read safely classified.
                             category = "read_timeout"
                         message = {
                             "read_timeout": "SSE 响应读取超时。",
