@@ -335,7 +335,7 @@ def main() -> int:
             ["--_tui-selfcheck"],
             environment=minimal_environment,
         )
-        if tui_result.returncode != 0 or "TUI 合成输入、命令补全和退出自检通过。" not in tui_result.stdout:
+        if tui_result.returncode != 0 or "TUI 合成输入、命令补全、F2 映射和退出自检通过。" not in tui_result.stdout:
             signature = _process_error_signature(tui_result)
             _fail(f"打包程序 TUI 启动、命令补全或退出自检失败（{signature}）")
 
