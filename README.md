@@ -34,11 +34,11 @@ python -m venv .venv
 
 输入区固定在底部，上方保留会话输出；新文本会跟随到底部，手动向上滚动后不会被新输出拉回。行首输入 `/` 会实时筛选两列中文命令建议。↑/↓ 选择，Tab 填入，Enter 提交输入；Esc 先关闭建议，再取消当前输入。`/模式 ` 只补全固定选项。`@文件` 引用仍需手动输入路径，不会递归扫描工作区，也不会在补全时泄露敏感路径。
 
-Enter 提交当前输入，Ctrl+J 插入换行；Ctrl+C 首次清空草稿，再次按下会取消当前输入或请求。审批面板显示精确动作和 diff，默认选择“否”；用 ↑/↓、Tab 或鼠标选择，按 Enter 才确认本次操作，Esc 取消。点击建议只会填入候选，点击审批选项只切换选择，不会执行动作。不会保存输入历史或审批答案，也没有永久授权模式。
+Enter 提交当前输入，Ctrl+J 插入换行；TUI 生成期间会暂停输入，Ctrl+C 取消当前请求，不会吞掉后台输入草稿。空闲时 Ctrl+C 首次清空草稿，再次按下会取消当前输入或请求。审批面板显示精确动作和 diff，默认选择“否”；用 ↑/↓、Tab 或鼠标选择，按 Enter 才确认本次操作，Esc 取消。点击建议只会填入候选，点击审批选项只切换选择，不会执行动作。不会保存输入历史或审批答案，也没有永久授权模式。
 
 启用 TTY 全屏渲染后，终端的 Unicode 字符宽度、鼠标能力与输入法组合仍取决于宿主。当前项目在 CI 中使用 prompt_toolkit 的合成输入和 Linux PTY 验证键位、布局启动/退出；Windows runner 使用其 Win32 输入模拟验证。尚未完成 Windows Terminal、PowerShell/ConPTY 和各中文 IME 组合的人工兼容验收。
 
-查看 [实际 Linux PTY 合成会话录屏](evidence/tui-synthetic-session.cast)，其中包含主界面、命令候选高亮、多行草稿和默认拒绝审批；回放说明见 [证据说明](evidence/README.md)。
+查看 [实际 Linux PTY 合成会话录屏](evidence/tui-synthetic-session.cast)及其[关键帧联系表](evidence/tui-keyframes.png)，其中包含主界面、命令候选高亮、多行草稿、审批预览和拒绝结果；各张 PNG 原图与回放说明见[证据说明](evidence/README.md)。
 
 ### Windows 独立程序试验
 

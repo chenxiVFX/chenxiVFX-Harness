@@ -17,7 +17,8 @@ from prompt_toolkit.layout.containers import Float, FloatContainer, ConditionalC
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import Button, Frame, TextArea
+from prompt_toolkit.widgets import Button, TextArea
+from wcwidth import wcswidth
 
 from .sessions import redact_likely_secrets
 
@@ -121,10 +122,12 @@ class TerminalUI:
             complete_while_typing=True,
             wrap_lines=True,
             focus_on_click=True,
+            read_only=Condition(lambda: self._pending is None),
             height=Dimension(min=1, max=4),
             style="class:input",
         )
         self._input_buffer = self.input_area.buffer
+        self._input_buffer.on_text_changed += self._on_input_text_changed
         self.output_area = TextArea(
             text="",
             multiline=True,
@@ -142,8 +145,8 @@ class TerminalUI:
             read_only=True,
             focusable=False,
             wrap_lines=True,
-            scrollbar=True,
-            height=Dimension(min=2, max=8),
+            scrollbar=False,
+            height=Dimension(min=1, max=4),
             style="class:approval",
         )
         self._approval_no_button = Button(
@@ -153,17 +156,19 @@ class TerminalUI:
             "○ 是（本次）", handler=self._select_yes, width=18
         )
         self._approval_container = ConditionalContainer(
-            Frame(
-                HSplit(
-                    [
-                        self._approval_area,
-                        VSplit(
-                            [self._approval_no_button, self._approval_yes_button],
-                            padding=1,
-                        ),
-                    ]
-                ),
-                title="待审批（仅本次授权）",
+            HSplit(
+                [
+                    Window(
+                        FormattedTextControl("审批预览 · 默认拒绝 · 仅本次授权"),
+                        height=1,
+                        style="class:approval.heading",
+                    ),
+                    self._approval_area,
+                    VSplit(
+                        [self._approval_no_button, self._approval_yes_button],
+                        padding=1,
+                    ),
+                ]
             ),
             Condition(lambda: bool(self._approval_text)),
         )
@@ -222,8 +227,7 @@ class TerminalUI:
                     "input.separator": "fg:#707784",
                     "transcript": "fg:#d9e2ec",
                     "approval": "fg:#f5d76e",
-                    "frame.border": "fg:#707784",
-                    "frame.label": "bold fg:#f5d76e",
+                    "approval.heading": "bold fg:#f5d76e",
                     "button": "fg:#9aa0aa bg:#000000",
                     "button.focused": "fg:#c6a0f6 bg:#000000 bold",
                     "completion-menu.completion": "fg:#f2f2f2 bg:#263849",
@@ -376,6 +380,8 @@ class TerminalUI:
 
         @bindings.add("tab", eager=True)
         def accept_completion(event) -> None:
+            if self._pending is None:
+                return
             if self._pending is not None and self._pending.approval:
                 self._toggle_approval_choice()
                 return
@@ -394,6 +400,8 @@ class TerminalUI:
 
         @bindings.add("up", eager=True)
         def previous_completion(event) -> None:
+            if self._pending is None:
+                return
             if self._pending is not None and self._pending.approval:
                 self._select_yes()
                 return
@@ -407,6 +415,8 @@ class TerminalUI:
 
         @bindings.add("down", eager=True)
         def next_completion(event) -> None:
+            if self._pending is None:
+                return
             if self._pending is not None and self._pending.approval:
                 self._select_no()
                 return
@@ -443,7 +453,10 @@ class TerminalUI:
 
         @bindings.add("c-j", eager=True)
         def insert_newline(event) -> None:
-            if self._pending is None or self._pending.approval:
+            if self._pending is None:
+                self._notice = "后台生成期间已暂停输入。"
+                return
+            if self._pending.approval:
                 self._notice = "审批回答只能单行输入。"
                 return
             self._input_buffer.insert_text("\n")
@@ -470,6 +483,10 @@ class TerminalUI:
                 self.output_area.buffer.cursor_position = len(self.output_area.text)
 
         return bindings
+
+    def _on_input_text_changed(self, buffer) -> None:
+        if buffer.text:
+            self._notice = ""
 
     def _accept_completion_or_submit(self) -> bool:
         """Return True when Enter filled a candidate instead of submitting."""
@@ -527,12 +544,12 @@ class TerminalUI:
             return
         request.value = None if eof else value
         request.error = error
+        self._input_buffer.text = ""
         self._pending = None
         self._prompt = ""
         self._approval_text = ""
         self._approval_area.text = ""
         self._last_output = ""
-        self._input_buffer.text = ""
         self._request_ready.clear()
         self._status = "运行中"
         request.completed.set()
@@ -612,11 +629,44 @@ class TerminalUI:
         )
 
     def _status_line(self) -> str:
-        details = self._notice or "↑↓ 选择建议  Tab 填入  Enter 提交  Ctrl+J 换行  Ctrl+C 清空/取消  Esc 关闭建议/取消"
-        if self._pending is not None and self._pending.approval:
-            choice = "是" if self._approval_choice_yes else "否（默认）"
-            details = self._notice or f"选择 {choice}：Tab/↑↓ 切换或点击选项；Enter 确认；Esc 取消"
-        return f" 状态：{self._status}    {details}"
+        try:
+            columns = self._application.output.get_size().columns
+        except (AttributeError, NotImplementedError, OSError):
+            columns = 80
+
+        prefix = f" 状态：{self._status}  "
+        if self._notice:
+            details = self._notice
+        elif self._pending is None and not self._worker_done:
+            details = "生成中；输入已暂停  Ctrl+C取消"
+        elif self._pending is None:
+            details = ""
+        elif self._pending.approval:
+            details = (
+                "Tab/↑↓/点击切换  Enter确认  Esc取消"
+                if columns >= 90
+                else "Tab/↑↓切换 Enter确认 Esc取消"
+            )
+        elif columns >= 90:
+            details = "↑↓选候选  Tab填入  Enter提交  Ctrl+J换行  Ctrl+C清空/取消  Esc关闭/取消"
+        elif columns >= 64:
+            details = "↑↓候选 Tab填入 Enter提交 Ctrl+J换行 Ctrl+C取消"
+        else:
+            details = "Enter提交 Ctrl+C取消"
+
+        line = prefix + details
+        if wcswidth(line) <= columns:
+            return line
+        limit = max(0, columns - 1)
+        clipped: list[str] = []
+        used = 0
+        for character in line:
+            width = max(0, wcswidth(character))
+            if used + width > limit:
+                break
+            clipped.append(character)
+            used += width
+        return "".join(clipped) + ("…" if columns else "")
 
 
 def run_tui_console(args) -> int | None:

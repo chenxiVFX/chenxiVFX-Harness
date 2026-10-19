@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 if os.name == "posix":
     import fcntl
@@ -18,9 +19,12 @@ if os.name == "posix":
 
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.data_structures import Size
+from wcwidth import wcswidth
 
-from cvfx_harness.cli import _StreamingSecretRedactor, _confirm_action, build_parser
-from cvfx_harness.tools import ActionRequest
+from cvfx_harness.cli import _StreamingSecretRedactor, _confirm_action, build_parser, run_console
+from cvfx_harness.providers import AssistantTurn, MockProvider, ProviderCancelled, ToolCall
+from cvfx_harness.tools import ActionRequest, Workspace
 from cvfx_harness.tui import CommandCompleter, TerminalUI, terminal_supports_tui
 
 
@@ -37,10 +41,13 @@ class PromptToolkitTests(unittest.TestCase):
                     send_keys(pipe, ui)
                 except BaseException as exc:
                     errors.append(exc)
-                    try:
-                        pipe.send_bytes(b"\x03")
-                    except Exception:
-                        pass
+                    ui.cancellation_event.set()
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline and not ui._worker_done:
+                        if ui._pending is not None:
+                            ui._resolve_pending(eof=True)
+                            break
+                        time.sleep(0.01)
 
             thread = threading.Thread(target=sender, daemon=True)
             thread.start()
@@ -50,6 +57,32 @@ class PromptToolkitTests(unittest.TestCase):
             if errors:
                 raise errors[0]
             return ui, result
+
+    def _run_cli_ui(self, workspace: str, provider, send_keys) -> tuple[TerminalUI, int]:
+        args = build_parser().parse_args(
+            ["--workspace", workspace, "--provider", "mock"]
+        )
+
+        def worker(ui: TerminalUI) -> int:
+            return run_console(
+                args,
+                input_fn=ui.input,
+                output=ui.output,
+                stream_write=ui.stream_write,
+                cancellation_event=ui.cancellation_event,
+            )
+
+        with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+            return self._run_ui(worker, send_keys)
+
+    @staticmethod
+    def _wait_until(predicate, message: str, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        raise AssertionError(message)
 
     def test_fixed_command_completer_only_offers_commands_and_enums(self) -> None:
         from prompt_toolkit.document import Document
@@ -232,7 +265,7 @@ class PromptToolkitTests(unittest.TestCase):
         ui, result = self._run_ui(worker, send)
         self.assertEqual(result, 0)
         self.assertEqual(received, ["保留的输入"])
-        self.assertIn("已清空草稿", ui._notice)
+        self.assertNotIn("已清空草稿", ui._notice)
 
     def test_approval_input_rejects_pasted_newline_and_stays_default_deny(self) -> None:
         received: list[str] = []
@@ -319,6 +352,233 @@ class PromptToolkitTests(unittest.TestCase):
             self.assertEqual(current_style.bgcolor, "c6a0f6")
             self.assertEqual(current_style.color, "1b1722")
             self.assertTrue(current_style.bold)
+
+    def test_status_line_fits_terminal_width_and_approval_keeps_mouse_hint(self) -> None:
+        from cvfx_harness.tui import _InputRequest
+
+        class SizedDummyOutput(DummyOutput):
+            def __init__(self, columns: int) -> None:
+                self.columns = columns
+
+            def get_size(self):
+                return Size(rows=24, columns=self.columns)
+
+        for columns in (36, 64, 80, 100):
+            with self.subTest(columns=columns), create_pipe_input() as pipe:
+                ui = TerminalUI(
+                    lambda _ui: 0,
+                    input=pipe,
+                    output=SizedDummyOutput(columns),
+                )
+                ui._pending = _InputRequest("输入", False, threading.Event())
+                self.assertLessEqual(wcswidth(ui._status_line()), columns)
+                ui._notice = "这是一个故意很长的合成状态提示，用来检查窄终端不会裁掉状态栏布局。"
+                self.assertLessEqual(wcswidth(ui._status_line()), columns)
+                ui._notice = ""
+                ui._pending = _InputRequest("确认写入？[y/N]", True, threading.Event())
+                line = ui._status_line()
+                self.assertLessEqual(wcswidth(line), columns)
+                if columns >= 90:
+                    self.assertIn("点击切换", line)
+
+    def test_cli_streaming_cancel_restores_input_and_keeps_busy_draft_separate(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-agent-stream-") as workspace:
+            stream_started = threading.Event()
+
+            class ResumableMockProvider(MockProvider):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.calls = 0
+
+                def complete_streaming(
+                    self,
+                    messages,
+                    tools,
+                    *,
+                    cancellation_event=None,
+                    max_tokens=2048,
+                    on_text_delta,
+                ):
+                    del messages, tools, max_tokens
+                    self.calls += 1
+                    if self.calls == 1:
+                        on_text_delta("这是足够长的首段合成流式输出，用于检查输入区域保持独立。")
+                        stream_started.set()
+                        if cancellation_event is None or not cancellation_event.wait(5):
+                            raise AssertionError("cancel input did not reach the mock provider")
+                        raise ProviderCancelled("synthetic fixture cancelled")
+                    on_text_delta("恢复后继续生成的合成流式答复。")
+                    return AssistantTurn("恢复后继续生成的合成流式答复。")
+
+            provider = ResumableMockProvider()
+
+            def send(pipe, ui: TerminalUI) -> None:
+                self.assertIsNotNone(ui._pending)
+                self.assertFalse(ui.input_area.buffer.read_only())
+                pipe.send_text("开始合成对话")
+                self._wait_until(
+                    lambda: ui._input_buffer.text == "开始合成对话",
+                    "prompt text was not accepted while the input request was pending",
+                )
+                pipe.send_bytes(b"\r")
+                self.assertTrue(stream_started.wait(5))
+                self._wait_until(
+                    lambda: "首段合成流式" in ui._transcript,
+                    "stream delta was not delivered to the transcript",
+                )
+                self.assertTrue(ui.input_area.buffer.read_only())
+                pipe.send_text("不应静默丢失的输入草稿")
+                time.sleep(0.05)
+                self.assertEqual(ui._input_buffer.text, "")
+                self.assertNotIn("不应静默丢失的输入草稿", ui._transcript)
+                pipe.send_bytes(b"\x03")
+                self._wait_until(
+                    lambda: ui._pending is not None and not ui._pending.approval,
+                    "TUI did not return to an input prompt after cancellation",
+                )
+                self.assertIn("已取消当前模型请求", ui._transcript)
+                self.assertFalse(ui.input_area.buffer.read_only())
+                pipe.send_text("继续合成对话")
+                self._wait_until(
+                    lambda: ui._input_buffer.text == "继续合成对话",
+                    "input was not restored after cancellation",
+                )
+                pipe.send_bytes(b"\r")
+                self._wait_until(
+                    lambda: "恢复后继续生成的合成流式答复。" in ui._transcript
+                    and ui._pending is not None
+                    and not ui._pending.approval,
+                    "conversation did not resume after cancellation",
+                )
+                self.assertFalse(ui.input_area.buffer.read_only())
+                pipe.send_text("/退出")
+                self._wait_until(
+                    lambda: ui._input_buffer.text == "/退出",
+                    "exit command text was not accepted after resumed stream",
+                )
+                pipe.send_bytes(b"\r")
+                self._wait_until(
+                    lambda: ui._worker_done,
+                    "TUI input did not submit /退出 after resumed stream",
+                )
+
+            ui, result = self._run_cli_ui(workspace, provider, send)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(provider.calls, 2)
+        self.assertIn("已取消当前模型请求", ui._transcript)
+        self.assertIn("恢复后继续生成的合成流式答复。", ui._transcript)
+
+    def test_cli_write_tool_default_denial_and_one_explicit_approval(self) -> None:
+        from cvfx_harness.tui import _InputRequest
+
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-agent-approval-") as workspace:
+            target = Path(workspace) / "合成文件.txt"
+
+            class WriteMockProvider(MockProvider):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.calls = 0
+
+                def complete_streaming(
+                    self,
+                    messages,
+                    tools,
+                    *,
+                    cancellation_event=None,
+                    max_tokens=2048,
+                    on_text_delta,
+                ):
+                    del messages, tools, max_tokens
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        raise ProviderCancelled("unexpected synthetic cancellation")
+                    self.calls += 1
+                    if self.calls in {1, 3}:
+                        return AssistantTurn(
+                            "",
+                            [
+                                ToolCall(
+                                    f"write-{self.calls}",
+                                    "write_file",
+                                    {"path": "合成文件.txt", "content": "获批后只写入一次"},
+                                )
+                            ],
+                        )
+                    answer = (
+                        "拒绝后仍可继续的合成答复。"
+                        if self.calls == 2
+                        else "获批写入后的合成答复。"
+                    )
+                    on_text_delta(answer)
+                    return AssistantTurn(answer)
+
+            provider = WriteMockProvider()
+            committed_paths: list[str] = []
+            original_commit = Workspace.commit_write
+
+            def count_commit(workspace_obj, preview, *, cancellation_event=None):
+                committed_paths.append(preview.canonical_path)
+                return original_commit(
+                    workspace_obj,
+                    preview,
+                    cancellation_event=cancellation_event,
+                )
+
+            def send(pipe, ui: TerminalUI) -> None:
+                def submit_prompt(text: str) -> None:
+                    pipe.send_text(text)
+                    self._wait_until(
+                        lambda: ui._input_buffer.text == text,
+                        f"input text was not accepted: {text}",
+                    )
+                    pipe.send_bytes(b"\r")
+
+                def wait_for_approval() -> None:
+                    self._wait_until(
+                        lambda: ui._pending is not None and ui._pending.approval,
+                        "Agent did not present its write approval in the TUI",
+                    )
+
+                submit_prompt("请求第一次合成写入")
+                wait_for_approval()
+                self.assertFalse(ui._approval_choice_yes)
+                pipe.send_bytes(b"\r")
+                self._wait_until(
+                    lambda: ui._pending is not None and not ui._pending.approval,
+                    "denied write did not return to the conversation prompt",
+                )
+                self.assertFalse(target.exists())
+                self.assertEqual(committed_paths, [])
+
+                submit_prompt("请求第二次合成写入")
+                wait_for_approval()
+                self.assertFalse(ui._approval_choice_yes)
+                pipe.send_bytes(b"\t")
+                self._wait_until(
+                    lambda: ui._approval_choice_yes,
+                    "Tab did not select the one-time approval option",
+                )
+                self.assertIsNotNone(ui._pending, "selection alone must not approve")
+                pipe.send_bytes(b"\r")
+                self._wait_until(
+                    lambda: ui._pending is not None
+                    and not ui._pending.approval
+                    and target.exists(),
+                    "approved write did not finish and return to input",
+                )
+                self.assertEqual(target.read_text(encoding="utf-8"), "获批后只写入一次")
+                self.assertEqual(committed_paths, ["合成文件.txt"])
+                submit_prompt("/退出")
+
+            with patch.object(Workspace, "commit_write", new=count_commit):
+                ui, result = self._run_cli_ui(workspace, provider, send)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(provider.calls, 4)
+        self.assertEqual(committed_paths, ["合成文件.txt"])
+        self.assertIn("审批回答：（空，拒绝）", ui._transcript)
+        self.assertIn("拒绝后仍可继续的合成答复。", ui._transcript)
+        self.assertIn("获批写入后的合成答复。", ui._transcript)
 
     def test_escape_closes_completion_without_submitting_or_cancelling(self) -> None:
         received: list[str] = []
