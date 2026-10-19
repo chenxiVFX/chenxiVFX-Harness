@@ -189,7 +189,7 @@
 - 交互组件测试、隔离合成键盘自检和 POSIX PTY 测试只使用本地合成内容与 Mock；Windows standalone workflow 会在打包 EXE 内运行 TUI 合成键盘自检。中文 IME 和终端缩放/鼠标差异仍待人工兼容测试。
 - 实际 Linux PTY 录屏展示主界面、状态栏、细分隔线、命令候选高亮、多行草稿、审批预览和拒绝结果；[原始录屏与 PNG 关键帧](evidence/README.md)。PNG 由官方 asciinema `agg` v1.9.0 和 ffmpeg 从 PTY 录屏回放导出；不是重画图或 Windows 截图。录屏、POSIX PTY 测试均启动真实 TUI，只使用本地合成文本与 Mock；不是 Windows Terminal/ConPTY 或中文输入法人工验收。
 - 交互回归覆盖 9×20、10×24、12×36、16×64、24×80、30×100 六种终端尺寸下候选菜单不遮挡提示/分隔线且可裁剪；审批测试覆盖多行粘贴、重复 Enter、新请求重置默认拒绝、焦点切换和鼠标仅选择。Agent 离线集成场景覆盖流式取消/续聊、默认拒绝不落盘及显式审批仅提交一次写入。
-- Linux / Python 3.12 离线回归：186 项，185 通过、1 项 Windows-only junction 跳过；editable install、自检、TUI 合成键盘自检、`compileall` 与 `git diff --check` 通过。当前视觉修订的跨平台 CI 结果待 push 后记录。只使用 Mock 与本地 fixture，没有真实模型请求或凭据读取；自动测试不等同完整产品验收。
+- Linux / Python 3.12 离线回归：186 项，185 通过、1 项 Windows-only junction 跳过；editable install、自检、TUI 合成键盘自检、`compileall` 与 `git diff --check` 通过。Windows/Linux × Python 3.11/3.12 四格 CI 全部通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39251905493)）；Windows standalone 构建、归档审查、帮助/Mock/TUI 自检和 artifact 上传通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39251905520)）。只使用 Mock 与本地 fixture，没有真实模型请求或凭据读取；自动测试不等同完整产品验收。
 
 ## 参考项目复用边界
 
