@@ -1462,7 +1462,7 @@ class ProviderTests(unittest.TestCase):
                 bounded_provider.complete_streaming(
                     [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
                 )
-        self.assertEqual(caught.exception.diagnostics.category, "read_timeout")
+        self.assertEqual(caught.exception.diagnostics.category, "read_timeout", str(caught.exception))
         self.assertEqual(caught.exception.diagnostics.stage, "response_body")
         self.assertNotIn("synthetic transport detail", str(caught.exception))
         self.assertTrue(slow_response.closed)

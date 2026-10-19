@@ -761,7 +761,7 @@ class OpenAICompatibleProvider:
                         if (
                             category == "transport_error"
                             and stage == "response_body"
-                            and time.monotonic() - read_started_at >= poll_timeout * 0.8
+                            and time.monotonic() - read_started_at >= poll_timeout * 0.5
                         ):
                             # Some platform transports surface their socket timeout as a
                             # generic OSError; a poll-length read still has a safe timeout label.
