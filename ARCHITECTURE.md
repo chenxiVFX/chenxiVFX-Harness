@@ -47,7 +47,7 @@ Agent 的 system message 在每个请求、恢复和压缩后保持固定文本�
 - 模型循环上限为 4 轮、每轮执行上限为 4 项；超出的工具调用仍回填“未执行”结果，末轮工具调用全部不执行。每次提问共享 2048 默认输出预算，CLI 可用 `--max-output-tokens` 调整（1–65536）。
 - 读操作每次单独批准；写操作先预览差异，再单独批准并备份；撤销也预览并再次确认。
 - `.harness/backups` 与 `.harness/sessions` 是 Harness 私有状态，不能通过模型工具访问。
-- 目录 reparse point、硬链接身份等检查依赖 Windows 文件系统信息。本机集成测试无法创建链接，因此链接逃逸防护尚未在 junction/symlink/hard link 上端到端实测。
+- 目录 symlink 与硬链接逃逸通过实际链接 fixture 集成测试覆盖；junction 仅适用于 Windows。跨平台 CI 会在 Linux 默认创建 symlink/hard link，在 Windows 创建 junction，并在系统拒绝创建测试 fixture 时记录明确的 Windows 用例跳过。
 - 普通 Python 进程不能提供 OS 级沙箱。若未来加入 shell，须先设计并实测工作区隔离，不能把路径检查误称为进程沙箱。
 - 子代理仅从 CLI 明确列出的任务创建；工具层逐项展示确切任务文本并要求审批。每个 child 新建独立的 system/user 消息列表，不继承父会话、文件引用、工具结果、目标或工具 schema。仅有 `MockProvider.complete_subagent` 被开放；每项一次调用、输入最多 512 估算 tokens、输出最多 256 估算 tokens、超时 5 秒、最多 3 项、深度 0。
 - 取消事件、预算和状态按 child 独立。失败、超时、取消、拒绝或预算耗尽不阻止其他已批准 child；结果只生成 JSON 编码的不可信汇总，不加入父 Agent 上下文，不调用文件/命令工具。

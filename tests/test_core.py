@@ -31,9 +31,6 @@ from cvfx_harness.providers import (
 from cvfx_harness.tools import ActionRequest, Workspace, WorkspaceError, run_tool
 from cvfx_harness.usage import ProviderUsage
 
-_LINK_TESTS_ENABLED = os.environ.get("HARNESS_TEST_CREATE_LINKS") == "1"
-
-
 def make_test_temp(prefix: str = "case-") -> tempfile.TemporaryDirectory:
     local_temp = Path(__file__).resolve().parents[1] / ".test-tmp"
     local_temp.mkdir(exist_ok=True)
@@ -152,10 +149,7 @@ class WorkspaceTests(unittest.TestCase):
             Workspace(missing)
         self.assertNotIn(str(missing), str(caught.exception))
 
-    @unittest.skipUnless(
-        os.name == "nt" and _LINK_TESTS_ENABLED,
-        "Windows link integration requires Windows and explicit opt-in; the OS may deny fixture creation",
-    )
+    @unittest.skipUnless(os.name == "nt", "junctions are Windows-specific")
     def test_directory_junction_escape_is_rejected(self) -> None:
         outside = self.root.parent / f"{self.root.name}-junction-target"
         outside.mkdir()
@@ -185,28 +179,22 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaises(WorkspaceError):
             self.workspace.read_text("junction/secret.txt")
 
-    @unittest.skipUnless(
-        os.name == "nt" and _LINK_TESTS_ENABLED,
-        "Windows link integration requires Windows and explicit opt-in; the OS may deny fixture creation",
-    )
     def test_directory_symlink_escape_is_rejected(self) -> None:
         outside = self.root.parent / f"{self.root.name}-symlink-target"
         outside.mkdir()
-        self.addCleanup(lambda: __import__("shutil").rmtree(outside, ignore_errors=True))
+        self.addCleanup(lambda: shutil.rmtree(outside, ignore_errors=True))
         (outside / "secret.txt").write_text("symlink secret", encoding="utf-8")
         link = self.root / "link"
         try:
             os.symlink(outside, link, target_is_directory=True)
         except (OSError, NotImplementedError) as exc:
-            self.skipTest(f"本机 Windows 策略不允许创建测试 symlink：{exc}")
+            if os.name == "nt":
+                self.skipTest(f"Windows runner 未允许创建 symlink fixture：{type(exc).__name__}")
+            raise
         self.addCleanup(lambda: link.unlink() if link.is_symlink() else None)
         with self.assertRaises(WorkspaceError):
             self.workspace.resolve("link/secret.txt")
 
-    @unittest.skipUnless(
-        os.name == "nt" and _LINK_TESTS_ENABLED,
-        "Windows link integration requires Windows and explicit opt-in; the OS may deny fixture creation",
-    )
     def test_hard_link_with_external_name_is_rejected(self) -> None:
         outside = self.root.parent / f"{self.root.name}-hardlink-secret.txt"
         outside.write_text("hardlink secret", encoding="utf-8")
@@ -215,7 +203,9 @@ class WorkspaceTests(unittest.TestCase):
         try:
             os.link(outside, inside)
         except OSError as exc:
-            self.skipTest(f"本机文件系统不允许创建测试 hard link：{exc}")
+            if os.name == "nt":
+                self.skipTest(f"Windows runner 文件系统未允许创建 hard link fixture：{type(exc).__name__}")
+            raise
         with self.assertRaisesRegex(WorkspaceError, "硬链接"):
             self.workspace.read_text("linked.txt")
 

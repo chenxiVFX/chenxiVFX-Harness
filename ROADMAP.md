@@ -13,7 +13,7 @@
 | Anthropic provider / 更多供应商 | 待实现 | 尚无独立协议适配；当前用户要求的 `deepseek-flash` 只配置了兼容接口 |
 | 多轮工具循环 | 已实现 / 离线可测 | 最多 4 轮、每轮最多执行 4 项，回填工具结果；重复调用编号、格式错误或超预算时关闭当前轮次 |
 | 工作区文件引用、目录列表与读写 | 已实现 / 离线可测 | 目录只返回名称/类型且逐次批准；文件读取与写入逐次批准；路径和敏感路径检查、写入差异预览与撤销备份 |
-| junction / symlink / hard link 逃逸 | 部分实现 / 未实测 | 检测逻辑和普通路径回归在；本机策略拒绝创建链接，逃逸集成测试跳过 |
+| junction / symlink / hard link 逃逸 | 部分实现 / CI 验证中 | Linux 默认运行 symlink / hard link 集成用例；Windows 运行 junction 与可创建的 symlink / hard link 用例；Windows 系统策略拒绝 fixture 时会明确跳过 |
 | 计划模式 | 已实现 / 离线可测 | 拒绝工具写入；没有 shell 工具 |
 | 目标模式 | 已实现（有限） | 目标仅作为不可信上下文；没有计划编排或权限变化 |
 | 安全会话保存/恢复 | 已实现 / 离线可测 | `.harness/sessions/`；默认存安全完整轮次；`/检查点` 另存用户手写脱敏摘要，预览确认后才保存；不复制工具结果 |
@@ -56,14 +56,14 @@
 
 ## 当前恢复点
 
-- 本轮起点是 `main` / `origin/main` 的 `33a9563`；完成后由本轮中文提交作为新的恢复点，并以普通快进方式推送到 `origin/main`。
+- 当前工作基于本地 `main` 提交 `c6dab6e`，其父提交为 `8c7a1e8`。推送前复核时 `origin/main` 指向该父提交；普通 push 会快进包含这两个本地提交和本轮提交，不重写历史。
 - 本轮只更改 Harness 源码、测试和说明文档；`.harness/`、`.test-tmp/` 和 Python 缓存均忽略，不放入版本控制。
-- 本轮没有新增 Windows 链接集成测试，也没有调整系统链接权限；需在允许创建链接的 Windows 环境继续验收。
+- 本轮启用现有 symlink / hard link 集成用例的跨平台自动执行，并让 Windows junction 用例在 Windows 上自动运行；没有调整系统链接权限。
 
 ## 风险与未验证项
 
-- 普通 Windows 路径、中文路径、UTF-8 内容、UNC/ADS/遍历拒绝与路径边界已有本机测试。junction、symlink、hard link 测试需创建链接 fixture，当前系统拒绝这些操作；按要求不再尝试创建，不宣称逃逸已实测。
-- `pip install -e .` 曾因本地缺少 `setuptools>=68` 且网络不可用而未验证；可继续使用 `run.ps1` 或 `python -m cvfx_harness`。
+- 普通 Windows 路径、中文路径、UTF-8 内容、UNC/ADS/遍历拒绝与路径边界已有测试。本轮 Debian 测试实际创建并验证了 symlink 与 hard link 逃逸；Windows junction 和 Windows 链接策略仍待 CI 确认。
+- `pip install -e .` 曾因本地缺少 `setuptools>=68` 且网络不可用而未验证；本轮增加独立安装自检和 GitHub Actions 的 Windows/Linux 安装矩阵，具体 CI 结果记录在下方。
 - 本轮没有 API 请求，也没有读取聊天历史或搜索、读取、配置任何密钥。之前独立 smoke 只覆盖基本认证对话，不能代替工具循环验收。
 - 本地会话文件为明文 JSON，不含工具返回正文或密钥；共享工作区前仍应检查用户主动输入的普通对话内容。
 
@@ -74,6 +74,14 @@
 3. 增加完整的会话恢复/检查点覆盖策略与 schema migration；保留检查点只来自用户手写摘要的边界。
 4. 先设计 Windows 沙箱/进程隔离模型，再决定是否实现 PowerShell/cmd。Shell 执行未授权之前保持关闭。
 5. 与用户确认 PTC 的确切语义，再选择静态工具组合、脚本受限执行或其他模型；当前语义假设不阻塞基础 CLI。
+
+## 跨平台安装与离线 CI（2026-10-19）
+
+- 新增 `scripts/selfcheck.py`：核对发行包与导入包版本，检查 `python -m cvfx_harness` 和已安装命令的帮助内容，并以隔离环境运行 UTF-8 中文 Mock 会话。不会继承 `DEEPSEEK_API_KEY`，不调用真实 provider。
+- GitHub Actions 使用只读仓库权限，在 Windows/Linux 与 Python 3.11/3.12 矩阵中安装项目、运行自检、编译检查和完整 unittest；测试阶段不访问外部模型 API。
+- Windows 快速开始通过虚拟环境中的 Python 和 CLI 可执行文件直接运行，不需激活脚本或修改执行策略。
+- Debian 13 / Python 3.12：editable install、自检、compileall 和 65 项 unittest 通过（64 通过，1 项 Windows-only junction 用例跳过）；symlink 与 hard link 集成用例均执行通过。
+- GitHub Actions 的 `checkout` / `setup-python` tag 均固定到已核对的官方 commit SHA。Windows/Linux 远端矩阵结果及本轮提交号待推送后补录。
 
 ## 参考项目复用边界
 

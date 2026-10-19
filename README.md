@@ -6,13 +6,19 @@ Windows 优先、中文交互的 AI 编程命令行工具。当前版本包含�
 
 ## 环境与安装
 
-需要 Python 3.11 或更新版本。项目没有第三方运行时依赖。创建虚拟环境并安装：
+需要 Python 3.11 或更新版本。项目没有第三方运行时依赖。Windows PowerShell 中，在仓库目录运行：
 
 ```powershell
-cd C:\path\to\chenxiVFX-Harness
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e .
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\cvfx-harness.exe --help
+.\.venv\Scripts\cvfx-harness.exe --workspace . --provider mock
+```
+
+无需激活虚拟环境或修改 PowerShell 执行策略。启动后可输入 `你好` 测试中文交互，再输入 `/退出` 结束；`mock` 模式完全离线，不读取密钥，也不会发送网络请求。安装后可运行自检：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\selfcheck.py
 ```
 
 也可以直接用当前 Python 启动仓库中的脚本：
@@ -70,14 +76,15 @@ Token 数由本地字符启发式估算，不是提供商 tokenizer 的精确数
 - 模型输出、文件内容、工具结果、目标文本和历史摘要都是不可信数据，不能修改权限规则。未知工具一律拒绝。
 - 单次提问最多 4 轮模型回复、每轮最多执行 4 个工具调用、每个模型响应最多接收 16 个调用；输出预算默认 2048 个 provider completion tokens。按剩余请求槽分配每次 `max_tokens`；缺少 usage 时完整扣除该请求额度。重复调用编号、格式错误参数或超过单次额度的响应会在任何工具执行前终止当前轮次。
 - 当前没有 shell、通用命令执行、隔离 worktree、PTC 执行、可调用文件工具的子代理或 Anthropic provider；子代理只支持隔离的一次性 Mock 请求。
-- Windows 路径/中文文件的普通读写测试在本机通过。受当前系统策略限制，junction、symlink、hard link 逃逸集成测试未实际创建链接验证；不因测试而更改系统安全设置。
+- Windows 路径/中文文件的普通读写测试在本机通过。当前 Debian 测试覆盖 symlink 与 hard link 逃逸；junction 和 Windows 链接策略由跨平台 CI 验证。测试不会更改系统链接权限。
 
 ## 离线回归
 
 ```powershell
-python -m compileall -q src tests
+python scripts/selfcheck.py
+python -m compileall -q src tests scripts
 python -m unittest discover -s tests -v
 .\run.ps1 --help
 ```
 
-测试只使用本地临时工作区、模拟提供商、loopback HTTP fixture 和 stub HTTP 响应，不读取实际环境密钥或访问外部 API。链接集成用例默认跳过。
+`scripts/selfcheck.py` 需先安装项目；它会核对包版本、模块与命令行帮助，并用独立的 Mock 子进程验证 UTF-8 中文交互。测试只使用本地临时工作区、模拟提供商、loopback HTTP fixture 和 stub HTTP 响应，不读取实际环境密钥或访问外部 API。GitHub Actions 会在 Linux 与 Windows、Python 3.11 与 3.12 上运行安装自检和完整测试。符号链接和硬链接逃逸测试在支持的平台默认运行；junction 仅在 Windows 测试。若 Windows 策略拒绝创建符号链接或文件系统拒绝创建硬链接 fixture，对应 Windows 用例会明确跳过并说明原因。
