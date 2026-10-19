@@ -10,8 +10,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from cvfx_harness.cli import run_console
-from cvfx_harness.plans import PlanDraft, PlanError, PlanStore, PlanStep, parse_plan_proposal
+from cvfx_harness.cli import _plan_progress_text, run_console
+from cvfx_harness.plans import PlanDraft, PlanError, PlanProgress, PlanSnapshot, PlanStore, PlanStep, parse_plan_proposal
 from cvfx_harness.providers import AssistantTurn, MockProvider, ProviderCancelled, ProviderError, ToolCall
 from cvfx_harness.tools import Workspace
 
@@ -41,10 +41,12 @@ class PlanStoreTests(unittest.TestCase):
             )
 
             recovered = PlanStore(Workspace(temp)).recover_unfinished()
-            self.assertEqual([step.status for step in recovered.steps], ["pending", "pending"])
+            self.assertEqual([step.status for step in recovered.steps], ["blocked", "pending"])
+            self.assertEqual(recovered.progress.last_result, "outcome_unknown")
+            self.assertEqual(recovered.progress.interruption_cause, "legacy_state_unknown")
             self.assertEqual(
                 [step.status for step in store.load().steps],
-                ["pending", "pending"],
+                ["blocked", "pending"],
             )
 
     def test_step_count_text_and_secret_limits_are_enforced(self) -> None:
@@ -120,8 +122,92 @@ class PlanStoreTests(unittest.TestCase):
             loaded = store.load()
             self.assertEqual(loaded.steps[0].completion_criteria, "由用户检查实际输出后确认完成。")
             self.assertEqual(loaded.steps[0].required_tools, ())
-            store.transition(1, "in-progress", expected_step=loaded.steps[0])
-            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["version"], 2)
+            self.assertEqual(loaded.unverified_steps, (1,))
+            with self.assertRaisesRegex(PlanError, "未经核验"):
+                store.replace(
+                    PlanDraft((PlanStep("新计划", completion_criteria="检查输出"),)),
+                    expected_snapshot=loaded,
+                )
+            with self.assertRaisesRegex(PlanError, "需核验"):
+                store.transition(1, "in-progress", expected_step=loaded.steps[0])
+            recovered = store.recover_unfinished()
+            self.assertEqual(recovered.steps[0].status, "blocked")
+            self.assertEqual(recovered.progress.last_result, "outcome_unknown")
+            resumed = store.prepare_resume(
+                1, expected_snapshot=recovered, verified_unknown_outcome=True
+            )
+            self.assertEqual(resumed.steps[0].status, "pending")
+            self.assertEqual(resumed.unverified_steps, ())
+            self.assertEqual(resumed.progress.last_result, "user_verified")
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["version"], 3)
+
+    def test_legacy_v2_all_unfinished_steps_require_individual_verification(self) -> None:
+        with local_temp() as temp:
+            store = PlanStore(Workspace(temp))
+            path = Path(temp) / ".harness" / "plans" / "current.json"
+            path.parent.mkdir(parents=True)
+            legacy_steps = [
+                {
+                    "text": f"旧步骤 {index}",
+                    "status": "pending",
+                    "completion_criteria": "检查输出",
+                    "required_tools": [],
+                }
+                for index in range(1, 4)
+            ]
+            path.write_text(json.dumps({"version": 2, "steps": legacy_steps}), encoding="utf-8")
+
+            recovered = store.recover_unfinished()
+            self.assertEqual(recovered.unverified_steps, (1, 2, 3))
+            self.assertTrue(all(step.status == "blocked" for step in recovered.steps))
+            with self.assertRaisesRegex(PlanError, "旧版第 1 步"):
+                store.transition(2, "pending")
+            with self.assertRaisesRegex(PlanError, "第 1 步仍有未知工具结果"):
+                store.prepare_resume(2, expected_snapshot=recovered, verified_unknown_outcome=True)
+
+            first = store.prepare_resume(1, expected_snapshot=recovered, verified_unknown_outcome=True)
+            self.assertEqual(first.steps[0].status, "blocked")
+            self.assertEqual(first.unverified_steps, (2, 3))
+            restarted = store.recover_unfinished()
+            self.assertEqual(restarted.unverified_steps, (2, 3))
+            self.assertEqual(restarted.progress.step_index, 2)
+            self.assertEqual(restarted.progress.last_result, "outcome_unknown")
+            with self.assertRaisesRegex(PlanError, "旧版第 2 步"):
+                store.transition(1, "pending")
+
+            second = store.prepare_resume(2, expected_snapshot=restarted, verified_unknown_outcome=True)
+            self.assertEqual(second.unverified_steps, (3,))
+            final = store.prepare_resume(3, expected_snapshot=second, verified_unknown_outcome=True)
+            self.assertEqual(final.steps[2].status, "pending")
+            self.assertEqual(final.unverified_steps, ())
+            self.assertEqual(final.progress.last_result, "user_verified")
+            self.assertTrue(all(step.status == "blocked" for step in final.steps[:2]))
+
+    def test_unverified_legacy_steps_do_not_hide_a_separate_unknown_milestone(self) -> None:
+        with local_temp() as temp:
+            store = PlanStore(Workspace(temp))
+            mixed = PlanSnapshot(
+                (
+                    PlanStep("新格式步骤", "blocked"),
+                    PlanStep("遗留步骤", "blocked"),
+                ),
+                PlanProgress(1, "tool_execution", "write_file", "outcome_unknown", "process_restarted"),
+                (2,),
+            )
+            store._write(mixed)
+
+            recovered = store.recover_unfinished()
+            self.assertEqual(recovered.progress.step_index, 1)
+            self.assertEqual(recovered.unverified_steps, (2,))
+            with self.assertRaisesRegex(PlanError, "第 1 步仍有未知工具结果"):
+                store.prepare_resume(2, expected_snapshot=recovered, verified_unknown_outcome=True)
+
+            first = store.prepare_resume(1, expected_snapshot=recovered, verified_unknown_outcome=True)
+            self.assertEqual(first.steps[0].status, "blocked")
+            self.assertEqual(first.unverified_steps, (2,))
+            final = store.prepare_resume(2, expected_snapshot=first, verified_unknown_outcome=True)
+            self.assertEqual(final.steps[1].status, "pending")
+            self.assertEqual(final.unverified_steps, ())
 
     def test_accept_requires_review_snapshot_and_cannot_replace_running_step(self) -> None:
         with local_temp() as temp:
@@ -139,7 +225,7 @@ class PlanStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(PlanError, "进行中的步骤"):
                 store.replace(proposal, expected_snapshot=active)
 
-    def test_structured_fields_survive_restart_while_in_progress_returns_to_pending(self) -> None:
+    def test_structured_fields_survive_restart_and_legacy_active_state_is_blocked_unknown(self) -> None:
         with local_temp() as temp:
             store = PlanStore(Workspace(temp))
             empty = store.load()
@@ -154,9 +240,148 @@ class PlanStoreTests(unittest.TestCase):
             saved = store.load()
             store.transition(1, "in-progress", expected_step=saved.steps[0])
             recovered = store.recover_unfinished()
-            self.assertEqual(recovered.steps[0].status, "pending")
+            self.assertEqual(recovered.steps[0].status, "blocked")
+            self.assertEqual(recovered.progress.last_result, "outcome_unknown")
+            self.assertEqual(recovered.progress.interruption_cause, "legacy_state_unknown")
             self.assertEqual(recovered.steps[0].completion_criteria, "输出模块路径")
             self.assertEqual(recovered.steps[0].required_tools, ("list_directory",))
+
+    def test_pending_approval_restart_is_known_not_executed(self) -> None:
+        with local_temp() as temp:
+            store = PlanStore(Workspace(temp))
+            store.add("读取合成文件")
+            store.transition(1, "in-progress")
+            store.record_progress(1, "tool_approval", "read_file")
+
+            recovered = PlanStore(Workspace(temp)).recover_unfinished()
+            self.assertEqual(recovered.steps[0].status, "blocked")
+            self.assertEqual(recovered.progress.phase, "tool_approval")
+            self.assertEqual(recovered.progress.last_result, "not_executed")
+            resumed = store.prepare_resume(1, expected_snapshot=recovered)
+            self.assertEqual(resumed.steps[0].status, "pending")
+
+    def test_interrupted_questionnaire_only_records_local_interaction_not_answers(self) -> None:
+        with local_temp() as temp:
+            store = PlanStore(Workspace(temp))
+            store.add("向用户询问合成偏好")
+            store.transition(1, "in-progress")
+            store.record_progress(1, "tool_interaction", "ask_user")
+            path = Path(temp) / ".harness" / "plans" / "current.json"
+            before_restart = path.read_text(encoding="utf-8")
+            self.assertNotIn("SYNTHETIC_QUESTION_ANSWER", before_restart)
+
+            recovered = store.recover_unfinished()
+            self.assertEqual(recovered.progress.phase, "local_interaction")
+            self.assertEqual(recovered.progress.last_tool, "ask_user")
+            self.assertEqual(recovered.progress.last_result, "not_executed")
+
+    def test_execution_restart_requires_explicit_verification_and_never_direct_retry(self) -> None:
+        with local_temp() as temp:
+            store = PlanStore(Workspace(temp))
+            store.add("检查合成步骤")
+            store.add("其他步骤")
+            store.transition(1, "in-progress")
+            store.record_progress(1, "tool_execution", "write_file")
+
+            recovered = store.recover_unfinished()
+            self.assertEqual(recovered.progress.last_result, "outcome_unknown")
+            with self.assertRaisesRegex(PlanError, "结果未知"):
+                store.prepare_resume(1, expected_snapshot=recovered)
+            with self.assertRaisesRegex(PlanError, "结果未知"):
+                store.transition(1, "pending")
+            with self.assertRaisesRegex(PlanError, "第 1 步仍有未知工具结果"):
+                store.transition(2, "in-progress")
+
+            resumed = store.prepare_resume(
+                1, expected_snapshot=recovered, verified_unknown_outcome=True
+            )
+            self.assertEqual(resumed.steps[0].status, "pending")
+            self.assertEqual(resumed.progress.last_result, "user_verified")
+            store.transition(1, "in-progress")
+            resumed_progress = store.record_progress(1, "provider_request")
+            self.assertEqual(resumed_progress.progress.interruption_cause, "none")
+
+    def test_returned_tool_result_is_only_a_fixed_redacted_milestone(self) -> None:
+        with local_temp() as temp:
+            store = PlanStore(Workspace(temp))
+            store.add("检查中文工具结果")
+            store.transition(1, "in-progress")
+            store.record_progress(1, "tool_result", "read_file")
+            path = Path(temp) / ".harness" / "plans" / "current.json"
+            raw = path.read_text(encoding="utf-8")
+            self.assertIn('"last_result":"returned_redacted"', raw)
+            for forbidden in (
+                "synthetic_secret_value",
+                "PRIVATE_FILE_CONTENT",
+                "private/path.txt",
+                "api_key=",
+                "arguments",
+                "tool_output",
+            ):
+                self.assertNotIn(forbidden, raw)
+
+            recovered = store.recover_unfinished()
+            self.assertEqual(recovered.progress.phase, "tool_result_returned")
+            self.assertEqual(recovered.progress.last_result, "returned_redacted")
+            self.assertEqual(recovered.progress.last_tool, "read_file")
+
+    def test_progress_schema_rejects_arbitrary_content_and_invalid_tool_names(self) -> None:
+        with self.assertRaises(PlanError):
+            PlanStore._validate_snapshot({
+                "version": 3,
+                "steps": [{
+                    "text": "检查计划",
+                    "completion_criteria": "检查实际结果",
+                    "required_tools": [],
+                    "status": "blocked",
+                }],
+                "progress": {
+                    "step_index": 1,
+                    "phase": "tool_result_returned",
+                    "last_tool": "read_file",
+                    "last_result": "PRIVATE_FILE_CONTENT",
+                    "interruption_cause": "process_restarted",
+                },
+                "unverified_steps": [],
+            })
+        with self.assertRaisesRegex(PlanError, "待核验步骤索引"):
+            PlanStore._validate_snapshot({
+                "version": 3,
+                "steps": [{
+                    "text": "检查计划",
+                    "completion_criteria": "检查实际结果",
+                    "required_tools": [],
+                    "status": "blocked",
+                }],
+                "progress": None,
+                "unverified_steps": [True],
+            })
+        with self.assertRaises(PlanError):
+            PlanStore._validate_snapshot({
+                "version": 3,
+                "steps": [{
+                    "text": "检查计划",
+                    "completion_criteria": "检查实际结果",
+                    "required_tools": [],
+                    "status": "blocked",
+                }],
+                "progress": {
+                    "step_index": 1,
+                    "phase": "tool_result_returned",
+                    "last_tool": "read_file /private/path",
+                    "last_result": "returned_redacted",
+                    "interruption_cause": "process_restarted",
+                },
+                "unverified_steps": [],
+            })
+
+    def test_questionnaire_progress_says_answer_was_not_archived(self) -> None:
+        text = _plan_progress_text(
+            PlanProgress(1, "local_interaction", "ask_user", "approval_pending", "cancelled")
+        )
+        self.assertIn("问卷回答未存档", text)
+        self.assertIn("可能需要重新回答", text)
+        self.assertNotIn("工具尚未获批", text)
 
 
 class PlanProposalProtocolTests(unittest.TestCase):
@@ -266,7 +491,7 @@ class PlanProposalCliTests(unittest.TestCase):
             self.assertTrue(any("已接受并保存" in line for line in outputs))
             saved = Path(temp) / ".harness" / "plans" / "current.json"
             payload = json.loads(saved.read_text(encoding="utf-8"))
-            self.assertEqual(payload["version"], 2)
+            self.assertEqual(payload["version"], 3)
             self.assertEqual(set(payload["steps"][0]), {"text", "completion_criteria", "required_tools", "status"})
             self.assertNotIn("模拟", saved.read_text(encoding="utf-8"))
             self.assertEqual(snapshot, PlanStore(Workspace(temp)).load())
@@ -368,11 +593,66 @@ class PlanProposalCliTests(unittest.TestCase):
 
 
 class PlanCliTests(unittest.TestCase):
-    def test_interrupted_saved_step_returns_to_pending_and_needs_confirmation(self) -> None:
+    def test_legacy_plan_verifies_each_step_without_starting_agent_early(self) -> None:
+        class FinalProvider:
+            label = "offline-legacy-plan-resume-test"
+            model = "synthetic"
+
+            def __init__(self, workspace: str) -> None:
+                self.workspace = workspace
+                self.calls = 0
+
+            def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                del messages, tools, cancellation_event, max_tokens
+                self.calls += 1
+                plan = PlanStore(Workspace(self.workspace)).load()
+                if self.calls == 1:
+                    if plan.unverified_steps != ():
+                        raise AssertionError("legacy steps must all be verified before any provider request")
+                    return AssistantTurn("已从空白 Agent 开始核验最后一步。")
+                raise AssertionError("the resume fixture must use one provider request")
+
+        with local_temp() as temp:
+            path = Path(temp) / ".harness" / "plans" / "current.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({
+                "version": 2,
+                "steps": [
+                    {
+                        "text": f"旧版合成步骤 {index}",
+                        "status": "pending",
+                        "completion_criteria": "检查合成结果",
+                        "required_tools": [],
+                    }
+                    for index in (1, 2)
+                ],
+            }), encoding="utf-8")
+            provider = FinalProvider(temp)
+            inputs = iter([
+                "/继续 核验 1", "是",
+                "/继续 核验 2", "是",
+                "/退出",
+            ])
+            outputs: list[str] = []
+            args = SimpleNamespace(workspace=temp, provider="mock", model=None)
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                rc = run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append)
+
+            current = PlanStore(Workspace(temp)).load()
+            self.assertEqual(rc, 0)
+            self.assertEqual(provider.calls, 1)
+            self.assertIn("全部核验前不会启动 Agent", "\n".join(outputs))
+            self.assertIn("尚未启动模型", "\n".join(outputs))
+            self.assertEqual(current.unverified_steps, ())
+            self.assertEqual(current.steps[0].status, "blocked")
+            self.assertEqual(current.steps[1].status, "in-progress")
+
+    def test_interrupted_saved_step_blocks_and_resume_decline_makes_no_provider_request(self) -> None:
         with local_temp() as temp:
             store = PlanStore(Workspace(temp))
             store.add("只读的恢复测试步骤")
             store.transition(1, "in-progress")
+            store.record_progress(1, "provider_request")
 
             class NoRequestProvider:
                 label = "offline-recovery-test"
@@ -382,16 +662,191 @@ class PlanCliTests(unittest.TestCase):
                     del args, kwargs
                     raise AssertionError("declined resumed task must not contact provider")
 
-            inputs = iter(["/计划", "/计划 执行 1", "n", "/退出"])
+            inputs = iter(["/计划", "/继续 1", "n", "/退出"])
             outputs: list[str] = []
             args = SimpleNamespace(workspace=temp, provider="mock", model=None)
             with patch("cvfx_harness.cli.provider_from_environment", return_value=NoRequestProvider()):
                 rc = run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append)
 
             self.assertEqual(rc, 0)
-            self.assertTrue(any("退回 pending" in line for line in outputs))
-            self.assertIn("模型请求未发出", "\n".join(outputs))
-            self.assertEqual(PlanStore(Workspace(temp)).load().steps[0].status, "pending")
+            self.assertTrue(any("已设为受阻" in line for line in outputs))
+            self.assertIn("尚未确认继续", "\n".join(outputs))
+            self.assertEqual(PlanStore(Workspace(temp)).load().steps[0].status, "blocked")
+
+    def test_unknown_tool_outcome_cannot_continue_without_explicit_verification(self) -> None:
+        class NoRequestProvider:
+            label = "offline-unknown-resume-test"
+            model = "synthetic"
+
+            def complete(self, *args, **kwargs):
+                del args, kwargs
+                raise AssertionError("unknown tool call must not be replayed before verification")
+
+        with local_temp() as temp:
+            store = PlanStore(Workspace(temp))
+            store.add("检查可能已写入的合成文件")
+            store.transition(1, "in-progress")
+            store.record_progress(1, "tool_execution", "write_file")
+            recovered = store.recover_unfinished()
+            self.assertEqual(recovered.steps[0].status, "blocked")
+
+            inputs = iter(["/继续 1", "/计划", "/继续 核验 1", "n", "/退出"])
+            prompts: list[str] = []
+            outputs: list[str] = []
+
+            def input_fn(prompt: str) -> str:
+                prompts.append(prompt)
+                return next(inputs)
+
+            args = SimpleNamespace(workspace=temp, provider="mock", model=None)
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=NoRequestProvider()):
+                rc = run_console(args, input_fn=input_fn, output=outputs.append)
+
+            self.assertEqual(rc, 0)
+            self.assertIn("上次工具可能已执行，但结果未知", "\n".join(outputs))
+            self.assertTrue(any("确认已核验" in prompt for prompt in prompts))
+            self.assertEqual(store.load().steps[0].status, "blocked")
+            self.assertEqual(store.load().progress.last_result, "outcome_unknown")
+
+    def test_verified_resume_starts_fresh_agent_only_after_explicit_confirmation(self) -> None:
+        class FinalProvider:
+            label = "offline-verified-resume-test"
+            model = "synthetic"
+
+            def __init__(self) -> None:
+                self.requests: list[list[dict[str, object]]] = []
+
+            def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                del cancellation_event, max_tokens
+                self.requests.append([dict(message) for message in messages])
+                self.assert_no_tool_replay(tools)
+                return AssistantTurn("已开始重新检查。")
+
+            @staticmethod
+            def assert_no_tool_replay(tools):
+                if not tools:
+                    raise AssertionError("a fresh plan-step agent must have its bounded tools")
+
+        with local_temp() as temp:
+            store = PlanStore(Workspace(temp))
+            store.add("检查已核验的合成状态")
+            store.transition(1, "in-progress")
+            store.record_progress(1, "tool_execution", "write_file")
+            store.recover_unfinished()
+            provider = FinalProvider()
+            inputs = iter(["/继续 核验 1", "是", "/退出"])
+            prompts: list[str] = []
+            outputs: list[str] = []
+
+            def input_fn(prompt: str) -> str:
+                prompts.append(prompt)
+                return next(inputs)
+
+            args = SimpleNamespace(workspace=temp, provider="mock", model=None)
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                rc = run_console(args, input_fn=input_fn, output=outputs.append)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(provider.requests), 1)
+            self.assertEqual(
+                [message["role"] for message in provider.requests[0]], ["system", "user"]
+            )
+            user_message = provider.requests[0][1]["content"]
+            self.assertIn("检查已核验的合成状态", user_message)
+            self.assertNotIn("PRIVATE_TOOL_RESULT", json.dumps(provider.requests, ensure_ascii=False))
+            self.assertTrue(any("确认已核验" in prompt for prompt in prompts))
+            self.assertFalse(any("确认开始此步骤" in prompt for prompt in prompts))
+            current = store.load()
+            self.assertEqual(current.steps[0].status, "in-progress")
+            self.assertEqual(current.progress.last_result, "user_verified")
+            self.assertIn("已开始重新检查", "\n".join(outputs))
+
+    def test_side_effect_before_result_checkpoint_recovers_as_unknown(self) -> None:
+        class WriteProvider:
+            label = "offline-write-recovery-test"
+            model = "synthetic"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                del messages, tools, cancellation_event, max_tokens
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantTurn("", [ToolCall(
+                        "synthetic-write", "write_file",
+                        {"path": "written.txt", "content": "SYNTHETIC_WRITTEN_CONTENT"},
+                    )])
+                raise AssertionError("a failed progress checkpoint must stop before another request")
+
+        with local_temp() as temp:
+            provider = WriteProvider()
+            inputs = iter(["/计划 添加 写入合成文件", "/计划 执行 1", "是", "是", "/退出"])
+            outputs: list[str] = []
+            args = SimpleNamespace(workspace=temp, provider="mock", model=None)
+            original = PlanStore.record_progress
+
+            def fail_result_checkpoint(store, index, event, tool=None):
+                if event == "tool_result":
+                    raise PlanError("synthetic checkpoint interruption")
+                return original(store, index, event, tool)
+
+            with (
+                patch("cvfx_harness.cli.provider_from_environment", return_value=provider),
+                patch.object(PlanStore, "record_progress", fail_result_checkpoint),
+            ):
+                rc = run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(provider.calls, 1)
+            written = Path(temp, "written.txt")
+            self.assertEqual(written.read_text(encoding="utf-8"), "SYNTHETIC_WRITTEN_CONTENT")
+            snapshot = PlanStore(Workspace(temp)).load()
+            self.assertEqual(snapshot.steps[0].status, "blocked")
+            self.assertEqual(snapshot.progress.phase, "tool_execution")
+            self.assertEqual(snapshot.progress.last_result, "outcome_unknown")
+            saved = (Path(temp) / ".harness" / "plans" / "current.json").read_text(encoding="utf-8")
+            self.assertNotIn("written.txt", saved)
+            self.assertNotIn("SYNTHETIC_WRITTEN_CONTENT", saved)
+            self.assertIn("结果：执行结果未知", "\n".join(outputs))
+            self.assertIn("/继续 核验 1", "\n".join(outputs))
+
+    def test_cancellation_while_waiting_for_tool_approval_is_not_executed(self) -> None:
+        class ReadProvider:
+            label = "offline-approval-interrupt-test"
+            model = "synthetic"
+
+            def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                del messages, tools, cancellation_event, max_tokens
+                return AssistantTurn("", [ToolCall(
+                    "synthetic-read", "read_file", {"path": "private/path.txt"}
+                )])
+
+        with local_temp() as temp:
+            Path(temp, "private").mkdir()
+            Path(temp, "private", "path.txt").write_text("SYNTHETIC_PRIVATE_CONTENT", encoding="utf-8")
+            inputs = iter(["/计划 添加 读取合成文件", "/计划 执行 1", "是", "/退出"])
+            outputs: list[str] = []
+            args = SimpleNamespace(workspace=temp, provider="mock", model=None)
+
+            def input_fn(prompt: str) -> str:
+                if "确认读取？" in prompt:
+                    raise KeyboardInterrupt
+                return next(inputs)
+
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=ReadProvider()):
+                rc = run_console(args, input_fn=input_fn, output=outputs.append)
+
+            self.assertEqual(rc, 0)
+            snapshot = PlanStore(Workspace(temp)).load()
+            self.assertEqual(snapshot.steps[0].status, "cancelled")
+            self.assertEqual(snapshot.progress.phase, "tool_approval")
+            self.assertEqual(snapshot.progress.last_tool, "read_file")
+            self.assertEqual(snapshot.progress.last_result, "approval_pending")
+            saved = (Path(temp) / ".harness" / "plans" / "current.json").read_text(encoding="utf-8")
+            self.assertNotIn("private/path.txt", saved)
+            self.assertNotIn("SYNTHETIC_PRIVATE_CONTENT", saved)
+            self.assertIn("工具尚未获批，未执行", "\n".join(outputs))
 
     def test_provider_failure_is_blocked_redacted_and_retryable(self) -> None:
         class FailingProvider:
@@ -414,8 +869,8 @@ class PlanCliTests(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             combined = "\n".join(outputs)
-            self.assertIn("[blocked]", combined)
-            self.assertIn("[pending]", combined)
+            self.assertIn("[受阻]", combined)
+            self.assertIn("[待办]", combined)
             self.assertNotIn("PRIVATE_PROVIDER_ERROR_SENTINEL", combined)
             self.assertEqual(PlanStore(Workspace(temp)).load().steps[0].status, "pending")
 
@@ -436,7 +891,7 @@ class PlanCliTests(unittest.TestCase):
                 rc = run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append)
 
             self.assertEqual(rc, 0)
-            self.assertIn("状态为 cancelled", "\n".join(outputs))
+            self.assertIn("[已取消]", "\n".join(outputs))
             self.assertEqual(PlanStore(Workspace(temp)).load().steps[0].status, "cancelled")
 
     def test_each_step_uses_fresh_bounded_agent_and_keeps_tool_approval_per_call(self) -> None:
@@ -493,7 +948,7 @@ class PlanCliTests(unittest.TestCase):
             self.assertNotIn("第二步不应进入", second_execution_user)
             combined = "\n".join(outputs)
             self.assertEqual(sum(prompt.startswith("确认写入") for prompt in prompts), 2)
-            self.assertIn("[completed]", combined)
+            self.assertIn("[已完成]", combined)
             self.assertIn("步骤检查完成。", combined)
 
     def test_plan_step_retains_read_approval_and_excludes_session_tool_history(self) -> None:

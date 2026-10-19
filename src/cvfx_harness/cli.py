@@ -38,7 +38,7 @@ from .providers import (
     ProviderStreamError,
     provider_from_environment,
 )
-from .plans import MAX_PLAN_STEPS, MAX_STEP_CHARS, PlanDraft, PlanError, PlanSnapshot, PlanStore, PlanStatus
+from .plans import MAX_PLAN_STEPS, MAX_STEP_CHARS, PlanDraft, PlanError, PlanProgress, PlanSnapshot, PlanStore, PlanStatus
 from .profiles import TestProfileError, TestProfileStore
 from .questions import (
     MAX_ANSWER_BYTES,
@@ -64,7 +64,7 @@ _TRAILING_PUNCTUATION = ",，。;；!?！？)]}"
 MAX_MULTILINE_INPUT_BYTES = 64 * 1024
 _CLI_COMMANDS = (
     "/帮助", "/命令", "/状态", "/模式", "/目标", "/计划", "/保存", "/检查点",
-    "/恢复", "/会话", "/多行", "/压缩", "/统计", "/预算", "/配置", "/测试", "/子代理",
+    "/恢复", "/继续", "/会话", "/多行", "/压缩", "/统计", "/预算", "/配置", "/测试", "/子代理",
     "/变更集", "/撤销", "/快捷键", "/按键", "/退出",
 )
 _CLI_ENUM_ARGUMENTS = {
@@ -72,6 +72,7 @@ _CLI_ENUM_ARGUMENTS = {
     "/测试": ("列表", "添加", "运行", "移除"),
     "/压缩": ("撤销",),
     "/计划": ("生成", "显示", "修订", "接受", "拒绝", "添加", "执行", "完成", "阻塞", "取消", "重试", "清空"),
+    "/继续": ("核验",),
     "/配置": ("显示", "编辑", "重置", "提供商", "模型", "端点", "预算", "输出上限"),
     "/变更集": ("列表", "证据", "恢复"),
 }
@@ -484,6 +485,100 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _plan_progress_text(progress: PlanProgress | None) -> str:
+    if progress is None:
+        return "最近工具结果：尚无中断记录。"
+    tool_labels = {
+        "read_file": "读取文件",
+        "list_directory": "列出目录",
+        "search_text": "工作区搜索",
+        "write_file": "写入文件",
+        "patch_file": "精确补丁",
+        "apply_change_set": "多文件变更集",
+        "run_test_profile": "用户测试",
+        "ask_user": "本地问卷",
+    }
+    result_labels = {
+        "none": "尚无工具结果",
+        "approval_pending": "工具尚未获批，未执行",
+        "not_executed": "工具未执行",
+        "outcome_unknown": "执行结果未知，继续前必须核验工作区",
+        "returned_redacted": "工具已返回结果；为保护文件引用/问卷等内容，详情未存档",
+        "user_verified": "上次未知结果已由用户核验；之前的工具不会重放",
+    }
+    phase_labels = {
+        "provider_request": "模型请求或流式输出期间",
+        "tool_approval": "工具等待审批期间",
+        "local_interaction": "本地问卷交互期间",
+        "tool_execution": "工具获批后执行期间",
+        "tool_result_returned": "工具返回结果后、交回模型前",
+        "finished": "模型已结束当前步骤，等待用户检查",
+        "unknown": "旧版/缺失阶段记录",
+    }
+    cause_labels = {
+        "none": "无已记录中断",
+        "cancelled": "用户取消或中断",
+        "provider_or_tool_error": "模型/工具请求错误（详细错误未存档）",
+        "process_restarted": "进程重启时发现步骤未完成",
+        "legacy_state_unknown": "旧存档没有执行阶段，结果无法判定",
+    }
+    tool = tool_labels.get(progress.last_tool, "工具类型未知")
+    if not progress.last_tool and progress.last_result == "none":
+        tool = "尚无工具调用"
+    result = result_labels.get(progress.last_result, "状态未知")
+    if progress.phase == "local_interaction" or progress.last_tool == "ask_user":
+        if progress.last_result in {"approval_pending", "not_executed"}:
+            result = "问卷回答未存档；继续时可能需要重新回答"
+    return (
+        f"最近工具：{tool}；结果：{result}\n"
+        f"中断位置：{phase_labels.get(progress.phase, '阶段未知')}；"
+        f"原因：{cause_labels.get(progress.interruption_cause, '原因未知')}"
+    )
+
+
+def _plan_snapshot_text(snapshot: PlanSnapshot) -> str:
+    status_labels = {
+        "pending": "待办",
+        "in-progress": "进行中",
+        "completed": "已完成",
+        "blocked": "受阻",
+        "cancelled": "已取消",
+    }
+    lines = [
+        f"  {index}. [{status_labels.get(step.status, '状态未知')}] {_safe_terminal_text(step.text)}\n"
+        f"     完成条件：{_safe_terminal_text(step.completion_criteria)}\n"
+        f"     建议工具（不构成授权）：{_safe_terminal_text('、'.join(step.required_tools) or '无')}"
+        for index, step in enumerate(snapshot.steps, 1)
+    ]
+    if snapshot.progress is not None:
+        lines.append(_plan_progress_text(snapshot.progress))
+        if snapshot.progress.last_result == "outcome_unknown":
+            lines.append("恢复不会自动重试；先用 /继续 核验 <编号> 检查工作区，再重新确认步骤。")
+        else:
+            lines.append("恢复会创建新的空白 Agent；之前的工具调用和审批不会重放或延续。")
+    if snapshot.unverified_steps:
+        numbers = "、".join(str(index) for index in snapshot.unverified_steps)
+        lines.append(
+            f"旧版计划没有执行阶段记录；第 {numbers} 步都需分别核验。"
+            "全部核验前不会启动 Agent。"
+        )
+    return "\n".join(lines)
+
+
+def _plan_continue_command(snapshot: PlanSnapshot, index: int) -> str:
+    progress = snapshot.progress
+    if (
+        index in snapshot.unverified_steps
+        or (
+            progress is not None
+            and progress.step_index == index
+            and progress.last_result == "outcome_unknown"
+        )
+    ):
+        return f"/继续 核验 {index}"
+    return f"/继续 {index}"
+
+
 def _help_text() -> str:
     return """命令：
   /帮助              显示帮助
@@ -498,7 +593,9 @@ def _help_text() -> str:
   /计划 添加 <步骤>  添加一条用户自写步骤（最多 3 条）
   /计划 执行 <编号>  确认后执行一步；每项工具仍单独审批，完成状态需人工确认
   /计划 完成|阻塞|取消 <编号>
-  /计划 重试 <编号>  将受阻/取消步骤退回待办，再次执行仍需确认
+  /继续 <编号>      检查并继续被阻塞或中断的计划步骤
+  /继续 核验 <编号> 工具结果未知或旧计划缺阶段记录时，逐步检查当前工作区
+  /计划 重试 <编号> 将受阻/取消步骤退回待办；结果未知时必须先 /继续 核验
   /计划 清空        确认后清除当前计划
   /保存 [名称]       将可安全保存的普通对话保存到工作区 .harness/sessions/
   /检查点 <名称>    输入一段手写脱敏摘要；预览并确认后仅保存该摘要
@@ -1104,9 +1201,19 @@ def run_console(
 
     try:
         prior_plan = plan_store.load()
-        plan_store.recover_unfinished()
+        recovered_plan = plan_store.recover_unfinished()
         if any(step.status == "in-progress" for step in prior_plan.steps):
-            output("已恢复上次中断的计划：进行中步骤已退回 pending；继续前必须重新确认。")
+            output(
+                "检测到上次进程中断；计划步骤已设为受阻，不会自动续跑。"
+                "下面只显示已完成/待办状态及固定阶段摘要，不含工具参数、文件内容、问卷答案或测试输出：\n"
+                + _plan_snapshot_text(recovered_plan)
+                + "\n检查当前工作区后，使用 /继续 <编号>；结果未知或旧版没有阶段记录时，必须使用 /继续 核验 <编号>。"
+            )
+        elif recovered_plan.unverified_steps:
+            output(
+                "检测到旧版计划没有执行阶段记录；所有未完成步骤已设为受阻，结果按未知处理，不会自动续跑。\n"
+                + _plan_snapshot_text(recovered_plan)
+            )
     except PlanError as exc:
         output(f"计划恢复失败：{exc}。本次不会自动执行或覆盖计划存档。")
     output(
@@ -1158,6 +1265,132 @@ def run_console(
             continue
         command, _, argument = stripped.partition(" ")
         command = command.casefold()
+        resume_confirmed = False
+
+        if command in {"/继续", "/resume"}:
+            parts = argument.strip().split()
+            verify_requested = bool(parts and parts[0].casefold() in {"核验", "verify"})
+            if verify_requested:
+                parts = parts[1:]
+            snapshot = plan_store.load()
+            candidates = [
+                index
+                for index, step in enumerate(snapshot.steps, 1)
+                if step.status in {"blocked", "cancelled"}
+            ]
+            if len(parts) > 1 or (parts and not parts[0].isdecimal()):
+                output("用法：/继续 <步骤编号>；未知工具结果需 /继续 核验 <步骤编号>。")
+                continue
+            if parts:
+                index = int(parts[0])
+            elif len(candidates) == 1:
+                index = candidates[0]
+            else:
+                output("请指定一个受阻/取消步骤编号：/继续 <步骤编号>。")
+                continue
+            if not 1 <= index <= len(snapshot.steps):
+                output("步骤编号不存在。")
+                continue
+            step = snapshot.steps[index - 1]
+            if step.status not in {"blocked", "cancelled"}:
+                output(f"第 {index} 步状态为 {step.status}；只有受阻、取消或重启中断的步骤可继续。")
+                continue
+            progress = (
+                snapshot.progress
+                if snapshot.progress is not None and snapshot.progress.step_index == index
+                else None
+            )
+            legacy_unverified = index in snapshot.unverified_steps
+            unknown_outcome = legacy_unverified or (
+                progress is not None and progress.last_result == "outcome_unknown"
+            )
+            unresolved_progress = (
+                snapshot.progress
+                if snapshot.progress is not None
+                and snapshot.progress.last_result == "outcome_unknown"
+                else None
+            )
+            if unresolved_progress is not None and unresolved_progress.step_index != index:
+                output(
+                    f"第 {unresolved_progress.step_index} 步仍有未知工具结果；"
+                    f"请先检查工作区并执行 /继续 核验 {unresolved_progress.step_index}。"
+                )
+                continue
+            if unknown_outcome and not verify_requested:
+                if legacy_unverified:
+                    warning = (
+                        "旧版计划没有执行阶段记录，无法判断此步是否曾运行。"
+                        "不会自动续跑；请逐项检查当前工作区，再使用 /继续 核验 "
+                    )
+                else:
+                    warning = (
+                        "上次工具可能已执行，但结果未知。不会自动重试。请先检查下面显示的当前工作区，"
+                        "再输入 /继续 核验 "
+                    )
+                output(
+                    f"{warning}{index}；历史调用参数和目标路径未存档。\n"
+                    + _plan_snapshot_text(snapshot)
+                )
+                continue
+            if verify_requested and not unknown_outcome:
+                output("此步骤没有未知工具结果；请用 /继续 <编号> 重新审阅。")
+                continue
+
+            output(
+                "继续前的工作区复核：程序将检查工作区根目录和未完成变更集；不会读取旧工具目标、参数或输出。\n"
+                f"当前路径：{_safe_terminal_text(str(workspace.root))}\n"
+                + _plan_snapshot_text(snapshot)
+                + "\n恢复会创建新的空白 Agent；旧工具调用和审批不会重放或延续，后续每项工具仍须按当前工作区重新审批。"
+            )
+            try:
+                workspace.resolve_directory(".")
+                incomplete = workspace.describe_incomplete_change_sets()
+            except WorkspaceError as exc:
+                output(f"无法安全检查当前工作区；未继续执行：{_safe_error_text(exc)}")
+                continue
+            if not incomplete.startswith("没有未完成的多文件变更集"):
+                output("工作区仍有未完成变更集或不确定备份证据；先处理后再继续：\n" + incomplete)
+                continue
+            if unknown_outcome:
+                try:
+                    reviewed = input_fn(
+                        "请先检查可能受影响的文件/测试状态；确认已核验并允许重新开始该步骤？[y/N] "
+                    )
+                except (EOFError, KeyboardInterrupt):
+                    output("核验确认已取消；步骤和中断记录未改变。")
+                    continue
+                if not _is_affirmative_answer(reviewed):
+                    output("尚未确认核验；步骤和中断记录未改变。")
+                    continue
+            else:
+                try:
+                    reviewed = input_fn(
+                        f"请检查当前工作区最近一次工具可能造成的影响；确认启动新的 Agent 并继续第 {index} 步？[y/N] "
+                    )
+                except (EOFError, KeyboardInterrupt):
+                    output("继续确认已取消；步骤和中断记录未改变。")
+                    continue
+                if not _is_affirmative_answer(reviewed):
+                    output("尚未确认继续；步骤和中断记录未改变。")
+                    continue
+            try:
+                prepared = plan_store.prepare_resume(
+                    index,
+                    expected_snapshot=snapshot,
+                    verified_unknown_outcome=unknown_outcome,
+                )
+            except PlanError as exc:
+                output(f"未准备继续：{exc}")
+                continue
+            if prepared.steps[index - 1].status != "pending":
+                output(
+                    "该旧版步骤已由你核验；其余旧版步骤仍需分别核验，尚未启动模型。\n"
+                    + _plan_snapshot_text(prepared)
+                )
+                continue
+            resume_confirmed = True
+            command = "/计划"
+            argument = f"执行 {index}"
 
         if command in {"/帮助", "/help"}:
             output(_help_text())
@@ -1513,15 +1746,9 @@ def run_console(
                     if not snapshot.steps:
                         output("当前没有计划步骤。用 /计划 生成 [需求] 获取候选，或用 /计划 添加 <步骤> 手工添加。")
                     else:
-                        statuses = "\n".join(
-                            f"  {index}. [{step.status}] {_safe_terminal_text(step.text)}\n"
-                            f"     完成条件：{_safe_terminal_text(step.completion_criteria)}\n"
-                            f"     建议工具：{_safe_terminal_text('、'.join(step.required_tools) or '无')}"
-                            for index, step in enumerate(snapshot.steps, 1)
-                        )
                         output(
-                            "当前计划（只保存步骤、完成条件、建议工具与状态；不保存模型输出、工具结果或审批）：\n"
-                            + statuses
+                            "当前计划（步骤、状态及固定执行阶段；不保存模型输出、工具参数、文件内容、问卷答案、测试输出或审批）：\n"
+                            + _plan_snapshot_text(snapshot)
                             + "\n执行上限：每次只运行一步，最多 2 次模型请求、512 输出 tokens；"
                             "所有工具仍逐次审批；会话目标仅作不可信上下文，步骤本身限定任务范围。"
                         )
@@ -1669,23 +1896,28 @@ def run_console(
                     f"建议工具：{_safe_terminal_text('、'.join(step.required_tools) or '无')}\n"
                     "运行时使用新的空白会话，不携带其他步骤或历史工具结果；每项工具仍单独审批。"
                 )
-                try:
-                    answer = input_fn("确认开始此步骤？[y/N] ")
-                except (EOFError, KeyboardInterrupt):
-                    output("已取消；步骤仍为 pending，模型请求未发出。")
-                    continue
-                if not _is_affirmative_answer(answer):
-                    output("已取消；步骤仍为 pending，模型请求未发出。")
-                    continue
+                if not resume_confirmed:
+                    try:
+                        answer = input_fn("确认开始此步骤？[y/N] ")
+                    except (EOFError, KeyboardInterrupt):
+                        output("已取消；步骤仍为 pending，模型请求未发出。")
+                        continue
+                    if not _is_affirmative_answer(answer):
+                        output("已取消；步骤仍为 pending，模型请求未发出。")
+                        continue
 
-                running_snapshot = plan_store.transition(
+                plan_store.transition(
                     index,
                     "in-progress",
                     expected_text=step.text,
                     expected_status="pending",
                     expected_step=step,
                 )
-                running_step = running_snapshot.steps[index - 1]
+                plan_store.record_progress(index, "provider_request")
+
+                def on_plan_progress(event: str, tool_name: str | None) -> None:
+                    plan_store.record_progress(index, event, tool_name)
+
                 step_agent = Agent(
                     provider,
                     workspace,
@@ -1722,28 +1954,42 @@ def run_console(
                         plan_only=False,
                         cancellation_event=cancellation_event,
                         on_text_delta=on_plan_delta if sse_streaming else None,
+                        on_progress=on_plan_progress,
                     )
                 except (KeyboardInterrupt, ProviderCancelled):
                     end_plan_stream()
-                    plan_store.transition(
-                        index,
-                        "cancelled",
-                        expected_text=step.text,
-                        expected_status="in-progress",
-                        expected_step=running_step,
-                    )
-                    output(f"第 {index} 步已取消；状态为 cancelled。已获批的先前操作不会自动回滚；可用 /计划 重试 {index} 重新确认。")
+                    try:
+                        interrupted = plan_store.mark_interrupted(
+                            index, cause="cancelled", cancelled=True
+                        )
+                        output(
+                            f"第 {index} 步已取消；已获批的先前操作不会自动回滚。\n"
+                            + _plan_snapshot_text(interrupted)
+                            + f"\n检查工作区后用 {_plan_continue_command(interrupted, index)} 重新审阅。"
+                        )
+                    except PlanError:
+                        output(
+                            f"第 {index} 步已取消，但中断状态未能写入计划存档；"
+                            "请检查 /计划 和当前工作区，不会自动续跑。"
+                        )
                     continue
                 except Exception:
                     end_plan_stream()
-                    plan_store.transition(
-                        index,
-                        "blocked",
-                        expected_text=step.text,
-                        expected_status="in-progress",
-                        expected_step=running_step,
-                    )
-                    output(f"第 {index} 步未能完成模型请求；状态为 blocked。先前获批的文件操作不会自动回滚；可用 /计划 重试 {index} 再次确认。")
+                    try:
+                        interrupted = plan_store.mark_interrupted(
+                            index, cause="provider_or_tool_error", cancelled=False
+                        )
+                        output(
+                            f"第 {index} 步因模型或工具错误受阻；错误详情未存档。"
+                            "先前获批的文件操作不会自动回滚。\n"
+                            + _plan_snapshot_text(interrupted)
+                            + f"\n检查工作区后用 {_plan_continue_command(interrupted, index)} 重新审阅。"
+                        )
+                    except PlanError:
+                        output(
+                            f"第 {index} 步遇到模型或工具错误，但中断状态未能写入计划存档；"
+                            "请检查 /计划 和当前工作区，不会自动续跑。"
+                        )
                     continue
 
                 if sse_streaming and step_stream["received"]:

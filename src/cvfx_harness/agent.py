@@ -241,6 +241,7 @@ class Agent:
         plan_only: bool = False,
         cancellation_event: threading.Event | None = None,
         on_text_delta: Callable[[str], None] | None = None,
+        on_progress: Callable[[str, str | None], None] | None = None,
     ) -> str:
         references = references or []
         content = self._user_content(user_text, self.goal, references)
@@ -292,6 +293,8 @@ class Agent:
                     complete_streaming = getattr(self.provider, "complete_streaming", None)
                     if not callable(complete_streaming):
                         raise ProviderError("当前提供商不支持 SSE 流式响应。")
+                if on_progress is not None:
+                    on_progress("provider_request", None)
                 self.usage.record_request(estimated_input)
                 try:
                     if complete_streaming is None:
@@ -432,6 +435,8 @@ class Agent:
                 self._rebuild_messages()
 
                 if not response.tool_calls:
+                    if on_progress is not None:
+                        on_progress("finished", None)
                     self._finalize_session_retention(turn)
                     turn.complete = True
                     self._compression_checkpoint = None
@@ -440,6 +445,8 @@ class Agent:
                 reached_round_limit = round_index + 1 >= self.max_provider_requests
                 reached_output_limit = consumed_output_tokens >= self.max_output_tokens
                 for index, call in enumerate(response.tool_calls):
+                    approval_state: dict[str, bool | None] = {"seen": False, "approved": None}
+                    tool_not_executed = False
                     if reached_round_limit:
                         result = "已达到工具轮数上限；该调用未执行。"
                     elif reached_output_limit:
@@ -448,16 +455,35 @@ class Agent:
                         result = "本轮工具调用数超过本地上限；该调用未执行。"
                     else:
                         self._raise_if_cancelled(cancellation_event)
+                        if on_progress is not None:
+                            on_progress(
+                                "tool_interaction" if call.name == "ask_user" else "tool_approval",
+                                call.name,
+                            )
+
+                        def tracked_approval(request: Any) -> bool:
+                            approved = self.approve_action(request)
+                            if not approval_state["seen"]:
+                                approval_state["seen"] = True
+                                approval_state["approved"] = approved
+                                if on_progress is not None:
+                                    on_progress(
+                                        "tool_execution" if approved else "tool_denied",
+                                        call.name,
+                                    )
+                            return approved
+
                         try:
                             if call.name == "run_test_profile" and test_execution_used:
                                 result = "本次提问已请求过测试运行；未再次启动测试进程。"
+                                tool_not_executed = True
                             else:
                                 if call.name == "run_test_profile":
                                     test_execution_used = True
                                 result = run_tool(
                                     self.workspace,
                                     call,
-                                    approve_action=self.approve_action,
+                                    approve_action=tracked_approval,
                                     plan_only=plan_only,
                                     cancellation_event=cancellation_event,
                                     test_profile_store=self.test_profile_store,
@@ -481,6 +507,18 @@ class Agent:
                                 )
                         except WorkspaceError as exc:
                             result = f"操作被工作区策略阻止：{exc}"
+                            if on_progress is not None:
+                                on_progress("tool_error", call.name)
+                        else:
+                            if on_progress is not None:
+                                on_progress(
+                                    "tool_not_executed"
+                                    if approval_state["approved"] is False or tool_not_executed
+                                    else "tool_result",
+                                    call.name,
+                                )
+                    if (reached_round_limit or reached_output_limit or index >= MAX_TOOL_CALLS_PER_ROUND) and on_progress is not None:
+                        on_progress("tool_not_executed", call.name)
                     if call.name == "ask_user":
                         self._record_questionnaire_outcome(turn, call, result)
                     turn.messages.append(
@@ -499,6 +537,8 @@ class Agent:
                     else:
                         answer = "已达到工具轮数上限。本次未执行最后一轮工具调用。"
                     turn.messages.append({"role": "assistant", "content": answer})
+                    if on_progress is not None:
+                        on_progress("finished", None)
                     self._finalize_session_retention(turn)
                     turn.complete = True
                     self._rebuild_messages()

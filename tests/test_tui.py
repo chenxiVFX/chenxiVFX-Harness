@@ -598,7 +598,7 @@ class PromptToolkitTests(unittest.TestCase):
                 pipe.send_text("/计划 接受\r")
                 self._wait_until(lambda: "已接受并保存" in ui._transcript, "proposal was not accepted")
                 pipe.send_text("/计划\r")
-                self._wait_until(lambda: "[pending] 检查中文界面" in ui._transcript, "accepted step was not displayed")
+                self._wait_until(lambda: "[待办] 检查中文界面" in ui._transcript, "accepted step was not displayed")
                 pipe.send_text("/退出\r")
 
             _ui, rc = self._run_cli_ui(workspace, provider, drive)

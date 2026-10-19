@@ -36,6 +36,8 @@ class OfflineWalkthroughProvider:
     def __init__(self, source_sha256: str, log_path: Path) -> None:
         self.source_sha256 = source_sha256
         self.log_path = log_path
+        self.plan_read_started = False
+        self.plan_interrupt_after_result = False
         self.synthetic_workspace = log_path.parent / "合成工作区"
         self.synthetic_hashes = {
             relative: hashlib.sha256((self.synthetic_workspace / relative).read_bytes()).hexdigest()
@@ -77,6 +79,14 @@ class OfflineWalkthroughProvider:
                     break
             result = str(last.get("content", ""))
             self._log({"kind": "tool_result", "tool": call_name, "denied": "拒绝" in result})
+            if call_name == "read_file" and "confirmed-plan-step" in task_text:
+                if not self.plan_interrupt_after_result:
+                    self.plan_interrupt_after_result = True
+                    self._log({"kind": "plan_interrupt_after_tool_result"})
+                    from cvfx_harness.providers import ProviderCancelled
+
+                    raise ProviderCancelled("synthetic interruption after tool result")
+                return self._turn("已从空白 Agent 重新检查步骤；历史工具结果没有重放。")
             if call_name == "ask_user":
                 try:
                     questionnaire = json.loads(result)
@@ -158,7 +168,10 @@ class OfflineWalkthroughProvider:
                 {"questions": [{"id": "private-scope", "question": "仅本次使用的合成答案是什么？"}]},
             )
         if "confirmed-plan-step" in request_text:
-            return self._turn("已按确认的计划步骤检查合成中文配置字段；没有读取或修改文件。")
+            if not self.plan_read_started:
+                self.plan_read_started = True
+                return self._tool("read_file", {"path": "src/配置.py"})
+            return self._turn("已从空白 Agent 重新检查步骤；历史工具结果没有重放。")
         if "演示两文件变更集" in request_text or "演示失败补偿和冲突" in request_text:
             paths = (
                 ("src/布局.py", "src/主题.py")
@@ -780,8 +793,36 @@ def _exercise(walk: PtyWalkthrough, workspace: Path) -> None:
     walk.wait("将执行第 1 步")
     walk.mark("plan-step-confirm")
     walk.send("\t\r")
-    walk.wait("已按确认的计划步骤检查合成中文配置字段")
-    walk.wait("第 1 步保持 in-progress")
+    read_prompt_start = len(walk.raw)
+    walk.wait("确认读取？", start=read_prompt_start)
+    walk.mark("plan-tool-approval")
+    walk.send("\t\r")
+    walk.wait("工具已返回结果；为保护文件引用/问卷等内容，详情未存档")
+    walk.wait("模型请求或流式输出期间")
+    plan_state_path = workspace / ".harness" / "plans" / "current.json"
+    plan_state = json.loads(plan_state_path.read_text(encoding="utf-8"))
+    progress = plan_state.get("progress", {})
+    if (
+        plan_state["steps"][0]["status"] != "cancelled"
+        or progress.get("phase") != "provider_request"
+        or progress.get("last_tool") != "read_file"
+        or progress.get("last_result") != "returned_redacted"
+        or progress.get("interruption_cause") != "cancelled"
+    ):
+        raise RuntimeError("plan interruption after a returned tool result was not summarized safely")
+    serialized_plan_state = json.dumps(plan_state, ensure_ascii=False)
+    if "src/配置.py" in serialized_plan_state or "BUDGET_THRESHOLD = 16384" in serialized_plan_state:
+        raise RuntimeError("plan recovery metadata retained a path or raw tool output")
+    resume_start = len(walk.raw)
+    walk.command(
+        "/继续 1",
+        expect="请检查当前工作区最近一次工具可能造成的影响；确认启动新的 Agent 并继续第 1 步？",
+        wait_ready=False,
+    )
+    walk.mark("plan-resume-review")
+    walk.send("\t\r")
+    walk.wait("已从空白 Agent 重新检查步骤")
+    walk.wait("第 1 步保持 in-progress", start=resume_start)
     walk.ready(start=walk.last_command_start)
     walk.command("/计划 完成 1", expect="第 1 步状态已设为 completed")
 
@@ -1063,7 +1104,7 @@ def main() -> int:
             if no_color and _has_sgr_color(recorded_output):
                 raise RuntimeError("NO_COLOR PTY output contained an ANSI color attribute")
             print(f"Recorded {len(walk.events)} PTY events to {output}")
-            print("Synthetic offline flow passed: config review/save/restart and F2 shortcut, question edit/cancel/submit/privacy, plan confirmation, two-file approval, compensated conflict, save/restore, compression, narrow resize.")
+            print("Synthetic offline flow passed: config review/save/restart and F2 shortcut, question edit/cancel/submit/privacy, plan approval/result interruption/explicit resume, two-file approval, compensated conflict, save/restore, compression, narrow resize.")
             return 0
         except BaseException:
             if walk.raw:
