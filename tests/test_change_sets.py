@@ -8,6 +8,7 @@ import sys
 import threading
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -395,6 +396,9 @@ workspace.apply_change_set(changes, approve_action=lambda _request: True)
         record = self.workspace._load_change_set_record(requests[0].path)
         self.assertEqual(record["state"], "recovery_required")
         self.assertEqual([item["status"] for item in record["files"]], ["conflict", "not_applied", "not_applied"])
+        notice = self.workspace.describe_incomplete_change_sets()
+        self.assertIn("a.txt（冲突，未覆盖）", notice)
+        self.assertIn("b.txt（未修改）", notice)
 
     def test_cancellation_after_first_commit_runs_non_cancelled_compensation(self) -> None:
         original = {name: (self.root / name).read_bytes() for name in self.sources}
@@ -674,6 +678,199 @@ workspace.apply_change_set(changes, approve_action=lambda _request: True)
             for _path, data in self.workspace._load_backups()
             if data.get("change_set_id") is not None
         ))
+
+    def _create_completed_change_set_for_pruning(self, sequence: int) -> dict[str, Any]:
+        changes: list[dict[str, str]] = []
+        for index, relative in enumerate(("a.txt", "b.txt")):
+            target = self.root / relative
+            source = target.read_bytes()
+            old_text = target.read_text(encoding="utf-8").splitlines()[-1]
+            changes.append({
+                "path": relative,
+                "expected_sha256": hashlib.sha256(source).hexdigest(),
+                "old_text": old_text,
+                "new_text": f"清理批次{sequence}-{index}",
+            })
+        requests: list[ActionRequest] = []
+        result = self.workspace.apply_change_set(
+            changes,
+            approve_action=self.approval(requests),
+        )
+        self.assertIn("已应用全部文件变更", result)
+        return self.workspace._load_change_set_record(requests[0].path)
+
+    def test_terminal_log_pruning_resumes_after_process_exit_at_each_durable_step(self) -> None:
+        script = r'''
+import os, sys
+from pathlib import Path
+from cvfx_harness.tools import Workspace
+
+root = Path(sys.argv[1])
+change_set_id = sys.argv[2]
+stage = sys.argv[3]
+workspace = Workspace(root)
+record = workspace._load_change_set_record(change_set_id)
+
+real_write_record = Workspace._write_change_set_record
+def interrupted_write_record(self, value):
+    real_write_record(self, value)
+    if stage == "started" and value.get("state") == "pruning":
+        os._exit(77)
+    if stage.startswith("cursor-") and value.get("state") == "pruning":
+        if value.get("prune_next_index") == int(stage.split("-", 1)[1]):
+            os._exit(77)
+Workspace._write_change_set_record = interrupted_write_record
+
+real_write_json = Workspace._atomic_write_json
+backup_writes = 0
+def interrupted_write_json(self, target, value):
+    global backup_writes
+    real_write_json(self, target, value)
+    if stage.startswith("backup-") and target.parent.name == "backups":
+        backup_writes += 1
+        if backup_writes == int(stage.split("-", 1)[1]):
+            os._exit(77)
+Workspace._atomic_write_json = interrupted_write_json
+
+real_unlink = Workspace._unlink_workspace_file
+def interrupted_unlink(self, target, **kwargs):
+    is_journal = target.parent.name == "change-sets" and target.suffix == ".json"
+    if is_journal and stage == "before-delete":
+        os._exit(77)
+    real_unlink(self, target, **kwargs)
+    if is_journal and stage == "after-delete":
+        os._exit(77)
+Workspace._unlink_workspace_file = interrupted_unlink
+
+workspace._prune_terminal_change_set_log(record)
+os._exit(0)
+'''
+        stages = (
+            "started",
+            "backup-1", "backup-2",
+            "cursor-1", "cursor-2",
+            "before-delete", "after-delete",
+        )
+        for sequence, stage in enumerate(stages):
+            with self.subTest(stage=stage):
+                record = self._create_completed_change_set_for_pruning(sequence)
+                journal = self.root / ".harness" / "change-sets" / f"{record['id']}.json"
+                original_files = {
+                    name: (self.root / name).read_bytes()
+                    for name in ("a.txt", "b.txt")
+                }
+                result = subprocess.run(
+                    [sys.executable, "-c", script, str(self.root), record["id"], stage],
+                    cwd=ROOT,
+                    env=cli_subprocess_env(str(self.root)),
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 77, result.stderr.decode("utf-8", "replace"))
+
+                notice = self.workspace.describe_incomplete_change_sets()
+                self.assertEqual(notice, "没有未完成的多文件变更集。")
+                self.assertFalse(journal.exists())
+                self.assertEqual(
+                    {name: (self.root / name).read_bytes() for name in original_files},
+                    original_files,
+                )
+                self.assertEqual(self.workspace.describe_incomplete_change_sets(), notice)
+                for entry in record["files"]:
+                    backup = self.workspace._load_backups(backup_id=entry["backup_id"])
+                    if backup:
+                        self.assertNotIn("change_set_id", backup[0][1])
+                        self.assertNotIn("change_set_index", backup[0][1])
+                next_record = self._create_completed_change_set_for_pruning(sequence + 100)
+                self.assertEqual(next_record["state"], "completed")
+                self.assertEqual(self.workspace.describe_incomplete_change_sets(), "没有未完成的多文件变更集。")
+
+    def test_pruning_progress_mismatch_and_corrupt_backup_remain_fail_closed(self) -> None:
+        record = self._create_completed_change_set_for_pruning(100)
+        journal = self.root / ".harness" / "change-sets" / f"{record['id']}.json"
+        original_files = {name: (self.root / name).read_bytes() for name in ("a.txt", "b.txt")}
+
+        malformed = dict(record)
+        malformed.update({
+            "state": "pruning",
+            "prune_terminal_state": "applying",
+            "prune_next_index": "0",
+        })
+        journal.write_text(json.dumps(malformed), encoding="utf-8")
+        with self.assertRaisesRegex(WorkspaceError, "日志清理状态无效"):
+            self.workspace.describe_incomplete_change_sets()
+        self.assertEqual({name: (self.root / name).read_bytes() for name in original_files}, original_files)
+
+        inconsistent = dict(record)
+        inconsistent.update({
+            "state": "pruning",
+            "prune_terminal_state": "completed",
+            "prune_next_index": 1,
+        })
+        self.workspace._write_change_set_record(inconsistent)
+        with self.assertRaisesRegex(WorkspaceError, "清理进度与备份标记矛盾"):
+            self.workspace.describe_incomplete_change_sets()
+        self.assertEqual({name: (self.root / name).read_bytes() for name in original_files}, original_files)
+        self.assertEqual(self.workspace._load_change_set_record(record["id"])["state"], "pruning")
+
+        journal.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        pruning = dict(record)
+        pruning.update({
+            "state": "pruning",
+            "prune_terminal_state": "completed",
+            "prune_next_index": 0,
+        })
+        self.workspace._write_change_set_record(pruning)
+        first = self.workspace._load_backups(backup_id=record["files"][0]["backup_id"])
+        self.assertTrue(first)
+        first_path, first_backup = first[0]
+        first_backup.pop("change_set_id")
+        first_backup.pop("change_set_index")
+        self.workspace._atomic_write_json(first_path, first_backup)
+        backup_path = self.root / ".harness" / "backups" / f"{record['files'][1]['backup_id']}.json"
+        backup_path.write_bytes(b"{broken json")
+        with self.assertRaisesRegex(WorkspaceError, "无法读取撤销备份"):
+            self.workspace.describe_incomplete_change_sets()
+        self.assertEqual({name: (self.root / name).read_bytes() for name in original_files}, original_files)
+        self.assertEqual(self.workspace._load_change_set_record(record["id"])["state"], "pruning")
+
+    def test_unlinked_backup_for_incomplete_batch_still_blocks_writes(self) -> None:
+        change_set_id = self.make_interrupted_set_after_commit(1)
+        record = self.workspace._load_change_set_record(change_set_id)
+        entry_with_backup = next(
+            item
+            for item in record["files"]
+            if self.workspace._load_backups(backup_id=item["backup_id"])
+        )
+        loaded = self.workspace._load_backups(backup_id=entry_with_backup["backup_id"])
+        self.assertTrue(loaded)
+        backup_path, backup = loaded[0]
+        original_files = {name: (self.root / name).read_bytes() for name in self.sources}
+        backup.pop("change_set_id")
+        backup.pop("change_set_index")
+        self.workspace._atomic_write_json(backup_path, backup)
+
+        with self.assertRaisesRegex(WorkspaceError, "备份证据"):
+            self.workspace.list_incomplete_change_sets()
+        approve_calls: list[ActionRequest] = []
+        next_changes: list[dict[str, str]] = []
+        for index, relative in enumerate(("a.txt", "b.txt")):
+            target = self.root / relative
+            source = target.read_bytes()
+            next_changes.append({
+                "path": relative,
+                "expected_sha256": hashlib.sha256(source).hexdigest(),
+                "old_text": target.read_text(encoding="utf-8").splitlines()[-1],
+                "new_text": f"不得开始{index}",
+            })
+        with self.assertRaisesRegex(WorkspaceError, "无法完整核对"):
+            self.workspace.apply_change_set(
+                next_changes,
+                approve_action=self.approval(approve_calls),
+            )
+        self.assertEqual(len(approve_calls), 1)
+        self.assertEqual({name: (self.root / name).read_bytes() for name in self.sources}, original_files)
 
     def test_cli_approval_renders_complete_diff_and_asks_once(self) -> None:
         request = ActionRequest(

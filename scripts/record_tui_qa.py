@@ -24,7 +24,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[@-Z\\-_])")
-_PROMPT = re.compile(r"你\[(?:执行|计划)\]> ")
+_PROMPT = re.compile(r"你\[(?:执行|计划)\]> ?")
 
 
 class OfflineWalkthroughProvider:
@@ -36,6 +36,13 @@ class OfflineWalkthroughProvider:
     def __init__(self, source_sha256: str, log_path: Path) -> None:
         self.source_sha256 = source_sha256
         self.log_path = log_path
+        self.synthetic_workspace = log_path.parent / "合成工作区"
+        self.synthetic_hashes = {
+            relative: hashlib.sha256((self.synthetic_workspace / relative).read_bytes()).hexdigest()
+            for relative in (
+                "src/布局.py", "src/主题.py", "src/故障A.py", "src/故障B.py", "src/故障C.py"
+            )
+        }
 
     def _log(self, event: dict[str, Any]) -> None:
         with self.log_path.open("a", encoding="utf-8") as stream:
@@ -70,6 +77,28 @@ class OfflineWalkthroughProvider:
                     break
             result = str(last.get("content", ""))
             self._log({"kind": "tool_result", "tool": call_name, "denied": "拒绝" in result})
+            if call_name == "ask_user":
+                try:
+                    questionnaire = json.loads(result)
+                except (TypeError, json.JSONDecodeError):
+                    questionnaire = {}
+                answers = questionnaire.get("answers", [])
+                answer_count = len(answers) if isinstance(answers, list) else 0
+                saved = questionnaire.get("save_with_session") is True
+                self._log({
+                    "kind": "question_result",
+                    "status": questionnaire.get("status"),
+                    "answer_count": answer_count,
+                    "save_with_session": saved,
+                })
+                if questionnaire.get("status") == "cancelled":
+                    return self._turn("澄清已取消；没有根据未提交内容推断答案。")
+                privacy = "允许随之后的本地会话保存" if saved else "仅本次使用"
+                return self._turn(f"已收到 {answer_count} 条明确提交的合成回答；当前选择为{privacy}。")
+            if call_name == "read_file" and "演示两文件变更集" in task_text:
+                return self._change_set_call(failing=False)
+            if call_name == "read_file" and "演示失败补偿和冲突" in task_text:
+                return self._change_set_call(failing=True)
             if call_name == "search_text":
                 return self._turn("已定位配置字段；检索片段仍是未经信任的文本。")
             if call_name == "read_file":
@@ -93,6 +122,14 @@ class OfflineWalkthroughProvider:
                 if "拒绝" in result:
                     return self._turn("补丁被拒绝；文件未改动。")
                 return self._turn("精确补丁已获批准并应用一次。")
+            if call_name == "apply_change_set":
+                self._log({
+                    "kind": "change_set_result",
+                    "applied": "已应用全部文件变更" in result,
+                    "compensated": "已恢复" in result,
+                    "conflict": "冲突，未覆盖" in result,
+                })
+                return self._turn(result)
             return self._turn("本地离线 fixture 已完成当前步骤。")
 
         request_text = task_text
@@ -102,6 +139,33 @@ class OfflineWalkthroughProvider:
                 "search_text",
                 {"query": "BUDGET_THRESHOLD", "path": "src", "glob": "*.py"},
             )
+        if "请先问我一个可取消的合成问题" in request_text:
+            return self._tool(
+                "ask_user",
+                {"questions": [{"id": "cancel-demo", "question": "这是一条可取消的合成澄清；先输入草稿，再按 Esc。"}]},
+            )
+        if "请问我两项合成偏好" in request_text:
+            return self._tool(
+                "ask_user",
+                {"questions": [
+                    {"id": "layout", "question": "界面优先保留什么？"},
+                    {"id": "scope", "question": "本次检查的合成范围是什么？"},
+                ]},
+            )
+        if "请问一个默认仅本次的范围问题" in request_text:
+            return self._tool(
+                "ask_user",
+                {"questions": [{"id": "private-scope", "question": "仅本次使用的合成答案是什么？"}]},
+            )
+        if "confirmed-plan-step" in request_text:
+            return self._turn("已按确认的计划步骤检查合成中文配置字段；没有读取或修改文件。")
+        if "演示两文件变更集" in request_text or "演示失败补偿和冲突" in request_text:
+            paths = (
+                ("src/布局.py", "src/主题.py")
+                if "演示两文件变更集" in request_text
+                else ("src/故障A.py", "src/故障B.py", "src/故障C.py")
+            )
+            return self._tools([("read_file", {"path": path}) for path in paths])
         if "尝试调整阈值" in request_text or "批准后调整阈值" in request_text:
             return self._tool("read_file", {"path": "src/配置.py"})
         if request_text.startswith("第一轮约束"):
@@ -117,6 +181,37 @@ class OfflineWalkthroughProvider:
 
         return self._turn("", [ToolCall(f"offline-{name}-{time.monotonic_ns()}", name, arguments)])
 
+    def _tools(self, calls: list[tuple[str, dict[str, Any]]]):
+        from cvfx_harness.providers import ToolCall
+
+        return self._turn("", [
+            ToolCall(f"offline-{name}-{time.monotonic_ns()}-{index}", name, arguments)
+            for index, (name, arguments) in enumerate(calls)
+        ])
+
+    def _change_set_call(self, *, failing: bool):
+        paths = (
+            ("src/故障A.py", "src/故障B.py", "src/故障C.py")
+            if failing
+            else ("src/布局.py", "src/主题.py")
+        )
+        old_values, new_values = (
+            (("旧文案 = '初始'", "旧字号 = 12", "旧间距 = 8"),
+             ("旧文案 = '更新'", "旧字号 = 14", "旧间距 = 16"))
+            if failing
+            else (("区域宽度 = 3", "强调色 = '青'"), ("区域宽度 = 4", "强调色 = '深青'"))
+        )
+        changes = [
+            {
+                "path": path,
+                "expected_sha256": self.synthetic_hashes[path],
+                "old_text": old_text,
+                "new_text": new_text,
+            }
+            for path, old_text, new_text in zip(paths, old_values, new_values)
+        ]
+        return self._tool("apply_change_set", {"changes": changes})
+
     @staticmethod
     def _turn(content: str, tool_calls=None):
         from cvfx_harness.providers import AssistantTurn
@@ -126,6 +221,7 @@ class OfflineWalkthroughProvider:
 
 def _child(workspace: str, log_path: str, source_sha256: str) -> int:
     # Do not pass inherited user credentials or other unrelated environment to the fixture.
+    no_color = os.environ.get("CVFX_TUI_QA_NO_COLOR") == "1"
     os.environ.clear()
     os.environ.update(
         {
@@ -139,12 +235,33 @@ def _child(workspace: str, log_path: str, source_sha256: str) -> int:
             "LANG": "C.UTF-8",
         }
     )
+    if no_color:
+        os.environ["NO_COLOR"] = "1"
     from cvfx_harness import cli
+    from cvfx_harness.tools import Workspace, WorkspaceError
     from cvfx_harness.tui import TerminalUI
 
     fixture = OfflineWalkthroughProvider(source_sha256, Path(log_path))
     cli.provider_from_environment = lambda *_args, **_kwargs: fixture
     cli.configure_console_encoding = lambda: None
+    real_commit_write = Workspace.commit_write
+    injected_conflict = False
+
+    def commit_with_synthetic_conflict(self, preview, **kwargs):
+        nonlocal injected_conflict
+        if (
+            not injected_conflict
+            and kwargs.get("change_set_id") is not None
+            and preview.path == "src/故障C.py"
+        ):
+            injected_conflict = True
+            (Path(workspace) / "src" / "故障A.py").write_text(
+                "外部并发版本；必须保留。\n", encoding="utf-8", newline="\n"
+            )
+            raise WorkspaceError("synthetic second-file failure")
+        return real_commit_write(self, preview, **kwargs)
+
+    Workspace.commit_write = commit_with_synthetic_conflict
 
     def _audit(kind: str, **fields: Any) -> None:
         with Path(log_path).open("a", encoding="utf-8") as stream:
@@ -153,6 +270,10 @@ def _child(workspace: str, log_path: str, source_sha256: str) -> int:
     original_input = TerminalUI.input
     original_output = TerminalUI.output
     original_resolve = TerminalUI._resolve_pending
+    original_question_review = TerminalUI._question_show_review
+    original_question_save_toggle = TerminalUI._question_toggle_session_save
+    original_question_cancel = TerminalUI._question_cancel
+    original_move_output_cursor = TerminalUI._move_output_cursor
 
     def audited_input(self, prompt: str) -> str:
         value = original_input(self, prompt)
@@ -176,12 +297,77 @@ def _child(workspace: str, log_path: str, source_sha256: str) -> int:
                 prompt=self._prompt,
                 context=self._approval_text,
             )
+        if (
+            self._pending is not None
+            and self._pending.approval
+            and self._prompt.startswith("确认开始此步骤？")
+        ):
+            _audit(
+                "plan_step_approval_view",
+                context=self._last_output,
+                accepted=self._approval_choice_yes,
+            )
+        if (
+            self._pending is not None
+            and self._pending.approval
+            and self._prompt.startswith("以上所有文件共用这一次审批")
+        ):
+            _audit(
+                "change_set_approval_view",
+                context=self._last_output,
+                accepted=self._approval_choice_yes,
+            )
         original_resolve(self, **kwargs)
+
+    def audited_question_review(self) -> None:
+        original_question_review(self)
+        _audit(
+            "question_review_view",
+            question_count=len(self._question_answers),
+            save_allowed=bool(self._question_pending and self._question_pending.request.save_allowed),
+            save_with_session=self._question_save_with_session,
+            answer_digest=hashlib.sha256("\0".join(self._question_answers).encode("utf-8")).hexdigest(),
+        )
+
+    def audited_question_save_toggle(self) -> None:
+        original_question_save_toggle(self)
+        _audit("question_save_choice", save_with_session=self._question_save_with_session)
+
+    def audited_question_cancel(self) -> None:
+        original_question_cancel(self)
+        _audit("question_cancelled")
+
+    def audited_move_output_cursor(self, rows: int) -> None:
+        original_move_output_cursor(self, rows)
+        document = self.output_area.buffer.document
+        cursor_row, _cursor_column = document.translate_index_to_position(
+            self.output_area.buffer.cursor_position
+        )
+        _audit("transcript_scroll", row=cursor_row, following=self._follow_output)
 
     TerminalUI.input = audited_input
     TerminalUI.output = audited_output
     TerminalUI._resolve_pending = audited_resolve
+    TerminalUI._question_show_review = audited_question_review
+    TerminalUI._question_toggle_session_save = audited_question_save_toggle
+    TerminalUI._question_cancel = audited_question_cancel
+    TerminalUI._move_output_cursor = audited_move_output_cursor
     return cli.main(["--workspace", workspace, "--provider", "mock"])
+
+
+def _has_sgr_color(text: str) -> bool:
+    for parameters in re.findall(r"\x1b\[([0-9;]*)m", text):
+        codes = [int(code) for code in parameters.split(";") if code]
+        if any(
+            30 <= code <= 37
+            or 40 <= code <= 47
+            or 90 <= code <= 97
+            or 100 <= code <= 107
+            or code in (38, 48, 58)
+            for code in codes
+        ):
+            return True
+    return False
 
 
 class PtyWalkthrough:
@@ -297,6 +483,8 @@ class PtyWalkthrough:
             "timestamp": int(time.time()),
             "env": {"TERM": "xterm-256color", "SHELL": "/bin/bash"},
         }
+        if os.environ.get("CVFX_TUI_QA_NO_COLOR") == "1":
+            header["env"]["NO_COLOR"] = "1"
         self.output.parent.mkdir(parents=True, exist_ok=True)
         with self.output.open("w", encoding="utf-8", newline="\n") as stream:
             stream.write(json.dumps(header, ensure_ascii=False) + "\n")
@@ -315,7 +503,51 @@ def _prepare_workspace(workspace: Path) -> str:
         "        self.assertEqual(6 * 7, 42)\n",
         encoding="utf-8",
     )
+    for relative, content in {
+        "src/布局.py": "区域宽度 = 3\n",
+        "src/主题.py": "强调色 = '青'\n",
+        "src/故障A.py": "旧文案 = '初始'\n",
+        "src/故障B.py": "旧字号 = 12\n",
+        "src/故障C.py": "旧间距 = 8\n",
+    }.items():
+        (workspace / relative).write_text(content, encoding="utf-8", newline="\n")
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _approve_read_batch(
+    walk: PtyWalkthrough,
+    request: str,
+    *,
+    read_count: int,
+    expected_paths: tuple[str, ...],
+    marker: str,
+    outcome: str | None,
+) -> None:
+    walk.command(request, expect="确认读取？", wait_ready=False)
+    for index in range(read_count):
+        if index:
+            next_prompt_start = len(walk.raw)
+            walk.wait("确认读取？", start=next_prompt_start)
+        walk.send("\t\r")
+
+    preview_start = len(walk.raw)
+    walk.wait("多文件变更集完整审阅", start=preview_start)
+    if len(expected_paths) > 2:
+        # The review stays in the scrollable transcript while the approval
+        # dock remains fixed. Page through it so the first member is truly
+        # reachable before confirming a later failing batch.
+        for _ in range(5):
+            walk.send(b"\x1b[5~")
+            walk._collect(0.05)
+    walk.wait("精确差异（+ 新增，- 删除）", start=preview_start)
+    walk.mark(marker)
+    decision_start = len(walk.raw)
+    walk.send("\t\r")
+    if outcome is None:
+        walk.ready(start=walk.last_command_start)
+    else:
+        walk.wait(outcome, start=decision_start, timeout=15.0)
+    walk.ready(start=walk.last_command_start)
 
 
 def _exercise(walk: PtyWalkthrough, workspace: Path) -> None:
@@ -430,9 +662,148 @@ def _exercise(walk: PtyWalkthrough, workspace: Path) -> None:
     walk.wait("已恢复历史会话 'qa-walkthrough'")
     walk.ready(start=walk.last_command_start)
 
+    # Exercise the questionnaire in the real prompt_toolkit panel: Escape
+    # discards a draft, the two-question flow returns for editing, and saving is
+    # an explicit opt-in distinct from submitting answers to the current turn.
+    walk.command("请先问我一个可取消的合成问题", expect="这是一条可取消的合成澄清", wait_ready=False)
+    walk.mark("question-cancel-draft")
+    walk.send("取消草稿：不应提交")
+    walk.send(b"\x1b")
+    walk.wait("已取消提问；没有提交回答。")
+    walk.ready(start=walk.last_command_start)
+
+    walk.command("请问我两项合成偏好", expect="界面优先保留什么？", wait_ready=False)
+    walk.send("旧答案：图片优先")
+    walk.wait("旧答案：图片优先")
+    next_question_start = len(walk.raw)
+    walk.send("\t\t\r")
+    walk.wait("本次检查的合成范围是什么？", start=next_question_start)
+    walk.send("本次范围：src/配置.py")
+    walk.wait("本次范围：src/配置.py")
+    first_review_start = len(walk.raw)
+    walk.send("\t\t\r")
+    walk.wait("审阅本次回答", start=first_review_start)
+    walk.wait("隐私：默认仅本次")
+    walk.mark("question-review-default")
+    # Review focuses the edit control. Move back to the first answer, replace
+    # the draft by keyboard, then return to review before opting into storage.
+    edit_question_start = len(walk.raw)
+    walk.send("\r")
+    walk.wait("本次检查的合成范围是什么？", start=edit_question_start)
+    previous_question_start = len(walk.raw)
+    walk.send("\t\r")
+    walk.wait("界面优先保留什么？", start=previous_question_start)
+    walk.send(b"\x7f" * len("旧答案：图片优先"))
+    walk.send("复核后：保持中文变量名")
+    edited_next_start = len(walk.raw)
+    walk.send("\t\t\r")
+    walk.wait("本次检查的合成范围是什么？", start=edited_next_start)
+    second_review_start = len(walk.raw)
+    walk.send("\t\t\r")
+    walk.wait("审阅本次回答", start=second_review_start)
+    walk.wait("复核后：保持中文变量名")
+    walk.mark("question-review-edited")
+    # From the edit control: Tab reaches the optional save toggle; after
+    # turning it on, Tab reaches the separate explicit submit button.
+    walk.send("\t\r")
+    walk.wait("已允许本问卷随之后的 /保存 写入工作区本地会话。")
+    walk.send("\t\r")
+    walk.wait("已收到 2 条明确提交的合成回答")
+    walk.ready(start=walk.last_command_start)
+
+    walk.command("/保存 qa-questionnaire", expect="到会话 'qa-questionnaire'")
+    saved_questionnaire = json.loads(
+        (workspace / ".harness" / "sessions" / "qa-questionnaire.json").read_text(encoding="utf-8")
+    )
+    saved_questionnaire_text = json.dumps(saved_questionnaire, ensure_ascii=False)
+    if "复核后：保持中文变量名" not in saved_questionnaire_text:
+        raise RuntimeError("explicitly saved questionnaire answer was not present in the archive")
+    if "旧答案：图片优先" in saved_questionnaire_text or "取消草稿：不应提交" in saved_questionnaire_text:
+        raise RuntimeError("edited or cancelled questionnaire draft leaked into the archive")
+    walk.command(
+        "/恢复 qa-questionnaire",
+        expect="恢复会话将替换当前上下文。确认？",
+        wait_ready=False,
+    )
+    walk.send("\t\r")
+    walk.wait("已恢复历史会话 'qa-questionnaire'")
+    walk.wait("取消或未完成的问卷")
+    walk.mark("restore-questionnaire-state")
+    walk.ready(start=walk.last_command_start)
+
+    # The default remains private. Save a later session after this answer and
+    # verify that restore explains the omission without retaining its content.
+    walk.command("请问一个默认仅本次的范围问题", expect="仅本次使用的合成答案是什么？", wait_ready=False)
+    walk.send("默认仅本次的合成范围")
+    walk.wait("默认仅本次的合成范围")
+    private_review_start = len(walk.raw)
+    walk.send("\t\t\r")
+    walk.wait("审阅本次回答", start=private_review_start)
+    walk.wait("存档：仅本次（默认）")
+    walk.mark("question-private-default")
+    walk.send("\t\t\r")
+    walk.wait("当前选择为仅本次使用")
+    walk.ready(start=walk.last_command_start)
+    walk.command("/保存 qa-private", expect="到会话 'qa-private'")
+    private_archive = json.loads(
+        (workspace / ".harness" / "sessions" / "qa-private.json").read_text(encoding="utf-8")
+    )
+    private_archive_text = json.dumps(private_archive, ensure_ascii=False)
+    if "默认仅本次的合成范围" in private_archive_text:
+        raise RuntimeError("default-private questionnaire answer was included in a saved session")
+    walk.command(
+        "/恢复 qa-private",
+        expect="恢复会话将替换当前上下文。确认？",
+        wait_ready=False,
+    )
+    walk.send("\t\r")
+    walk.wait("已恢复历史会话 'qa-private'")
+    walk.wait("仅本次使用、未存档的问卷回答")
+    walk.mark("restore-private-omission")
+    walk.ready(start=walk.last_command_start)
+
     walk.command("/计划 生成 检查预算字段", expect="待审阅候选计划")
-    walk.mark("plan-candidate")
-    walk.command("/计划 拒绝", expect="已拒绝并丢弃候选计划")
+    walk.mark("plan-candidate-review")
+    walk.command("/计划 接受", expect="已接受并保存")
+    walk.command("/计划 执行 1", expect="确认开始此步骤？", wait_ready=False)
+    walk.wait("将执行第 1 步")
+    walk.mark("plan-step-confirm")
+    walk.send("\t\r")
+    walk.wait("已按确认的计划步骤检查合成中文配置字段")
+    walk.wait("第 1 步保持 in-progress")
+    walk.ready(start=walk.last_command_start)
+    walk.command("/计划 完成 1", expect="第 1 步状态已设为 completed")
+
+    _approve_read_batch(
+        walk,
+        "演示两文件变更集",
+        read_count=2,
+        expected_paths=("src/布局.py", "src/主题.py"),
+        marker="change-set-two-file-review",
+        outcome="已应用全部文件变更",
+    )
+    _approve_read_batch(
+        walk,
+        "演示失败补偿和冲突",
+        read_count=3,
+        expected_paths=("src/故障A.py", "src/故障B.py", "src/故障C.py"),
+        marker="change-set-conflict-review",
+        outcome=None,
+    )
+    walk.command("/变更集 列表", expect="src/故障A.py（冲突，未覆盖）")
+    walk.wait("src/故障B.py（已恢复）", start=walk.last_command_start)
+    walk.wait("src/故障C.py（未修改）", start=walk.last_command_start)
+    if (workspace / "src" / "布局.py").read_text(encoding="utf-8") != "区域宽度 = 4\n":
+        raise RuntimeError("the approved two-file change set did not retain both edits")
+    if (workspace / "src" / "主题.py").read_text(encoding="utf-8") != "强调色 = '深青'\n":
+        raise RuntimeError("the approved two-file change set did not retain its second edit")
+    if (workspace / "src" / "故障A.py").read_text(encoding="utf-8") != "外部并发版本；必须保留。\n":
+        raise RuntimeError("the compensation conflict overwrote the synthetic external edit")
+    if (workspace / "src" / "故障B.py").read_text(encoding="utf-8") != "旧字号 = 12\n":
+        raise RuntimeError("the non-conflicted first write was not compensated")
+    if (workspace / "src" / "故障C.py").read_text(encoding="utf-8") != "旧间距 = 8\n":
+        raise RuntimeError("the failed third write unexpectedly changed its target")
+    walk.mark("change-set-compensation-conflict")
 
     walk.command("/压缩 2", expect="确认应用压缩？", wait_ready=False)
     compression_start = walk.last_command_start
@@ -488,7 +859,12 @@ def main() -> int:
         return _child(sys.argv[2], sys.argv[3], sys.argv[4])
     if os.name != "posix":
         raise SystemExit("This recording script requires a POSIX PTY; it is not Windows acceptance evidence.")
-    output = ROOT / "evidence" / "tui-synthetic-session.cast"
+    no_color = os.environ.get("CVFX_TUI_QA_NO_COLOR") == "1"
+    output = (
+        Path(os.environ.get("CVFX_TUI_QA_OUTPUT", "/tmp/cvfx-tui-no-color.cast"))
+        if no_color
+        else ROOT / "evidence" / "tui-synthetic-session.cast"
+    )
     with tempfile.TemporaryDirectory(prefix="cvfx-harness-pty-qa-") as temporary:
         base = Path(temporary)
         workspace = base / "合成工作区"
@@ -553,14 +929,51 @@ def main() -> int:
                     raise RuntimeError("patch target/fingerprint review panel was malformed or repeated its question")
             if not any(item.get("kind") == "plan" for item in log):
                 raise RuntimeError("offline provider did not receive a plan proposal request")
+            question_results = [item for item in log if item.get("kind") == "question_result"]
+            if [item.get("status") for item in question_results] != ["cancelled", "submitted", "submitted"]:
+                raise RuntimeError(f"questionnaire outcomes differed from the PTY journey: {question_results!r}")
+            if [item.get("save_with_session") for item in question_results] != [False, True, False]:
+                raise RuntimeError("questionnaire privacy choices did not preserve cancel/opt-in/default-private states")
+            reviews = [item for item in log if item.get("kind") == "question_review_view"]
+            if len(reviews) < 3 or reviews[0].get("answer_digest") == reviews[1].get("answer_digest"):
+                raise RuntimeError("questionnaire review did not show the edited answer through the real UI")
+            if not any(
+                item.get("kind") == "question_save_choice" and item.get("save_with_session") is True
+                for item in log
+            ):
+                raise RuntimeError("optional questionnaire archive consent was not toggled in the UI")
+            plan_views = [item for item in log if item.get("kind") == "plan_step_approval_view"]
+            if len(plan_views) != 1 or not plan_views[0].get("accepted") or "完成条件：" not in plan_views[0].get("context", ""):
+                raise RuntimeError("plan step preview was not reviewed and explicitly confirmed in the TUI")
+            batch_views = [item for item in log if item.get("kind") == "change_set_approval_view"]
+            if len(batch_views) != 2 or not all(item.get("accepted") for item in batch_views):
+                raise RuntimeError("expected one explicit approval for each complete multi-file review")
+            if not all(
+                all(path in item.get("context", "") for path in paths)
+                for item, paths in zip(
+                    batch_views,
+                    (("src/布局.py", "src/主题.py"), ("src/故障A.py", "src/故障B.py", "src/故障C.py")),
+                )
+            ):
+                raise RuntimeError("change-set approval did not show the complete set of file paths")
+            scroll_events = [item for item in log if item.get("kind") == "transcript_scroll"]
+            if not scroll_events:
+                raise RuntimeError("PageUp did not move through the scrollable TUI transcript during review")
+            change_results = [item for item in log if item.get("kind") == "change_set_result"]
+            if len(change_results) != 2 or not change_results[0].get("applied"):
+                raise RuntimeError("the approved two-file change set did not complete")
+            if not change_results[1].get("conflict") or not change_results[1].get("compensated"):
+                raise RuntimeError("failed change-set compensation/conflict state was not surfaced")
             walk.save_cast()
             recorded_output = "".join(
                 event[2] for event in walk.events if event[1] == "o"
             )
             if "预期原文件 SHA-256：[已脱敏]" in recorded_output:
                 raise RuntimeError("the trusted patch fingerprint was redacted in the PTY display")
+            if no_color and _has_sgr_color(recorded_output):
+                raise RuntimeError("NO_COLOR PTY output contained an ANSI color attribute")
             print(f"Recorded {len(walk.events)} PTY events to {output}")
-            print("Synthetic offline flow passed: config, search, patch deny/accept, test approval, session, plan, compression, narrow resize.")
+            print("Synthetic offline flow passed: config, question edit/cancel/submit/privacy, plan confirmation, two-file approval, compensated conflict, save/restore, compression, narrow resize.")
             return 0
         except BaseException:
             if walk.raw:

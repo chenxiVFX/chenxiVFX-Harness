@@ -1418,6 +1418,7 @@ class TerminalUI:
         if self._question_index + 1 < len(pending.request.questions):
             self._question_index += 1
             self._question_set_current()
+            self._application.layout.focus(self._question_answer_area)
         else:
             self._question_show_review()
 

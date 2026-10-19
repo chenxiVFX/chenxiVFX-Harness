@@ -264,6 +264,10 @@ class PromptToolkitTests(unittest.TestCase):
                 self.assertEqual(ui._question_answer_area.text, "稳定性")
                 self.assertIsNotNone(ui._question_pending, "a suggestion click must only fill the draft")
                 ui._question_next_button.handler()
+                self.assertTrue(
+                    ui._application.layout.has_focus(ui._question_answer_area),
+                    "moving to the next question must return keyboard focus to its answer field",
+                )
                 pipe.send_text("仅检查 src/")
                 pipe.send_bytes(b"\r\r")
                 pipe.send_bytes("\x1b[200~不要运行测试\x1b[201~".encode("utf-8"))

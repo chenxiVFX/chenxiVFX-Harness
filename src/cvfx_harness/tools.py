@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import difflib
 import base64
+import binascii
+import difflib
 import errno
 import fnmatch
 import hashlib
@@ -1689,15 +1690,22 @@ class Workspace:
 
         states = {
             "applying", "rolling_back", "recovery_required", "recovery_in_progress",
-            "completed", "rolled_back", "recovered",
+            "completed", "rolled_back", "recovered", "pruning",
         }
         file_states = {
             "pending", "applying", "committed", "failed", "restoring",
             "restore_failed", "restored", "not_applied", "conflict",
         }
+        base_record_keys = {"version", "id", "created_ns", "updated_ns", "state", "files"}
+        state_value = record.get("state") if isinstance(record, dict) else None
+        record_keys = (
+            base_record_keys | {"prune_terminal_state", "prune_next_index"}
+            if state_value == "pruning"
+            else base_record_keys
+        )
         if (
             not isinstance(record, dict)
-            or set(record) != {"version", "id", "created_ns", "updated_ns", "state", "files"}
+            or set(record) != record_keys
             or type(record.get("version")) is not int
             or record.get("version") != 1
             or not isinstance(record.get("id"), str)
@@ -1761,9 +1769,21 @@ class Workspace:
             seen_backup_ids.add(item["backup_id"])
         statuses = [item["status"] for item in record["files"]]
         state = record["state"]
-        if state == "completed" and any(status != "committed" for status in statuses):
+        if state == "pruning":
+            terminal_state = record.get("prune_terminal_state")
+            next_index = record.get("prune_next_index")
+            if (
+                not isinstance(terminal_state, str)
+                or terminal_state not in {"completed", "rolled_back", "recovered"}
+                or type(next_index) is not int
+                or not 0 <= next_index <= len(statuses)
+            ):
+                raise WorkspaceError("变更集日志清理状态无效；未自动恢复或执行。")
+        else:
+            terminal_state = state
+        if terminal_state == "completed" and any(status != "committed" for status in statuses):
             raise WorkspaceError("变更集终态与文件状态矛盾；未自动恢复或执行。")
-        if state in {"rolled_back", "recovered"} and any(
+        if terminal_state in {"rolled_back", "recovered"} and any(
             status not in {"restored", "not_applied"} for status in statuses
         ):
             raise WorkspaceError("变更集终态与文件状态矛盾；未自动恢复或执行。")
@@ -1857,7 +1877,15 @@ class Workspace:
                 raise WorkspaceError("变更集日志名称无效；未自动恢复或执行。")
             record = self._load_change_set_record(path.stem)
             records.append(record)
-        return sorted(records, key=lambda item: (item["created_ns"], item["id"]))
+        records = sorted(records, key=lambda item: (item["created_ns"], item["id"]))
+        pruning = [record for record in records if record["state"] == "pruning"]
+        for record in pruning:
+            self._resume_terminal_change_set_log_pruning(record)
+        if pruning:
+            # Reload after pruning so callers never mistake a cleanup journal
+            # for an incomplete batch or inspect its now-unlinked backups.
+            return self._list_change_set_records()
+        return records
 
     def list_incomplete_change_sets(self) -> list[dict[str, Any]]:
         records = self._list_change_set_records()
@@ -1907,29 +1935,72 @@ class Workspace:
         terminal.sort(key=lambda item: (item[1]["created_ns"], item[1]["id"]))
         retained_before_new_log = max(0, CHANGE_SET_TERMINAL_LOG_RETENTION - 1)
         remove_count = max(0, len(terminal) - retained_before_new_log)
-        for path, record in terminal[:remove_count]:
-            self._forget_change_set_backup_links(record)
-            self._unlink_workspace_file(path)
+        for _path, record in terminal[:remove_count]:
+            self._prune_terminal_change_set_log(record)
 
-    def _forget_change_set_backup_links(self, record: dict[str, Any]) -> None:
-        """Drop only the obsolete journal association before pruning a terminal log."""
-        for index, entry in enumerate(record["files"]):
-            records = self._load_backups(backup_id=entry["backup_id"])
-            if not records:
-                if entry["status"] in {"committed", "restored"}:
-                    raise WorkspaceError("终态变更集缺少原始备份；拒绝清理其状态日志。")
+    def _prune_terminal_change_set_log(self, record: dict[str, Any]) -> None:
+        if record["state"] not in {"completed", "rolled_back", "recovered"}:
+            raise WorkspaceError("只允许清理已完成的变更集日志。")
+        pruning = dict(record)
+        pruning["state"] = "pruning"
+        pruning["prune_terminal_state"] = record["state"]
+        pruning["prune_next_index"] = 0
+        self._write_change_set_record(pruning)
+        self._resume_terminal_change_set_log_pruning(pruning)
+
+    def _load_prunable_change_set_backup(
+        self,
+        record: dict[str, Any],
+        index: int,
+        *,
+        allow_unlinked: bool,
+    ) -> tuple[Path, dict[str, Any]] | None:
+        entry = record["files"][index]
+        loaded = self._load_backups(backup_id=entry["backup_id"])
+        if not loaded:
+            if entry["status"] in {"committed", "restored"}:
+                raise WorkspaceError("终态变更集缺少原始备份；拒绝清理其状态日志。")
+            return None
+        backup_path, backup = loaded[0]
+        has_batch_id = "change_set_id" in backup
+        has_batch_index = "change_set_index" in backup
+        if not has_batch_id and not has_batch_index:
+            if not allow_unlinked or not self._change_set_backup_payload_matches_entry(entry, backup):
+                raise WorkspaceError("终态变更集备份关联不一致；拒绝续跑状态日志清理。")
+            return None
+        if not has_batch_id or not has_batch_index or not self._change_set_backup_matches_entry(
+            record["id"], index, entry, backup
+        ):
+            raise WorkspaceError("终态变更集备份关联不一致；拒绝续跑状态日志清理。")
+        return backup_path, backup
+
+    def _resume_terminal_change_set_log_pruning(self, record: dict[str, Any]) -> None:
+        if record["state"] != "pruning":
+            raise WorkspaceError("变更集日志并非处于可续跑清理状态。")
+        for index in range(len(record["files"])):
+            next_index = record["prune_next_index"]
+            if index < next_index:
+                if self._load_prunable_change_set_backup(
+                    record, index, allow_unlinked=True
+                ) is not None:
+                    raise WorkspaceError("变更集清理进度与备份标记矛盾；未继续清理。")
                 continue
-            backup_path, backup = records[0]
-            has_batch = "change_set_id" in backup or "change_set_index" in backup
-            if not has_batch:
+            if index > next_index:
+                self._load_prunable_change_set_backup(
+                    record, index, allow_unlinked=False
+                )
                 continue
-            if not self._change_set_backup_matches_entry(
-                record["id"], index, entry, backup
-            ):
-                raise WorkspaceError("终态变更集备份关联不一致；拒绝清理其状态日志。")
-            backup.pop("change_set_id", None)
-            backup.pop("change_set_index", None)
-            self._atomic_write_json(backup_path, backup)
+            backup = self._load_prunable_change_set_backup(
+                record, index, allow_unlinked=True
+            )
+            if backup is not None:
+                backup_path, backup_record = backup
+                backup_record.pop("change_set_id", None)
+                backup_record.pop("change_set_index", None)
+                self._atomic_write_json(backup_path, backup_record)
+            record["prune_next_index"] = index + 1
+            self._write_change_set_record(record)
+        self._unlink_workspace_file(self._change_set_path(record["id"], create=False))
 
     @staticmethod
     def _supports_dir_fd_operations() -> bool:
@@ -3309,8 +3380,25 @@ class Workspace:
         return (
             backup.get("change_set_id") == change_set_id
             and backup.get("change_set_index") == index + 1
-            and backup.get("path") == entry["path"]
+            and Workspace._change_set_backup_payload_matches_entry(entry, backup)
+        )
+
+    @staticmethod
+    def _change_set_backup_payload_matches_entry(
+        entry: dict[str, Any],
+        backup: dict[str, Any],
+    ) -> bool:
+        encoded_before = backup.get("before_base64")
+        if not isinstance(encoded_before, str):
+            return False
+        try:
+            before_bytes = base64.b64decode(encoded_before, validate=True)
+        except (ValueError, binascii.Error):
+            return False
+        return (
+            backup.get("path") == entry["path"]
             and backup.get("before_exists") is True
+            and hashlib.sha256(before_bytes).hexdigest() == entry["before_sha256"]
             and backup.get("state") in {"pending", "committed", "conflict"}
             and backup.get("before_mode") == entry["before_mode"]
             and backup.get("after_mode") == entry["after_mode"]
@@ -3517,12 +3605,22 @@ class Workspace:
             rendered.append(
                 f"发现 {len(incomplete)} 个未完成变更集；启动时不会自动恢复或重放审批。"
             )
+            file_status_labels = {
+                "pending": "未开始",
+                "applying": "处理中",
+                "committed": "已修改",
+                "failed": "失败，未确认写入",
+                "restoring": "恢复中",
+                "restore_failed": "恢复未完成",
+                "restored": "已恢复",
+                "not_applied": "未修改",
+                "conflict": "冲突，未覆盖",
+            }
             for record in incomplete[:CHANGE_SET_EVIDENCE_DISPLAY_LIMIT]:
-                rendered.append(
-                    f"{record['id']}：{record['state']}；"
-                    + "、".join(
-                        f"{entry['path']}（{entry['status']}）" for entry in record["files"]
-                    )
+                rendered.append(f"{record['id']}：{record['state']}")
+                rendered.extend(
+                    f"  {entry['path']}（{file_status_labels.get(entry['status'], '状态未知')}）"
+                    for entry in record["files"]
                 )
             if len(incomplete) > CHANGE_SET_EVIDENCE_DISPLAY_LIMIT:
                 rendered.append(f"另有 {len(incomplete) - CHANGE_SET_EVIDENCE_DISPLAY_LIMIT} 条未展开。")
