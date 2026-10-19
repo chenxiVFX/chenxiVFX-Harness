@@ -4,6 +4,8 @@ import json
 import io
 import os
 import shutil
+import select
+import signal
 import socket
 import ssl
 import subprocess
@@ -13,6 +15,10 @@ import threading
 import time
 import unittest
 import urllib.request
+if os.name == "posix":
+    import pty
+else:
+    pty = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +28,14 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cvfx_harness.agent import Agent, SYSTEM_PROMPT
-from cvfx_harness.cli import _StreamingSecretRedactor, _safe_terminal_text, parse_references, run_console
+from cvfx_harness.cli import (
+    MAX_MULTILINE_INPUT_BYTES,
+    _StreamingSecretRedactor,
+    _collect_multiline_input,
+    _safe_terminal_text,
+    parse_references,
+    run_console,
+)
 from cvfx_harness.providers import (
     AssistantTurn,
     DEEPSEEK_API_KEY_ENV,
@@ -43,6 +56,19 @@ def make_test_temp(prefix: str = "case-") -> tempfile.TemporaryDirectory:
     local_temp = Path(__file__).resolve().parents[1] / ".test-tmp"
     local_temp.mkdir(exist_ok=True)
     return tempfile.TemporaryDirectory(dir=local_temp, prefix=prefix)
+
+
+def cli_subprocess_env(workspace: str) -> dict[str, str]:
+    allowed = ("PATH", "SystemRoot", "TEMP", "TMP")
+    env = {name: os.environ[name] for name in allowed if name in os.environ}
+    env.update({
+        "HOME": workspace,
+        "USERPROFILE": workspace,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+    })
+    return env
 
 
 def local_http_fixture(handler_function):
@@ -1087,6 +1113,204 @@ class AgentTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_cli_keyboard_interrupt_cancels_request_without_exit_or_replay(self) -> None:
+        class InterruptOnceProvider:
+            label = "interrupt fixture"
+            model = "offline"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, _messages, _tools, *, cancellation_event=None, max_tokens=2048):
+                del cancellation_event, max_tokens
+                self.calls += 1
+                if self.calls == 1:
+                    raise KeyboardInterrupt
+                return AssistantTurn("不应重放", assistant_message={"role": "assistant", "content": "不应重放"})
+
+        with make_test_temp(prefix="cli-request-cancel-") as temp:
+            provider = InterruptOnceProvider()
+            outputs: list[str] = []
+            inputs = iter(["当前请求", "/退出"])
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                result = run_console(
+                    SimpleNamespace(workspace=temp, provider="mock", model=None),
+                    input_fn=lambda _prompt: next(inputs),
+                    output=outputs.append,
+                )
+            self.assertEqual(result, 0)
+            self.assertEqual(provider.calls, 1)
+            self.assertTrue(any("已取消当前模型请求" in line for line in outputs))
+            self.assertFalse(any("不应重放" in line for line in outputs))
+
+    def test_subprocess_multiline_commands_and_space_path_references(self) -> None:
+        with make_test_temp(prefix="cli-multiline-") as temp:
+            folder = Path(temp) / "folder with space"
+            folder.mkdir()
+            (folder / "hello file.txt").write_text("合成文件内容", encoding="utf-8")
+            script = (
+                "/命令\n"
+                "/多行\n"
+                "请检查 @{folder with space/hello file.txt}\n"
+                "/撤销\n"
+                "/退出\n"
+                "第二行中文仍属于同一个问题\n"
+                "/提交\n"
+                "y\n"
+                "/退出\n"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable, "-m", "cvfx_harness", "--workspace", temp,
+                    "--provider", "mock",
+                ],
+                input=script,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=10,
+                cwd=Path(__file__).resolve().parents[1],
+                env=cli_subprocess_env(temp),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("/多行", result.stdout)
+            self.assertIn("第二行中文仍属于同一个问题", result.stdout)
+            self.assertIn("folder with space/hello file.txt", result.stdout)
+            self.assertIn("合成文件内容", result.stdout)
+            self.assertNotIn("确认恢复写入前内容", result.stdout)
+            self.assertIn("[模拟模式] 已收到：请检查", result.stdout)
+            self.assertIn("/撤销", result.stdout)
+            self.assertIn("/退出", result.stdout)
+            self.assertIn("会话结束", result.stdout)
+
+    def test_subprocess_multiline_cancel_and_eof_never_submit_draft(self) -> None:
+        with make_test_temp(prefix="cli-multiline-cancel-") as temp:
+            common = [
+                sys.executable, "-m", "cvfx_harness", "--workspace", temp,
+                "--provider", "mock",
+            ]
+            cancelled = subprocess.run(
+                common,
+                input="/多行\n不应提交的合成草稿\n/取消\n/退出\n",
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=10,
+                cwd=Path(__file__).resolve().parents[1],
+                env=cli_subprocess_env(temp),
+            )
+            self.assertEqual(cancelled.returncode, 0, cancelled.stderr)
+            self.assertIn("已丢弃多行草稿", cancelled.stdout)
+            self.assertNotIn("[模拟模式]", cancelled.stdout)
+
+            eof = subprocess.run(
+                common,
+                input="/多行\nEOF 前未提交的草稿\n",
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=10,
+                cwd=Path(__file__).resolve().parents[1],
+                env=cli_subprocess_env(temp),
+            )
+            self.assertEqual(eof.returncode, 0, eof.stderr)
+            self.assertIn("多行草稿已丢弃", eof.stdout)
+            self.assertNotIn("[模拟模式]", eof.stdout)
+
+    @unittest.skipUnless(os.name == "posix", "PTY key handling is POSIX-specific")
+    def test_tty_tab_completion_ctrl_c_and_no_input_history(self) -> None:
+        if pty is None:
+            self.skipTest("pty module unavailable")
+        with make_test_temp(prefix="cli-pty-") as temp:
+            (Path(temp) / "approval.txt").write_text("合成审批文件", encoding="utf-8")
+            master_fd, slave_fd = pty.openpty()
+            process = subprocess.Popen(
+                [
+                    sys.executable, "-m", "cvfx_harness", "--workspace", temp,
+                    "--provider", "mock",
+                ],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=Path(__file__).resolve().parents[1],
+                env=cli_subprocess_env(temp),
+                close_fds=True,
+            )
+            os.close(slave_fd)
+            transcript = bytearray()
+
+            def read_until(marker: bytes, *, start: int = 0, timeout: float = 8.0) -> None:
+                deadline = time.monotonic() + timeout
+                while marker not in transcript[start:]:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self.fail(f"PTY timed out waiting for {marker!r}; output={bytes(transcript)!r}")
+                    ready, _, _ = select.select([master_fd], [], [], remaining)
+                    if not ready:
+                        continue
+                    try:
+                        transcript.extend(os.read(master_fd, 4096))
+                    except OSError:
+                        break
+
+            try:
+                read_until("你[执行]> ".encode("utf-8"))
+                self.assertIn("TTY Tab 命令补全已启用".encode("utf-8"), transcript)
+                interrupt_start = len(transcript)
+                process.send_signal(signal.SIGINT)
+                read_until("已取消当前输入".encode("utf-8"), start=interrupt_start)
+                read_until("你[执行]> ".encode("utf-8"), start=interrupt_start)
+                os.write(master_fd, "/帮\t\r".encode("utf-8"))
+                read_until("命令：".encode("utf-8"))
+                start = len(transcript)
+                os.write(master_fd, b"\x1b[A\r")
+                read_until("你[执行]> ".encode("utf-8"), start=start)
+                self.assertEqual(bytes(transcript).count("命令：".encode("utf-8")), 1)
+
+                os.write(master_fd, "/多行\r".encode("utf-8"))
+                read_until("多行> ".encode("utf-8"), start=len(transcript))
+                start = len(transcript)
+                os.write(master_fd, "请丢弃此草稿\r".encode("utf-8"))
+                read_until("请丢弃此草稿".encode("utf-8"), start=start)
+                interrupt_start = len(transcript)
+                process.send_signal(signal.SIGINT)
+                read_until("已丢弃多行草稿".encode("utf-8"), start=interrupt_start)
+                read_until("你[执行]> ".encode("utf-8"), start=interrupt_start)
+
+                approval_start = len(transcript)
+                os.write(master_fd, "请读取 @approval.txt\r".encode("utf-8"))
+                read_until("确认读取？[y/N] ".encode("utf-8"), start=approval_start)
+                approval_start = len(transcript)
+                os.write(master_fd, b"y\r")
+                read_until("[模拟模式] 已收到：".encode("utf-8"), start=approval_start)
+                read_until("你[执行]> ".encode("utf-8"), start=approval_start)
+                approval_start = len(transcript)
+                os.write(master_fd, b"\x1b[A\r")
+                read_until("你[执行]> ".encode("utf-8"), start=approval_start)
+                os.write(master_fd, "/退出\r".encode("utf-8"))
+                read_until("会话结束".encode("utf-8"))
+                self.assertEqual(process.wait(timeout=5), 0)
+                decoded = transcript.decode("utf-8", errors="replace")
+                self.assertNotIn("[模拟模式] 已收到：请丢弃此草稿", decoded)
+                self.assertNotIn("[模拟模式] 已收到：y", decoded)
+                self.assertEqual(decoded.count("[模拟模式] 已收到："), 1)
+                self.assertFalse((Path(temp) / ".python_history").exists())
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+                os.close(master_fd)
+
+    def test_multiline_input_enforces_utf8_byte_limit(self) -> None:
+        answers = iter(["甲" * MAX_MULTILINE_INPUT_BYTES, "/提交"])
+        outputs: list[str] = []
+        state, text_value = _collect_multiline_input(
+            lambda _prompt: next(answers), output=outputs.append
+        )
+        self.assertEqual(state, "too_large")
+        self.assertIsNone(text_value)
+        self.assertIn("65536 bytes", outputs[0])
+
     def test_cli_displays_streamed_chinese_safely(self) -> None:
         output_text: list[str] = []
         stream_text: list[str] = []

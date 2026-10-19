@@ -39,6 +39,12 @@ from .usage import DEFAULT_TOKEN_BUDGET
 
 _REFERENCE = re.compile(r"(?<![\w@])@(?:\{([^{}]+)\}|([^\s]+))", re.UNICODE)
 _TRAILING_PUNCTUATION = ",，。;；!?！？)]}"
+MAX_MULTILINE_INPUT_BYTES = 64 * 1024
+_CLI_COMMANDS = (
+    "/帮助", "/命令", "/状态", "/模式", "/目标", "/计划", "/保存", "/检查点",
+    "/恢复", "/会话", "/多行", "/压缩", "/统计", "/预算", "/配置", "/子代理",
+    "/撤销", "/退出",
+)
 
 
 def _safe_terminal_text(text: str) -> str:
@@ -278,6 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _help_text() -> str:
     return """命令：
   /帮助              显示帮助
+  /命令              列出可用的中文命令
   /状态              显示当前模型、目标和模式
   /模式 计划|执行    切换计划或执行模式（计划模式会拦截写入与撤销）
   /目标 <内容>       设置本会话目标；/目标 清空 可清除
@@ -307,9 +314,13 @@ def _help_text() -> str:
   /子代理 收取 [编号|全部] 将完成结果作为不可信上下文加入主对话
   /子代理 时限 <5–120>    设置后续子任务运行时限（审批/排队不计，最多 120 秒）
   /撤销              预览并恢复最近一次 Harness 文件写入
+  /多行              开始多行提问；单独输入 /提交 发送，/取消 丢弃
   /退出              结束会话
 
 文件引用：在提问中写 @相对路径，或用 @{包含空格的相对路径}。
+多行提问以换行符合并，最多 64 KiB UTF-8；Ctrl+C 或 /取消 会丢弃草稿，EOF 会结束会话且不提交。
+可用 TTY 若提供 Python readline，则 Tab 只补全命令名；输入历史（包括审批回答）不会保存或重放。
+无 TTY 时可用逐行脚本输入；EOF 结束会话。所有审批仍需单独输入 y/yes/是。
 每次文件读取和写入都要人工确认；写入/撤销会先显示完整差异。
 目录列表只返回名称和类型，每次也要人工确认；不读取目录项文件内容。
 敏感凭据路径默认禁止读取或修改。当前版本不会运行 shell 命令。
@@ -317,6 +328,84 @@ def _help_text() -> str:
 配置不接受或保存密钥；目前只支持 mock 和 DeepSeek OpenAI 兼容模式，Anthropic 未实现。
 OpenAI 兼容模式使用有界 SSE 流式文本；工具片段完整校验后仍走现有逐次审批循环。
 """
+
+
+def _configure_command_line_editing(*, enabled: bool) -> tuple[bool, Callable[[], None]]:
+    """Enable command-only Tab completion without retaining any entered line."""
+    if not enabled:
+        return False, lambda: None
+    try:
+        import readline
+    except ImportError:
+        return False, lambda: None
+
+    auto_history = getattr(readline, "set_auto_history", None)
+    if callable(auto_history):
+        auto_history(False)
+    clear_history = getattr(readline, "clear_history", None)
+    if callable(clear_history):
+        clear_history()
+
+    def complete_command(text: str, state: int) -> str | None:
+        line = readline.get_line_buffer()
+        if not line.startswith("/") or " " in line:
+            return None
+        matches = [candidate for candidate in _CLI_COMMANDS if candidate.startswith(text)]
+        return matches[state] if state < len(matches) else None
+
+    readline.set_completer(complete_command)
+    readline.set_completer_delims(" \t\n")
+    if "libedit" in (readline.__doc__ or "").casefold():
+        readline.parse_and_bind("bind ^I rl_complete")
+    else:
+        readline.parse_and_bind("tab: complete")
+
+    def clear_input_history() -> None:
+        if callable(clear_history):
+            clear_history()
+
+    return True, clear_input_history
+
+
+def _collect_multiline_input(
+    input_fn: Callable[[str], str],
+    *,
+    output: Callable[[str], None],
+) -> tuple[str, str | None]:
+    output(
+        f"多行输入：每行继续，单独输入 /提交 发送，/取消 丢弃；"
+        f"上限 {MAX_MULTILINE_INPUT_BYTES} bytes。"
+    )
+    lines: list[str] = []
+    total_bytes = 0
+    over_limit = False
+    try:
+        while True:
+            line = input_fn("多行> ")
+            marker = line.strip()
+            if marker == "/提交":
+                if over_limit:
+                    return "too_large", None
+                return "submitted", "\n".join(lines)
+            if marker == "/取消":
+                return "cancelled", None
+            if not over_limit:
+                try:
+                    line_bytes = len((line + "\n").encode("utf-8"))
+                except UnicodeEncodeError:
+                    over_limit = True
+                    lines.clear()
+                    continue
+                total_bytes += line_bytes
+                if total_bytes > MAX_MULTILINE_INPUT_BYTES:
+                    over_limit = True
+                    lines.clear()
+                    continue
+                lines.append(line)
+    except KeyboardInterrupt:
+        return "cancelled", None
+    except EOFError:
+        return "eof", None
 
 
 def _confirm_action(
@@ -357,6 +446,7 @@ def _confirm_action(
     try:
         answer = input_fn(prompt)
     except EOFError:
+        output("收到 EOF；本次文件/目录审批默认为拒绝。")
         return False
     return answer.strip().casefold() in {"y", "yes", "是"}
 
@@ -425,17 +515,35 @@ def run_console(
     if sse_streaming:
         output("已启用有界 SSE 流式文本；工具调用完整校验后按原审批循环执行。")
 
+    is_tty_input = input_fn is input and sys.stdin.isatty()
+    command_completion, clear_input_history = _configure_command_line_editing(
+        enabled=is_tty_input
+    )
+    original_input_fn = input_fn
+
+    def history_free_input(prompt: str) -> str:
+        try:
+            return original_input_fn(prompt)
+        finally:
+            clear_input_history()
+
+    input_fn = history_free_input
+    if is_tty_input:
+        if command_completion:
+            output("TTY Tab 命令补全已启用；不保存输入历史。")
+        else:
+            output("当前 Python 终端未提供 Tab 补全；可用 /命令 查找，不保存输入历史。")
+
     while True:
         try:
             line = input_fn(f"你[{mode}]> ")
         except EOFError:
             subagent_manager.cancel_all()
-            output("\n会话结束。")
+            output("\n收到 EOF；未提交的输入不会执行，会话结束。")
             return 0
         except KeyboardInterrupt:
-            subagent_manager.cancel_all()
-            output("\n已取消当前交互。")
-            return 130
+            output("\n已取消当前输入；没有提交问题，会话继续。")
+            continue
 
         stripped = line.strip()
         if not stripped:
@@ -446,6 +554,35 @@ def run_console(
         if command in {"/帮助", "/help"}:
             output(_help_text())
             continue
+        if command in {"/命令", "/commands"}:
+            output("可用命令：\n" + "  " + "\n  ".join(_CLI_COMMANDS))
+            output("输入 /帮助 查看参数；TTY 可用时，Tab 只补全命令名。")
+            continue
+        if command in {"/提交", "/cancel", "/取消"}:
+            output("/提交 和 /取消 只在 /多行 输入期间使用。")
+            continue
+        if command in {"/多行", "/multiline"}:
+            if argument.strip():
+                output("用法：/多行（随后逐行输入，单独一行 /提交 发送）")
+                continue
+            state, multiline_text = _collect_multiline_input(input_fn, output=output)
+            if state == "cancelled":
+                output("已丢弃多行草稿；没有提交问题。")
+                continue
+            if state == "eof":
+                subagent_manager.cancel_all()
+                output("收到 EOF；多行草稿已丢弃，会话结束。")
+                return 0
+            if state == "too_large":
+                output(f"多行草稿超过 {MAX_MULTILINE_INPUT_BYTES} bytes；已丢弃，没有提交。")
+                continue
+            line = multiline_text or ""
+            if not line.strip():
+                output("多行草稿为空；没有提交问题。")
+                continue
+            command = ""
+            argument = ""
+
         if command in {"/退出", "/exit", "/quit"}:
             subagent_manager.cancel_all()
             output("会话结束。")
