@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import select
 import subprocess
@@ -23,6 +24,7 @@ from prompt_toolkit.data_structures import Size
 from wcwidth import wcswidth
 
 from cvfx_harness.cli import _StreamingSecretRedactor, _confirm_action, build_parser, run_console
+from cvfx_harness.profiles import TestProfileStore
 from cvfx_harness.providers import AssistantTurn, MockProvider, ProviderCancelled, ToolCall
 from cvfx_harness.tools import ActionRequest, Workspace
 from cvfx_harness.tui import CommandCompleter, TerminalUI, terminal_supports_tui
@@ -111,6 +113,40 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertEqual(command_items[0].display_meta_text, "显示完整说明")
         self.assertEqual(values, ["计划"])
         self.assertEqual(path_values, [])
+
+    def test_test_profile_id_completion_suggests_runnable_and_removable_profiles(self) -> None:
+        from prompt_toolkit.completion import CompleteEvent
+        from prompt_toolkit.document import Document
+
+        with tempfile.TemporaryDirectory(prefix="cvfx-test-complete-") as root:
+            project = Path(root)
+            (project / "tests").mkdir()
+            workspace = Workspace(project)
+            store = TestProfileStore(workspace)
+            store.add("unit-main", "unittest", sys.executable, ".", "tests")
+            config_path = project / ".harness" / "config" / "test_profiles.json"
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            payload["profiles"].append(
+                {"id": "legacy-unit", "framework": "unittest", "cwd": ".", "target": "tests"}
+            )
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+            before = config_path.read_bytes()
+            completer = CommandCompleter(workspace)
+            event = CompleteEvent()
+
+            runnable = list(
+                completer.get_completions(Document("/测试 运行 "), event)
+            )
+            removable = list(
+                completer.get_completions(Document("/测试 移除 "), event)
+            )
+            after = config_path.read_bytes()
+
+        self.assertEqual([item.text for item in runnable], ["unit-main"])
+        self.assertEqual(runnable[0].display_meta_text, "unittest，可运行")
+        self.assertEqual([item.text for item in removable], ["legacy-unit", "unit-main"])
+        self.assertEqual(removable[0].display_meta_text, "旧配置，需重新添加解释器")
+        self.assertEqual(before, after)
 
     def test_workspace_reference_completer_handles_braces_paths_and_filters(self) -> None:
         from prompt_toolkit.completion import CompleteEvent

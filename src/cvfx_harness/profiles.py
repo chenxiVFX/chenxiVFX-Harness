@@ -292,9 +292,13 @@ class TestProfileStore:
         for profile in self.load():
             if profile.profile_id.casefold() == safe_id.casefold():
                 if profile.python is None:
-                    raise TestProfileError("该旧测试配置尚未选择外部 Python；用 /测试 添加 重新配置。")
+                    raise TestProfileError(
+                        "该旧测试配置尚未选择外部 Python；用 /测试 添加 <同一ID> 重新配置。"
+                    )
                 return profile
-        raise TestProfileError("没有名为该 ID 的用户测试配置。")
+        raise TestProfileError(
+            "没有名为该 ID 的用户测试配置；可用 /测试 列表查看，或用 /测试 添加 <ID> 创建。"
+        )
 
     def runnable(self) -> list[TestProfile]:
         profiles: list[TestProfile] = []

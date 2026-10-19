@@ -28,6 +28,7 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Button, TextArea
 from wcwidth import wcswidth
 
+from .profiles import TestProfileError, TestProfileStore
 from .sessions import SessionError, SessionStore, redact_likely_secrets
 from .tools import Workspace, WorkspaceError
 
@@ -65,6 +66,7 @@ class CommandCompleter(Completer):
 
     def __init__(self, workspace: Workspace | None = None) -> None:
         self._workspace = workspace
+        self._test_profiles = TestProfileStore(workspace) if workspace is not None else None
 
     @staticmethod
     def _path_context(document) -> tuple[str, str, bool, int] | None:
@@ -117,6 +119,35 @@ class CommandCompleter(Completer):
                             start_position=-len(prefix),
                             display_meta="历史会话",
                         )
+                    return
+            if self._test_profiles is not None:
+                for action in ("运行", "移除"):
+                    marker = f"/测试 {action} "
+                    if not before.startswith(marker):
+                        continue
+                    prefix = before[len(marker) :]
+                    if " " in prefix:
+                        return
+                    try:
+                        profiles = (
+                            self._test_profiles.runnable()
+                            if action == "运行"
+                            else self._test_profiles.load()
+                        )
+                    except TestProfileError:
+                        profiles = []
+                    for profile in profiles:
+                        if profile.profile_id.casefold().startswith(prefix.casefold()):
+                            meta = (
+                                f"{profile.framework}，可运行"
+                                if profile.python is not None
+                                else "旧配置，需重新添加解释器"
+                            )
+                            yield Completion(
+                                profile.profile_id,
+                                start_position=-len(prefix),
+                                display_meta=meta,
+                            )
                     return
         path_context = self._path_context(document)
         if path_context is not None and self._workspace is not None:

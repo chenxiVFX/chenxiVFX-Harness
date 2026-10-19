@@ -73,6 +73,60 @@ from cvfx_harness.tools import (
 )
 from cvfx_harness.usage import ProviderUsage
 
+
+def _set_windows_dacl_protection(path: Path, protected: bool) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("Advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("Kernel32", use_last_error=True)
+    get_named = advapi32.GetNamedSecurityInfoW
+    get_named.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+    ]
+    get_named.restype = wintypes.DWORD
+    set_named = advapi32.SetNamedSecurityInfoW
+    set_named.argtypes = [
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+    ]
+    set_named.restype = wintypes.DWORD
+    local_free = kernel32.LocalFree
+    local_free.argtypes = [wintypes.HLOCAL]
+    local_free.restype = wintypes.HLOCAL
+
+    dacl_information = 0x00000004
+    descriptor = wintypes.LPVOID()
+    dacl = wintypes.LPVOID()
+    status = get_named(
+        str(path), 1, dacl_information, None, None, ctypes.byref(dacl), None,
+        ctypes.byref(descriptor),
+    )
+    if status != 0 or not descriptor.value:
+        raise AssertionError("could not read synthetic Windows DACL")
+    try:
+        protection = 0x80000000 if protected else 0x20000000
+        status = set_named(
+            str(path), 1, dacl_information | protection, None, None, dacl, None
+        )
+        if status != 0:
+            raise AssertionError("could not set synthetic Windows DACL protection")
+    finally:
+        local_free(descriptor)
+
+
 def make_test_temp(prefix: str = "case-") -> tempfile.TemporaryDirectory:
     local_temp = Path(__file__).resolve().parents[1] / ".test-tmp"
     local_temp.mkdir(exist_ok=True)
@@ -331,6 +385,60 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.assertIn("4755 → 0755", requests[0].diff)
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+
+    @unittest.skipUnless(os.name == "nt", "Windows DACL semantics require a Windows fixture")
+    def test_write_preserves_protected_and_inherited_windows_dacls(self) -> None:
+        for index, protected in enumerate((True, False)):
+            with self.subTest(protected=protected):
+                target = self.root / f"windows-dacl-{index}.txt"
+                target.write_bytes(b"before")
+                _set_windows_dacl_protection(target, protected)
+                before_token = Workspace._windows_dacl_token(target)
+                prefix = b"cvfx-windows-dacl-v1\0"
+                control = int.from_bytes(
+                    before_token[len(prefix) : len(prefix) + 2], "little"
+                )
+                self.assertEqual(bool(control & 0x1000), protected)
+
+                run_tool(
+                    self.workspace,
+                    self.write_call(target.name, "after"),
+                    approve_action=self.approve(),
+                )
+
+                self.assertEqual(target.read_bytes(), b"after")
+                self.assertEqual(Workspace._windows_dacl_token(target), before_token)
+
+    @unittest.skipUnless(os.name == "nt", "Windows DACL semantics require a Windows fixture")
+    def test_windows_dacl_only_change_after_approval_is_a_conflict(self) -> None:
+        target = self.root / "windows-dacl-race.txt"
+        target.write_bytes(b"before")
+        _set_windows_dacl_protection(target, True)
+
+        def change_acl_during_approval(_request: ActionRequest) -> bool:
+            _set_windows_dacl_protection(target, False)
+            return True
+
+        with self.assertRaisesRegex(WorkspaceConflictError, "并发文件变化"):
+            run_tool(
+                self.workspace,
+                self.write_call(target.name, "after"),
+                approve_action=change_acl_during_approval,
+            )
+
+        self.assertEqual(target.read_bytes(), b"before")
+        record = next(
+            record
+            for _path, record in self.workspace._load_backups()
+            if record["path"] == target.name
+        )
+        self.assertEqual(record["state"], "conflict")
+        snapshot = record["conflict_snapshot"]
+        self.assertEqual(base64.b64decode(snapshot["bytes_base64"]), b"before")
+        self.assertEqual(
+            snapshot["acl_sha256"],
+            Workspace._acl_sha256(Workspace._windows_dacl_token(target)),
+        )
 
     def test_commit_detects_last_moment_editor_change_and_keeps_recovery_snapshot(self) -> None:
         target = self.root / "last-moment-race.txt"
@@ -974,6 +1082,42 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkspaceError, "发生变化"):
             self.workspace.undo_last(approve_action=lambda _request: self.fail("conflict must not prompt"))
         self.assertEqual(target.read_text(encoding="utf-8"), "external edit")
+
+    def test_undo_saves_utf8_and_binary_external_conflict_snapshots(self) -> None:
+        for filename, external_bytes in (
+            ("utf8-conflict.txt", "编辑器的外部修改".encode("utf-8")),
+            ("binary-conflict.txt", b"\xff\x00editor change"),
+        ):
+            with self.subTest(filename=filename):
+                run_tool(
+                    self.workspace,
+                    self.write_call(filename, "harness write"),
+                    approve_action=self.approve(),
+                )
+                target = self.root / filename
+                target.write_bytes(external_bytes)
+
+                with self.assertRaisesRegex(WorkspaceConflictError, "未覆盖当前文件"):
+                    self.workspace.undo_last(
+                        approve_action=lambda _request: self.fail(
+                            "external change must be rejected before requesting approval"
+                        )
+                    )
+
+                self.assertEqual(target.read_bytes(), external_bytes)
+                record = next(
+                    record
+                    for _path, record in self.workspace._load_backups()
+                    if record["path"] == filename
+                )
+                self.assertTrue(record["undo_conflict"])
+                snapshot = record["conflict_snapshot"]
+                self.assertEqual(
+                    base64.b64decode(snapshot["bytes_base64"]), external_bytes
+                )
+                self.assertEqual(
+                    snapshot["sha256"], hashlib.sha256(external_bytes).hexdigest()
+                )
 
     def test_approval_preview_is_revalidated_before_commit(self) -> None:
         file = self.root / "race.txt"

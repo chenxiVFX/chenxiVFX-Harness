@@ -22,7 +22,7 @@
 | 安全会话保存/恢复 | 已实现 / 离线可测 | `.harness/sessions/`；默认存安全完整轮次；TUI `/恢复 ` 可补全并选择本地会话名；恢复校验归档、标明历史上下文，不恢复审批/执行授权，也不执行旧工具调用；`/检查点` 另存用户手写脱敏摘要，预览确认后才保存；不复制工具结果 |
 | 可审核上下文压缩 | 已实现 / 离线可测 | 本地有损摘要，确认后应用；纳入当前目标与可识别的完整用户限制，摘要上限 32 KiB；工具组校验配对后整组保留/丢弃；拒绝不完整轮次；不可信 `user` 消息，疑似凭据脱敏，历史审批不延续为当前授权 |
 | Token / 预算统计 | 已实现 / 离线可测 | 上下文预算只提示；`/统计` 分别显示固定前缀和会话消息的独立启发式估算；provider usage 可选报告缓存输入命中数；usage 缺失时仍保证各请求上限之和不超过预算 |
-| 用户测试配置与执行 | 已实现 / 离线可测 | 用户在 `/测试 添加` 选择独立外部 Python 绝对路径；profile 固定 ID、框架、工作区相对 cwd/target，不接受模型提供命令或路径；旧 profile 未选择解释器时禁用。模型只能选择可运行 ID；每次展示外部解释器/argv/cwd 与 120 秒、32 KiB 上限并逐次审批。`/测试 运行` 仅本地显示；模型工具分享最多 16 KiB 输出另需批准。Windows Job Object 先挂起启动、完成分配后再恢复，并在取消/超时/输出溢出后查询活动进程。非沙箱：Linux 普通进程组不保证捕获自行 `setsid` 脱离者；无 CPU/内存/磁盘配额。Harness EXE 自带 Python，但用户测试仍需独立外部 Python；pytest 仅为 CI 的 hash 锁定验证依赖，不打包或自动安装 |
+| 用户测试配置与执行 | 已实现 / 离线可测 | 用户在 `/测试 添加` 选择独立外部 Python 绝对路径；profile 固定 ID、框架、工作区相对 cwd/target，不接受模型提供命令或路径；旧 profile 未选择解释器时禁用。TUI 可补全可运行/可移除 ID；无配置、过期解释器、缺少 pytest 和取消时显示下一步。模型只能选择可运行 ID；每次展示外部解释器/argv/cwd 与 120 秒、32 KiB 上限并逐次审批。`/测试 运行` 仅本地显示；模型工具分享最多 16 KiB 输出另需批准。Windows Job Object 先挂起启动、完成分配后再恢复，并在取消/超时/输出溢出后查询活动进程。非沙箱：Linux 普通进程组不保证捕获自行 `setsid` 脱离者；无 CPU/内存/磁盘配额。Harness EXE 自带 Python，但用户测试仍需独立外部 Python；pytest 仅为 CI 的 hash 锁定验证依赖，不打包或自动安装 |
 | Cache-friendly 稳定前缀 | 部分实现 / 离线可测 | 静态 system prompt 与固定工具 schema 顺序稳定；用户测试配置会在末尾增加动态 ID 枚举 schema；本地分项不是缓存命中量；只显示 provider 明确报告的缓存 tokens；没有缓存命中率承诺或远端命中验证 |
 | 子代理 | 已实现 / 离线可测（Mock 与两个 DeepSeek 协议适配器） | 每会话最多 3 项、并发 2、最多 2 轮；独立审批与取消；只读工具限精确预授权路径；无写入/shell/递归；Anthropic 兼容远端行为未在线验证 |
 | PTC（Programmatic Tool Calling） | 待实现 / 术语假设 | 暂按“模型组合调用工具/程序化工具调用”记录；未实现脚本或工具执行链 |
@@ -219,13 +219,19 @@
 - 两个 CI 工作流从官方 PyPI 安装单独 hash 锁定的 pytest 验证依赖，并在外部 Python 解释器中运行合成 unittest/pytest profile。Windows standalone workflow 还通过真正打包的 EXE 配置并运行两类本地 fixture，不需要 Harness 自身依赖系统 Python。pytest 不属于 Harness 运行依赖，不打包或自动安装。
 - Windows runner 终止路径会查询 Job Object 活动进程，并通过取消用例核验普通子进程已退出；环境回归确认未继承父进程合成敏感标记。Linux 仅保证普通进程组终止，不能保证捕获调用 `setsid` 脱离者；测试代码仍以当前用户权限运行，未提供 CPU、内存、磁盘或网络沙箱。
 
+## TUI 测试配置补全与下一步提示（2026-10-19）
+
+- 在 TUI 输入 `/测试 运行 ` 后补全仅列解释器可用的配置 ID；`/测试 移除 ` 可补全所有 ID，并标记缺少解释器的旧配置。补全只读本地配置，不运行测试、不修改配置、不授予审批。
+- 无配置时提示完整交互添加路径及后续运行命令；过期解释器和旧配置提示重新添加同一 ID；识别 pytest 的标准缺失模块错误后给出手动准备依赖或改用 unittest 的提示，不执行安装；取消运行后提示用户显式重试，不会自动重跑。
+- Debian / Python 3.12 本地离线回归：228 项，227 通过、1 项 Windows junction 用例跳过；覆盖 TUI 运行/移除 ID 补全、旧配置处理、无配置、失效解释器、合成 pytest 缺失错误和取消提示。`compileall`、安装自检、TUI 键盘自检、unittest/pytest 合成 profile 自检和 `git diff --check` 通过。所有测试使用合成工作区，无真实 API；自动测试不等同完整产品验收。
+
 ## 写入权限、EOF 差异与并发冲突快照（2026-10-19）
 
-- 覆盖已有文件时保留普通 POSIX `rwx` 权限位；setuid/setgid/sticky 位会在审批差异中显示并清除。POSIX ACL xattr 与 Windows DACL 尽可能从目标复制到替换文件，无法安全核对或复制时取消写入。所有权、时间戳和其他扩展属性不承诺保留。
+- 覆盖已有文件时保留普通 POSIX `rwx` 权限位；setuid/setgid/sticky 位会在审批差异中显示并清除。POSIX ACL xattr 与 Windows DACL 尽可能从目标复制到替换文件；Windows 同时保留受保护/允许继承状态，并在最后检查中比较 DACL 内容与继承状态，以识别时间戳不变的 ACL-only 更改。无法安全核对或复制时取消写入。所有权、时间戳和其他扩展属性不承诺保留。
 - unified diff 为缺少末尾换行的变更行输出标准 `\ No newline at end of file` 标记，避免新旧行粘连。
-- 写入、补丁和撤销在临时文件准备后再次按工作区目标核对内容、权限位与文件状态。若检查发现编辑冲突，不覆盖目标；原始备份和读取到的竞争版本快照（包括非 UTF-8 字节）保留在 Harness 私有撤销记录中。撤销会跳过已冲突的写入记录。
+- 写入、补丁和撤销在临时文件准备后再次按工作区目标核对内容、权限位与文件状态。若检查发现编辑冲突，不覆盖目标；原始备份和读取到的竞争版本快照（包括非 UTF-8 字节）保留在 Harness 私有撤销记录中。撤销遇到审批前外部修改时，在请求审批前保存原始字节快照并记录 `undo_conflict`，随后拒绝恢复。
 - 最后一次比较与文件系统 rename/replace 之间仍有不可移植的竞态；不声称通用 CAS，也不把 advisory lock 当作约束非协作编辑器的保证。Windows 仍使用 reparse 检查和路径式替换，存在相同的最后检查窗口。
-- Debian / Python 3.12 本地离线回归：224 项，223 通过、1 项 Windows junction 用例跳过；覆盖普通权限保留、特殊权限提示、无末尾换行 diff、写入/补丁/撤销冲突及二进制竞争快照。`compileall`、安装自检、TUI 合成键盘自检、unittest/pytest 合成 profile 自检和 `git diff --check` 通过。只用临时合成文件与 Mock；结果不等同完整产品验收。
+- Debian / Python 3.12 本地离线回归：231 项，228 通过、3 项平台限定跳过（Windows junction 1 项、Windows DACL 2 项）；覆盖普通权限保留、Windows-only protected/inherited DACL 和 ACL-only 冲突夹具、审批前 UTF-8/二进制撤销冲突快照。`compileall`、安装自检、TUI 合成键盘自检、unittest/pytest 合成 profile 自检和 `git diff --check` 通过。只用临时合成文件与 Mock；结果不等同完整产品验收。
 
 ## 参考项目复用边界
 

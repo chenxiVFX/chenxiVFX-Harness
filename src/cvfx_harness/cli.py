@@ -796,13 +796,14 @@ def run_console(
                     profiles = test_profile_store.load()
                     if not profiles:
                         output(
-                            "当前没有测试配置。用 /测试 添加 创建用户配置；"
-                            "本命令只保存配置，不会运行测试。"
+                            "当前没有测试配置。下一步：输入 /测试 添加 <ID>，按提示填写框架、"
+                            "外部 Python、工作目录和测试目标；之后用 /测试 运行 <ID>。"
+                            "pytest 必须已在所选解释器环境中准备好；Harness 不会自动安装依赖。"
                         )
                     else:
                         lines = [
                             f"  {profile.profile_id}: Python {profile.framework}；"
-                            f"解释器 {profile.python or '未配置（旧配置需重新添加）'!r}；"
+                            f"解释器 {profile.python or '未配置（用 /测试 添加 <同一ID> 重新选择）'!r}；"
                             f"工作目录 {profile.cwd!r}；目标 {profile.target!r}"
                             for profile in profiles
                         ]
@@ -814,8 +815,12 @@ def run_console(
 
                 if subcommand in {"添加", "add"}:
                     profile_id = detail.strip() or input_fn("测试配置 ID> ").strip()
-                    framework = input_fn("测试框架（unittest/pytest）> ").strip()
-                    interpreter = input_fn("外部 Python 可执行文件绝对路径> ").strip()
+                    framework = input_fn(
+                        "测试框架（unittest/pytest；pytest 需在所选解释器环境中已有）> "
+                    ).strip()
+                    interpreter = input_fn(
+                        "外部 Python 可执行文件绝对路径（不要填写命令参数）> "
+                    ).strip()
                     cwd = input_fn("工作目录（工作区相对路径）> ").strip()
                     target = input_fn("测试目标（工作区相对路径）> ").strip()
                     profile = test_profile_store.add(
@@ -828,6 +833,8 @@ def run_console(
                         f"cwd={_safe_terminal_text(profile.cwd)!r}，"
                         f"target={_safe_terminal_text(profile.target)!r}。当前只保存配置，不会运行。"
                     )
+                    if profile.framework == "pytest":
+                        output("请确认该外部 Python 环境已准备 pytest；Harness 不会自动安装依赖。")
                     continue
 
                 if subcommand in {"运行", "run"}:
@@ -848,7 +855,10 @@ def run_console(
                             share_output=False,
                         )
                     except (KeyboardInterrupt, ProviderCancelled):
-                        output("已取消本地测试运行；进程清理已启动。")
+                        output(
+                            "已取消本地测试运行；进程清理已启动。"
+                            f"可用 /测试 运行 {profile_id} 重新开始；不会自动重试。"
+                        )
                     else:
                         output(result)
                     continue

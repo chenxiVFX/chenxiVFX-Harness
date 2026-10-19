@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from cvfx_harness.cli import build_parser, run_console
 from cvfx_harness.profiles import TestProfileError, TestProfileStore
 from cvfx_harness.providers import MockProvider
+from cvfx_harness.test_runner import TestRunResult
 from cvfx_harness.tui import CommandCompleter
 from cvfx_harness.tools import ToolCall, Workspace, WorkspaceError, run_tool
 
@@ -178,6 +179,7 @@ class TestProfileStoreTests(unittest.TestCase):
             provider = CountingMock()
             outputs: list[str] = []
             inputs = iter([
+                "/测试 列表",
                 "/测试 添加 unit",
                 "unittest",
                 sys.executable,
@@ -198,6 +200,9 @@ class TestProfileStoreTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             self.assertEqual(provider.requests, 0)
+            self.assertTrue(any("当前没有测试配置" in line for line in outputs))
+            self.assertTrue(any("/测试 添加 <ID>" in line for line in outputs))
+            self.assertTrue(any("Harness 不会自动安装依赖" in line for line in outputs))
             self.assertTrue(any("只保存配置，不会运行" in line for line in outputs))
             self.assertTrue(any("tests with spaces" in line for line in outputs))
             self.assertTrue(any("synthetic CLI profile executed" in line for line in outputs))
@@ -205,6 +210,111 @@ class TestProfileStoreTests(unittest.TestCase):
             self.assertTrue(any("输出仅在本地显示" in line for line in outputs))
             self.assertTrue(any("已移除测试配置" in line for line in outputs))
             self.assertEqual(TestProfileStore(Workspace(project)).load(), [])
+
+    def test_missing_pytest_prints_manual_recovery_steps_without_installing(self) -> None:
+        with self._synthetic_project() as root:
+            project = Path(root)
+            (project / "tests").mkdir()
+            outputs: list[str] = []
+            inputs = iter([
+                "/测试 添加 pytest-suite",
+                "pytest",
+                sys.executable,
+                ".",
+                "tests",
+                "/测试 运行 pytest-suite",
+                "是",
+                "/退出",
+            ])
+            args = build_parser().parse_args(
+                ["--workspace", str(project), "--provider", "mock"]
+            )
+            missing_pytest = TestRunResult(
+                "failed",
+                1,
+                "ModuleNotFoundError: No module named 'pytest'\n",
+                44,
+                False,
+            )
+            with (
+                patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()),
+                patch("cvfx_harness.test_runner.execute_profile", return_value=missing_pytest) as execute,
+            ):
+                result = run_console(
+                    args,
+                    input_fn=lambda _prompt: next(inputs),
+                    output=outputs.append,
+                )
+
+        self.assertEqual(result, 0)
+        execute.assert_called_once()
+        self.assertTrue(any("外部 Python 环境没有 pytest" in line for line in outputs))
+        self.assertTrue(any("Harness 不会自动安装依赖" in line for line in outputs))
+        self.assertTrue(any("改用 unittest 配置" in line for line in outputs))
+
+    def test_stale_interpreter_gives_reconfiguration_steps_without_approval(self) -> None:
+        with self._synthetic_project() as root:
+            project = Path(root)
+            (project / "tests").mkdir()
+            workspace = Workspace(project)
+            store = TestProfileStore(workspace)
+            store.add("stale-suite", "unittest", sys.executable, ".", "tests")
+            config_path = project / ".harness" / "config" / "test_profiles.json"
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            missing = project / ("removed-python.exe" if os.name == "nt" else "removed-python")
+            payload["profiles"][0]["python"] = str(missing)
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            outputs: list[str] = []
+            inputs = iter(["/测试 运行 stale-suite", "/测试 列表", "/退出"])
+            args = build_parser().parse_args(
+                ["--workspace", str(project), "--provider", "mock"]
+            )
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()):
+                result = run_console(
+                    args,
+                    input_fn=lambda _prompt: next(inputs),
+                    output=outputs.append,
+                )
+
+        self.assertEqual(result, 0)
+        self.assertTrue(any("Python 解释器不可用" in line for line in outputs))
+        self.assertTrue(any("/测试 添加 <ID>" in line for line in outputs))
+        self.assertFalse(any("argv：" in line for line in outputs))
+
+    def test_cancelled_test_run_suggests_explicit_retry_without_restarting(self) -> None:
+        with self._synthetic_project() as root:
+            project = Path(root)
+            (project / "tests").mkdir()
+            outputs: list[str] = []
+            inputs = iter([
+                "/测试 添加 unit-suite",
+                "unittest",
+                sys.executable,
+                ".",
+                "tests",
+                "/测试 运行 unit-suite",
+                "是",
+                "/退出",
+            ])
+            args = build_parser().parse_args(
+                ["--workspace", str(project), "--provider", "mock"]
+            )
+            cancelled = TestRunResult("cancelled", None, "", 0, False)
+            with (
+                patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()),
+                patch("cvfx_harness.test_runner.execute_profile", return_value=cancelled) as execute,
+            ):
+                result = run_console(
+                    args,
+                    input_fn=lambda _prompt: next(inputs),
+                    output=outputs.append,
+                )
+
+        self.assertEqual(result, 0)
+        execute.assert_called_once()
+        self.assertTrue(any("/测试 运行 unit-suite 重新开始" in line for line in outputs))
+        self.assertTrue(any("不会自动重试" in line for line in outputs))
 
 
 if __name__ == "__main__":

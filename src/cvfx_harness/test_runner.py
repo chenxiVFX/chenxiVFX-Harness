@@ -71,6 +71,18 @@ def _output_summary(result: TestRunResult) -> str:
     return f"{title} 输出 {result.output_bytes} bytes{suffix}。"
 
 
+def _reports_missing_pytest(output: str) -> bool:
+    missing_pytest_lines = {
+        "no module named pytest",
+        "no module named 'pytest'",
+        'no module named "pytest"',
+        "modulenotfounderror: no module named pytest",
+        "modulenotfounderror: no module named 'pytest'",
+        'modulenotfounderror: no module named "pytest"',
+    }
+    return any(line.strip().casefold() in missing_pytest_lines for line in output.splitlines())
+
+
 def _test_environment() -> dict[str, str]:
     env = {
         "PATH": os.defpath,
@@ -545,8 +557,13 @@ def run_test_profile_tool(
     try:
         profile = profile_store.get(profile_id)
         argv, cwd = _command_for(profile, workspace)
-    except (TestProfileError, WorkspaceError):
-        return "没有可运行的匹配用户测试配置；未启动测试进程。"
+    except TestProfileError as exc:
+        return (
+            f"测试配置无法运行：{exc} 可用 /测试 列表查看状态，"
+            "或用 /测试 添加 <ID> 重新配置。未启动测试进程。"
+        )
+    except WorkspaceError:
+        return "测试配置路径不可用；未启动测试进程。可用 /测试 列表检查配置，或重新添加配置。"
     preview = (
         f"用户配置 ID：{profile.profile_id}\n"
         f"Python 解释器：{argv[0]}\n"
@@ -589,18 +606,29 @@ def run_test_profile_tool(
         emit_output(f"\n本地测试结果：{summary}\n{body}\n")
 
     if result.status == "cancelled":
-        return f"{summary} 用户取消后的输出仅在本地显示；没有发送给模型。"
+        return (
+            f"{summary} 用户取消后的输出仅在本地显示；没有发送给模型。"
+            f"可用 /测试 运行 {profile.profile_id} 重新开始；不会自动重试。"
+        )
+
+    pytest_hint = ""
+    if profile.framework == "pytest" and result.status == "failed" and _reports_missing_pytest(result.output):
+        pytest_hint = (
+            "所选外部 Python 环境没有 pytest；Harness 不会自动安装依赖。"
+            "请在该解释器环境中自行准备 pytest，或改用 unittest 配置后重试。"
+        )
 
     if not share_output:
-        return f"{summary} 测试输出仅在本地显示；没有发送给模型。"
+        return f"{summary} 测试输出仅在本地显示；没有发送给模型。{pytest_hint}"
 
     shared = _truncate_utf8(result.output, MAX_SHARED_TEST_OUTPUT_BYTES)
     if result.output_truncated and "[分享输出已截断]" not in shared:
         shared = _truncate_utf8(shared + "\n[测试进程输出已达到本地上限]", MAX_SHARED_TEST_OUTPUT_BYTES)
     if not shared:
-        return f"{summary} 用户未提供测试输出给模型。"
+        return f"{summary} 用户未提供测试输出给模型。{pytest_hint}"
     share_preview = (
         f"测试配置：{profile.profile_id}\n{summary}\n"
+        f"{pytest_hint}\n"
         "以下内容已经进行凭据脱敏和终端控制字符转义。"
         "批准后将把至多 16 KiB 输出发送给当前模型：\n\n"
         f"{shared}"
@@ -615,7 +643,7 @@ def run_test_profile_tool(
             source="test_runner",
         )
     ):
-        return f"{summary} 用户选择仅在本地查看；测试输出没有发送给模型。"
+        return f"{summary} 用户选择仅在本地查看；测试输出没有发送给模型。{pytest_hint}"
     if cancellation_event is not None and cancellation_event.is_set():
         raise ProviderCancelled("test output sharing cancelled")
-    return f"{summary}\n用户另行批准的脱敏输出：\n{shared}"
+    return f"{summary}\n{pytest_hint}\n用户另行批准的脱敏输出：\n{shared}"

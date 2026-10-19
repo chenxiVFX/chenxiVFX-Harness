@@ -142,10 +142,12 @@ class WorkspaceConflictError(WorkspaceError):
         *,
         current_bytes: bytes | None,
         current_mode: int | None = None,
+        current_acl_token: bytes | None = None,
     ) -> None:
         super().__init__(message)
         self.current_bytes = current_bytes
         self.current_mode = current_mode
+        self.current_acl_token = current_acl_token
 
 
 def _safe_terminal_display_length(text: str) -> int:
@@ -182,6 +184,7 @@ class WritePreview:
     before_bytes: bytes | None
     before_mode: int | None
     before_token: tuple[int, ...] | None
+    before_acl_token: bytes | None
     before_content: str
     new_content: str
     diff: str
@@ -688,6 +691,11 @@ class Workspace:
         canonical_path = target.relative_to(self.root).as_posix()
         diff = self._diff(canonical_path, before_content, content, before_exists=existed)
         before_mode = stat.S_IMODE(before_info.st_mode) if before_info is not None else None
+        before_acl_token = (
+            self._windows_dacl_token(target)
+            if os.name == "nt" and before_info is not None
+            else None
+        )
         if os.name != "nt" and before_mode is not None and before_mode & 0o7000:
             diff = (
                 f"POSIX 权限位：{before_mode:04o} → {before_mode & 0o777:04o}"
@@ -702,6 +710,7 @@ class Workspace:
             before_bytes=before_bytes,
             before_mode=before_mode,
             before_token=self._stat_token(before_info),
+            before_acl_token=before_acl_token,
             before_content=before_content,
             new_content=content,
             diff=diff,
@@ -880,6 +889,123 @@ class Workspace:
             raise WorkspaceError("无法保留现有 POSIX ACL；目标文件未替换。") from None
 
     @staticmethod
+    def _windows_dacl_token(target: Path) -> bytes:
+        if os.name != "nt":
+            return b""
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.WinDLL("Advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("Kernel32", use_last_error=True)
+        get_named_security_info = advapi32.GetNamedSecurityInfoW
+        get_named_security_info.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+        ]
+        get_named_security_info.restype = wintypes.DWORD
+        get_security_descriptor_control = advapi32.GetSecurityDescriptorControl
+        get_security_descriptor_control.argtypes = [
+            wintypes.LPVOID,
+            ctypes.POINTER(wintypes.WORD),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        get_security_descriptor_control.restype = wintypes.BOOL
+        get_security_descriptor_dacl = advapi32.GetSecurityDescriptorDacl
+        get_security_descriptor_dacl.argtypes = [
+            wintypes.LPVOID,
+            ctypes.POINTER(wintypes.BOOL),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.BOOL),
+        ]
+        get_security_descriptor_dacl.restype = wintypes.BOOL
+        get_acl_information = advapi32.GetAclInformation
+        get_acl_information.argtypes = [
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        ]
+        get_acl_information.restype = wintypes.BOOL
+        local_free = kernel32.LocalFree
+        local_free.argtypes = [wintypes.HLOCAL]
+        local_free.restype = wintypes.HLOCAL
+
+        dacl_information = 0x00000004
+        file_object = 1
+        dacl = wintypes.LPVOID()
+        descriptor = wintypes.LPVOID()
+        status = get_named_security_info(
+            str(target),
+            file_object,
+            dacl_information,
+            None,
+            None,
+            ctypes.byref(dacl),
+            None,
+            ctypes.byref(descriptor),
+        )
+        if status != 0 or not descriptor.value:
+            raise WorkspaceError("无法读取目标 Windows DACL；操作已取消。")
+        try:
+            control = wintypes.WORD()
+            revision = wintypes.DWORD()
+            if not get_security_descriptor_control(
+                descriptor, ctypes.byref(control), ctypes.byref(revision)
+            ):
+                raise WorkspaceError("无法检查目标 Windows ACL 继承状态；操作已取消。")
+            dacl_present = wintypes.BOOL()
+            dacl_defaulted = wintypes.BOOL()
+            dacl_from_descriptor = wintypes.LPVOID()
+            if not get_security_descriptor_dacl(
+                descriptor,
+                ctypes.byref(dacl_present),
+                ctypes.byref(dacl_from_descriptor),
+                ctypes.byref(dacl_defaulted),
+            ):
+                raise WorkspaceError("无法检查目标 Windows DACL；操作已取消。")
+
+            acl_bytes = b""
+            if dacl_present.value and dacl_from_descriptor.value:
+                class AclSizeInformation(ctypes.Structure):
+                    _fields_ = [
+                        ("AceCount", wintypes.DWORD),
+                        ("AclBytesInUse", wintypes.DWORD),
+                        ("AclBytesFree", wintypes.DWORD),
+                    ]
+
+                acl_size = AclSizeInformation()
+                if not get_acl_information(
+                    dacl_from_descriptor,
+                    ctypes.byref(acl_size),
+                    ctypes.sizeof(acl_size),
+                    2,  # AclSizeInformation
+                ):
+                    raise WorkspaceError("无法读取目标 Windows DACL 内容；操作已取消。")
+                acl_bytes = ctypes.string_at(dacl_from_descriptor, acl_size.AclBytesInUse)
+
+            dacl_control_mask = 0x1500  # protected, auto-inherit requested/inherited
+            control_bits = control.value & dacl_control_mask
+            presence_bits = bytes((
+                int(bool(dacl_present.value)),
+                int(bool(dacl_defaulted.value)),
+            ))
+            return (
+                b"cvfx-windows-dacl-v1\0"
+                + control_bits.to_bytes(2, "little")
+                + presence_bits
+                + len(acl_bytes).to_bytes(4, "little")
+                + acl_bytes
+            )
+        finally:
+            local_free(descriptor)
+
+    @staticmethod
     def _copy_windows_dacl(source: Path, destination: Path) -> None:
         if os.name != "nt":
             return
@@ -887,30 +1013,86 @@ class Workspace:
         from ctypes import wintypes
 
         advapi32 = ctypes.WinDLL("Advapi32", use_last_error=True)
-        get_file_security = advapi32.GetFileSecurityW
-        set_file_security = advapi32.SetFileSecurityW
-        get_file_security.argtypes = [
+        kernel32 = ctypes.WinDLL("Kernel32", use_last_error=True)
+        get_named_security_info = advapi32.GetNamedSecurityInfoW
+        get_named_security_info.argtypes = [
             wintypes.LPCWSTR,
             wintypes.DWORD,
-            wintypes.LPVOID,
             wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+        ]
+        get_named_security_info.restype = wintypes.DWORD
+        get_security_descriptor_control = advapi32.GetSecurityDescriptorControl
+        get_security_descriptor_control.argtypes = [
+            wintypes.LPVOID,
+            ctypes.POINTER(wintypes.WORD),
             ctypes.POINTER(wintypes.DWORD),
         ]
-        get_file_security.restype = wintypes.BOOL
-        set_file_security.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.LPVOID]
-        set_file_security.restype = wintypes.BOOL
+        get_security_descriptor_control.restype = wintypes.BOOL
+        set_named_security_info = advapi32.SetNamedSecurityInfoW
+        set_named_security_info.argtypes = [
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+        ]
+        set_named_security_info.restype = wintypes.DWORD
+        local_free = kernel32.LocalFree
+        local_free.argtypes = [wintypes.HLOCAL]
+        local_free.restype = wintypes.HLOCAL
+
         dacl_information = 0x00000004
-        required = wintypes.DWORD(0)
-        get_file_security(str(source), dacl_information, None, 0, ctypes.byref(required))
-        if required.value <= 0:
+        protected_dacl_information = 0x80000000
+        unprotected_dacl_information = 0x20000000
+        file_object = 1
+        dacl = wintypes.LPVOID()
+        descriptor = wintypes.LPVOID()
+        status = get_named_security_info(
+            str(source),
+            file_object,
+            dacl_information,
+            None,
+            None,
+            ctypes.byref(dacl),
+            None,
+            ctypes.byref(descriptor),
+        )
+        if status != 0 or not descriptor.value:
             raise WorkspaceError("无法读取目标 Windows DACL；目标文件未替换。")
-        descriptor = ctypes.create_string_buffer(required.value)
-        if not get_file_security(
-            str(source), dacl_information, descriptor, required.value, ctypes.byref(required)
-        ):
-            raise WorkspaceError("无法读取目标 Windows DACL；目标文件未替换。")
-        if not set_file_security(str(destination), dacl_information, descriptor):
-            raise WorkspaceError("无法保留目标 Windows DACL；目标文件未替换。")
+        try:
+            control = wintypes.WORD()
+            revision = wintypes.DWORD()
+            if not get_security_descriptor_control(
+                descriptor, ctypes.byref(control), ctypes.byref(revision)
+            ):
+                raise WorkspaceError("无法检查目标 Windows ACL 继承状态；目标文件未替换。")
+            protection_flag = (
+                protected_dacl_information
+                if control.value & 0x1000
+                else unprotected_dacl_information
+            )
+            status = set_named_security_info(
+                str(destination),
+                file_object,
+                dacl_information | protection_flag,
+                None,
+                None,
+                dacl,
+                None,
+            )
+            if status != 0:
+                raise WorkspaceError("无法保留目标 Windows DACL 及继承状态；目标文件未替换。")
+        finally:
+            local_free(descriptor)
+        if Workspace._windows_dacl_token(source) != Workspace._windows_dacl_token(destination):
+            raise WorkspaceError("替换文件的 Windows DACL 与继承状态不匹配；目标文件未替换。")
 
     def _snapshot_matches(
         self,
@@ -919,14 +1101,22 @@ class Workspace:
         expected_bytes: bytes | None,
         expected_mode: int | None,
         expected_token: tuple[int, ...] | None,
+        expected_acl_token: bytes | None = None,
+        current_acl_token: bytes | None = None,
     ) -> bool:
         if data != expected_bytes:
             return False
         if info is None:
-            return expected_mode is None and expected_token is None
+            return (
+                expected_mode is None
+                and expected_token is None
+                and expected_acl_token is None
+            )
         if expected_mode is not None and stat.S_IMODE(info.st_mode) != expected_mode:
             return False
         if expected_token is not None and self._stat_token(info) != expected_token:
+            return False
+        if expected_acl_token is not None and current_acl_token != expected_acl_token:
             return False
         return True
 
@@ -939,6 +1129,7 @@ class Workspace:
         expected_before_bytes: bytes | None = None,
         expected_before_mode: int | None = None,
         expected_before_token: tuple[int, ...] | None = None,
+        expected_before_acl_token: bytes | None = None,
     ) -> None:
         if not target.parent.is_dir():
             raise WorkspaceError("目标文件的父目录必须已存在。")
@@ -1055,17 +1246,30 @@ class Workspace:
             self._assert_no_reparse_points(target)
             if guarded:
                 current_bytes, current_info = self._read_snapshot_state(target, validate_utf8=False)
+                current_acl_token: bytes | None = None
+                if os.name == "nt" and current_info is not None:
+                    try:
+                        current_acl_token = self._windows_dacl_token(target)
+                    except WorkspaceError:
+                        raise WorkspaceConflictError(
+                            "无法复核目标 Windows DACL；没有替换目标。",
+                            current_bytes=current_bytes,
+                            current_mode=stat.S_IMODE(current_info.st_mode),
+                        ) from None
                 if not self._snapshot_matches(
                     current_bytes,
                     current_info,
                     expected_before_bytes,
                     expected_before_mode,
                     expected_before_token,
+                    expected_before_acl_token,
+                    current_acl_token,
                 ):
                     raise WorkspaceConflictError(
                         "原子替换前检测到并发文件变化；没有替换目标。",
                         current_bytes=current_bytes,
                         current_mode=stat.S_IMODE(current_info.st_mode) if current_info else None,
+                        current_acl_token=current_acl_token,
                     )
             os.fsync(descriptor)
             os.close(descriptor)
@@ -1106,7 +1310,25 @@ class Workspace:
             "sha256": hashlib.sha256(current).hexdigest() if current is not None else None,
             "bytes_base64": base64.b64encode(current).decode("ascii") if current is not None else None,
             "mode": error.current_mode,
+            "acl_sha256": Workspace._acl_sha256(error.current_acl_token),
         }
+
+    @staticmethod
+    def _acl_sha256(token: bytes | None) -> str | None:
+        return hashlib.sha256(token).hexdigest() if token is not None else None
+
+    def _persist_conflict_snapshot(
+        self,
+        backup_path: Path,
+        record: dict[str, Any],
+        error: WorkspaceConflictError,
+    ) -> bool:
+        record["conflict_snapshot"] = self._conflict_snapshot(error)
+        try:
+            self._atomic_write_json(backup_path, record)
+        except (OSError, WorkspaceError):
+            return False
+        return True
 
     def _unlink_workspace_file(
         self,
@@ -1116,6 +1338,7 @@ class Workspace:
         expected_before_bytes: bytes | None = None,
         expected_before_mode: int | None = None,
         expected_before_token: tuple[int, ...] | None = None,
+        expected_before_acl_token: bytes | None = None,
     ) -> None:
         if self._supports_dir_fd_operations():
             try:
@@ -1154,17 +1377,30 @@ class Workspace:
         self._assert_no_reparse_points(target)
         if guarded:
             current_bytes, current_info = self._read_snapshot_state(target, validate_utf8=False)
+            current_acl_token: bytes | None = None
+            if os.name == "nt" and current_info is not None:
+                try:
+                    current_acl_token = self._windows_dacl_token(target)
+                except WorkspaceError:
+                    raise WorkspaceConflictError(
+                        "无法复核目标 Windows DACL；未删除目标。",
+                        current_bytes=current_bytes,
+                        current_mode=stat.S_IMODE(current_info.st_mode),
+                    ) from None
             if not self._snapshot_matches(
                 current_bytes,
                 current_info,
                 expected_before_bytes,
                 expected_before_mode,
                 expected_before_token,
+                expected_before_acl_token,
+                current_acl_token,
             ):
                 raise WorkspaceConflictError(
                     "撤销删除前发现并发文件变化；未删除目标。",
                     current_bytes=current_bytes,
                     current_mode=stat.S_IMODE(current_info.st_mode) if current_info else None,
+                    current_acl_token=current_acl_token,
                 )
         try:
             target.unlink()
@@ -1192,6 +1428,10 @@ class Workspace:
             "path": preview.canonical_path,
             "before_exists": preview.existed,
             "before_mode": preview.before_mode,
+            "before_acl_sha256": self._acl_sha256(preview.before_acl_token),
+            "after_acl_sha256": (
+                self._acl_sha256(preview.before_acl_token) if preview.existed else None
+            ),
             "before_base64": (
                 base64.b64encode(preview.before_bytes).decode("ascii")
                 if preview.before_bytes is not None
@@ -1215,18 +1455,21 @@ class Workspace:
                 expected_before_bytes=preview.before_bytes,
                 expected_before_mode=preview.before_mode,
                 expected_before_token=preview.before_token,
+                expected_before_acl_token=preview.before_acl_token,
             )
         except WorkspaceConflictError as exc:
             record["state"] = "conflict"
-            record["conflict_snapshot"] = self._conflict_snapshot(exc)
-            try:
-                self._atomic_write_json(backup_path, record)
-            except (OSError, WorkspaceError):
-                pass
+            saved = self._persist_conflict_snapshot(backup_path, record, exc)
+            snapshot_status = (
+                f"冲突快照已保留在备份 {backup_id}。"
+                if saved
+                else f"冲突快照写入失败；原始备份 {backup_id} 仍保留。"
+            )
             raise WorkspaceConflictError(
-                f"检测到并发文件变化，目标未被替换；原始与冲突快照保留在备份 {backup_id}。",
+                f"检测到并发文件变化，目标未被替换；{snapshot_status}",
                 current_bytes=exc.current_bytes,
                 current_mode=exc.current_mode,
+                current_acl_token=exc.current_acl_token,
             ) from None
         except (WorkspaceError, ProviderCancelled):
             try:
@@ -1235,6 +1478,16 @@ class Workspace:
                 pass
             raise
         record["state"] = "committed"
+        if os.name == "nt":
+            try:
+                record["after_acl_sha256"] = self._acl_sha256(
+                    self._windows_dacl_token(current_target)
+                )
+            except WorkspaceError:
+                # Existing-file replacement already verified that the copied
+                # DACL matched the source token before the rename.
+                if not preview.existed:
+                    record["after_acl_sha256"] = None
         try:
             self._atomic_write_json(backup_path, record)
         except (OSError, WorkspaceError):
@@ -1250,17 +1503,30 @@ class Workspace:
         current_bytes, current_info = self._read_snapshot_state(
             current_target, validate_utf8=False
         )
+        current_acl_token: bytes | None = None
+        if os.name == "nt" and current_info is not None:
+            try:
+                current_acl_token = self._windows_dacl_token(current_target)
+            except WorkspaceError:
+                raise WorkspaceConflictError(
+                    "无法复核目标 Windows DACL；请重新检查后再写入。",
+                    current_bytes=current_bytes,
+                    current_mode=stat.S_IMODE(current_info.st_mode),
+                ) from None
         if not self._snapshot_matches(
             current_bytes,
             current_info,
             preview.before_bytes,
             preview.before_mode,
             preview.before_token,
+            preview.before_acl_token,
+            current_acl_token,
         ):
             raise WorkspaceConflictError(
                 "审批预览后文件或权限信息发生变化；请重新请求并检查新的差异。",
                 current_bytes=current_bytes,
                 current_mode=stat.S_IMODE(current_info.st_mode) if current_info else None,
+                current_acl_token=current_acl_token,
             )
         return current_target
 
@@ -1290,6 +1556,19 @@ class Workspace:
                     or not isinstance(data.get("after_sha256"), str)
                     or re.fullmatch(r"[0-9a-f]{64}", data.get("after_sha256", "")) is None
                     or data.get("state", "committed") not in ("pending", "committed", "conflict")
+                    or (
+                        "undo_conflict" in data
+                        and not isinstance(data.get("undo_conflict"), bool)
+                    )
+                    or any(
+                        key in data
+                        and data.get(key) is not None
+                        and (
+                            not isinstance(data.get(key), str)
+                            or re.fullmatch(r"[0-9a-f]{64}", data.get(key, "")) is None
+                        )
+                        for key in ("before_acl_sha256", "after_acl_sha256")
+                    )
                     or (
                         "before_mode" in data
                         and data.get("before_mode") is not None
@@ -1323,6 +1602,15 @@ class Workspace:
                         not isinstance(conflict.get("existed"), bool)
                         or type(conflict.get("captured_ns")) is not int
                         or conflict.get("captured_ns", -1) < 0
+                        or (
+                            conflict.get("acl_sha256") is not None
+                            and (
+                                not isinstance(conflict.get("acl_sha256"), str)
+                                or re.fullmatch(
+                                    r"[0-9a-f]{64}", conflict.get("acl_sha256", "")
+                                ) is None
+                            )
+                        )
                         or (
                             conflict.get("mode") is not None
                             and (
@@ -1393,12 +1681,68 @@ class Workspace:
         if not isinstance(relative_path, str) or not isinstance(backup_id, str):
             raise WorkspaceError("撤销备份缺少有效路径或编号。")
         target = self.resolve(relative_path)
-        current_bytes, current_info = self._read_snapshot_state(target)
+        try:
+            current_bytes, current_info = self._read_snapshot_state(
+                target, validate_utf8=False
+            )
+        except WorkspaceConflictError as exc:
+            record["undo_conflict"] = True
+            saved = self._persist_conflict_snapshot(backup_path, record, exc)
+            suffix = "冲突快照已保存。" if saved else "冲突快照写入失败；原始备份仍保留。"
+            raise WorkspaceConflictError(
+                f"撤销读取期间文件发生变化；未恢复内容。{suffix}",
+                current_bytes=exc.current_bytes,
+                current_mode=exc.current_mode,
+                current_acl_token=exc.current_acl_token,
+            ) from None
         expected_hash = record.get("after_sha256")
-        if current_bytes is None or not isinstance(expected_hash, str):
-            raise WorkspaceError("撤销被阻止：当前文件与最新备份不匹配。")
-        if hashlib.sha256(current_bytes).hexdigest() != expected_hash:
-            raise WorkspaceError("撤销被阻止：文件在 Harness 写入后又发生变化。")
+        current_acl_token: bytes | None = None
+        if os.name == "nt" and current_info is not None:
+            try:
+                current_acl_token = self._windows_dacl_token(target)
+            except WorkspaceError:
+                conflict = WorkspaceConflictError(
+                    "无法读取当前 Windows DACL；撤销未执行。",
+                    current_bytes=current_bytes,
+                    current_mode=stat.S_IMODE(current_info.st_mode),
+                )
+                record["undo_conflict"] = True
+                saved = self._persist_conflict_snapshot(backup_path, record, conflict)
+                suffix = "冲突快照已保存。" if saved else "冲突快照写入失败；原始备份仍保留。"
+                raise WorkspaceConflictError(
+                    f"无法核验当前 Windows DACL；撤销未执行。{suffix}",
+                    current_bytes=current_bytes,
+                    current_mode=stat.S_IMODE(current_info.st_mode),
+                ) from None
+        expected_acl_hash = record.get("after_acl_sha256")
+        content_mismatch = (
+            current_bytes is None
+            or not isinstance(expected_hash, str)
+            or hashlib.sha256(current_bytes).hexdigest() != expected_hash
+        )
+        acl_mismatch = (
+            isinstance(expected_acl_hash, str)
+            and self._acl_sha256(current_acl_token) != expected_acl_hash
+        )
+        if content_mismatch or acl_mismatch:
+            conflict = WorkspaceConflictError(
+                "当前文件内容或权限状态与 Harness 最近一次写入不匹配，检测到版本发生变化。",
+                current_bytes=current_bytes,
+                current_mode=stat.S_IMODE(current_info.st_mode) if current_info else None,
+                current_acl_token=current_acl_token,
+            )
+            record["undo_conflict"] = True
+            saved = self._persist_conflict_snapshot(backup_path, record, conflict)
+            if saved:
+                suffix = f"竞争版本快照已保存在备份 {backup_id}。"
+            else:
+                suffix = f"快照写入失败；原始备份 {backup_id} 仍保留。"
+            raise WorkspaceConflictError(
+                f"撤销已阻止：{str(conflict)}未覆盖当前文件。{suffix}",
+                current_bytes=current_bytes,
+                current_mode=stat.S_IMODE(current_info.st_mode) if current_info else None,
+                current_acl_token=current_acl_token,
+            ) from None
 
         before_exists = record.get("before_exists")
         old_base64 = record.get("before_base64")
@@ -1409,6 +1753,7 @@ class Workspace:
             restore_content = restore_bytes.decode("utf-8")
         except (ValueError, UnicodeDecodeError):
             raise WorkspaceError("撤销备份内容无效。") from None
+        assert current_bytes is not None and current_info is not None
         current_content = current_bytes.decode("utf-8")
         diff = self._diff(
             relative_path,
@@ -1432,24 +1777,49 @@ class Workspace:
         latest_bytes, latest_info = self._read_snapshot_state(
             current_target, validate_utf8=False
         )
+        latest_acl_token: bytes | None = None
+        if os.name == "nt" and latest_info is not None:
+            try:
+                latest_acl_token = self._windows_dacl_token(current_target)
+            except WorkspaceError:
+                latest_conflict = WorkspaceConflictError(
+                    "无法复核审批后的 Windows DACL；未恢复文件。",
+                    current_bytes=latest_bytes,
+                    current_mode=stat.S_IMODE(latest_info.st_mode),
+                )
+                record["undo_conflict"] = True
+                saved = self._persist_conflict_snapshot(
+                    backup_path, record, latest_conflict
+                )
+                suffix = "冲突快照已保存。" if saved else "冲突快照写入失败；原始备份仍保留。"
+                raise WorkspaceConflictError(
+                    f"无法复核审批后的 Windows DACL；未恢复文件。{suffix}",
+                    current_bytes=latest_bytes,
+                    current_mode=stat.S_IMODE(latest_info.st_mode),
+                ) from None
         if current_target != target or not self._snapshot_matches(
             latest_bytes,
             latest_info,
             current_bytes,
-            stat.S_IMODE(current_info.st_mode) if current_info else None,
+            stat.S_IMODE(current_info.st_mode),
             self._stat_token(current_info),
+            current_acl_token,
+            latest_acl_token,
         ):
             conflict = WorkspaceConflictError(
                 "审批后文件或权限信息发生变化；为防止覆盖新内容，本次撤销已取消。",
                 current_bytes=latest_bytes,
                 current_mode=stat.S_IMODE(latest_info.st_mode) if latest_info else None,
+                current_acl_token=latest_acl_token,
             )
-            record["conflict_snapshot"] = self._conflict_snapshot(conflict)
-            try:
-                self._atomic_write_json(backup_path, record)
-            except (OSError, WorkspaceError):
-                pass
-            raise conflict
+            record["undo_conflict"] = True
+            saved = self._persist_conflict_snapshot(backup_path, record, conflict)
+            suffix = "竞争版本快照已保存。" if saved else "快照写入失败；原始备份仍保留。"
+            raise WorkspaceConflictError(f"{conflict} {suffix}",
+                current_bytes=latest_bytes,
+                current_mode=conflict.current_mode,
+                current_acl_token=latest_acl_token,
+            ) from None
         try:
             if before_exists:
                 self._atomic_write_bytes(
@@ -1457,28 +1827,34 @@ class Workspace:
                     restore_bytes,
                     guarded=True,
                     expected_before_bytes=current_bytes,
-                    expected_before_mode=stat.S_IMODE(current_info.st_mode) if current_info else None,
+                    expected_before_mode=stat.S_IMODE(current_info.st_mode),
                     expected_before_token=self._stat_token(current_info),
+                    expected_before_acl_token=current_acl_token,
                 )
             else:
                 self._unlink_workspace_file(
                     target,
                     guarded=True,
                     expected_before_bytes=current_bytes,
-                    expected_before_mode=stat.S_IMODE(current_info.st_mode) if current_info else None,
+                    expected_before_mode=stat.S_IMODE(current_info.st_mode),
                     expected_before_token=self._stat_token(current_info),
+                    expected_before_acl_token=current_acl_token,
                 )
         except WorkspaceConflictError as exc:
-            record["conflict_snapshot"] = self._conflict_snapshot(exc)
-            try:
-                self._atomic_write_json(backup_path, record)
-            except (OSError, WorkspaceError):
-                pass
+            record["undo_conflict"] = True
+            saved = self._persist_conflict_snapshot(backup_path, record, exc)
+            suffix = (
+                f"竞争版本快照已保存至备份 {backup_id}。"
+                if saved
+                else f"快照写入失败；原始备份 {backup_id} 仍保留。"
+            )
             raise WorkspaceConflictError(
-                f"撤销时发现并发文件变化，目标未被替换或删除；快照保留在备份 {backup_id}。",
+                f"撤销时发现并发文件或 DACL 变化，目标未被替换或删除；{suffix}",
                 current_bytes=exc.current_bytes,
                 current_mode=exc.current_mode,
+                current_acl_token=exc.current_acl_token,
             ) from None
+        record["undo_conflict"] = False
         record["undone"] = True
         record["undone_ns"] = time.time_ns()
         self._atomic_write_json(backup_path, record)
