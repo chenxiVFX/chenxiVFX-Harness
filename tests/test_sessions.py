@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from cvfx_harness.agent import Agent, SYSTEM_PROMPT
 from cvfx_harness.cli import run_console
 from cvfx_harness.providers import AssistantTurn, MockProvider, ProviderCancelled, ToolCall
-from cvfx_harness.sessions import SessionError, SessionStore
+from cvfx_harness.sessions import MAX_SESSION_BYTES, SessionError, SessionStore
 from cvfx_harness.tools import TOOL_SCHEMAS, Workspace
 from cvfx_harness.usage import ProviderUsage, UsageStats, estimate_tokens
 
@@ -109,6 +109,36 @@ class SessionTests(unittest.TestCase):
             with self.assertRaises(SessionError):
                 store.load("bad")
             self.assertEqual(json.dumps(agent.messages, ensure_ascii=False), previous)
+
+    def test_oversized_and_tampered_archives_are_rejected(self) -> None:
+        with local_temp() as temp:
+            workspace = Workspace(temp)
+            store = SessionStore(workspace)
+            store.save("large", [], goal="safe")
+            large_path = workspace.root / ".harness" / "sessions" / "large.json"
+            large_path.write_bytes(b" " * (MAX_SESSION_BYTES + 1))
+            with self.assertRaisesRegex(SessionError, "4 MiB"):
+                store.load("large")
+
+            store.save("tampered", [], goal="safe")
+            tampered_path = workspace.root / ".harness" / "sessions" / "tampered.json"
+            archive = json.loads(tampered_path.read_text(encoding="utf-8"))
+            archive["turns"] = [{
+                "kind": "dialogue",
+                "messages": [
+                    {"role": "user", "content": "普通历史"},
+                    {"role": "assistant", "content": "api_key=synthetic_sensitive_value"},
+                ],
+            }]
+            tampered_path.write_text(json.dumps(archive, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaisesRegex(SessionError, "凭据"):
+                store.load("tampered")
+
+            archive["turns"] = []
+            archive["approvals"] = ["synthetic-old-approval"]
+            tampered_path.write_text(json.dumps(archive, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaisesRegex(SessionError, "结构无效"):
+                store.load("tampered")
 
     def test_session_names_and_sensitive_records_are_rejected(self) -> None:
         with local_temp() as temp:

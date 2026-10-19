@@ -112,6 +112,43 @@ class SessionStore:
             raise SessionError("无法枚举工作区会话目录。") from None
         return sorted(set(names), key=str.casefold)
 
+    def suggest_names(
+        self,
+        prefix: str,
+        *,
+        max_scan: int = 1000,
+        max_suggestions: int = 50,
+    ) -> list[str]:
+        """Return bounded safe name suggestions without opening archive contents."""
+        if not isinstance(prefix, str):
+            return []
+        directory = self._directory(create=False)
+        if directory is None:
+            return []
+        matches: list[str] = []
+        folded_prefix = prefix.casefold()
+        scanned = 0
+        try:
+            for path in directory.iterdir():
+                scanned += 1
+                if scanned > max_scan:
+                    break
+                if path.suffix.casefold() != ".json":
+                    continue
+                if self.workspace._is_reparse_point(path):
+                    raise SessionError("会话目录包含链接文件；已停止建议。")
+                try:
+                    name = self.validate_name(path.stem)
+                except SessionError:
+                    continue
+                if name.casefold().startswith(folded_prefix):
+                    matches.append(name)
+        except WorkspaceError as exc:
+            raise SessionError(str(exc)) from None
+        except OSError:
+            raise SessionError("无法枚举工作区会话目录。") from None
+        return sorted(set(matches), key=str.casefold)[:max_suggestions]
+
     @staticmethod
     def _validate_turn_records(turns: Any) -> list[dict[str, Any]]:
         if not isinstance(turns, list) or len(turns) > 2000:

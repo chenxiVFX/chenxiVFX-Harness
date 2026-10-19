@@ -350,7 +350,7 @@ def _help_text() -> str:
   /计划 清空        确认后清除当前计划
   /保存 [名称]       将可安全保存的普通对话保存到工作区 .harness/sessions/
   /检查点 <名称>    输入一段手写脱敏摘要；预览并确认后仅保存该摘要
-  /恢复 <名称>       校验并载入会话；替换当前上下文前会询问
+  /恢复 <名称>       校验并载入历史会话；替换当前上下文前确认，TUI 可补全名称
   /会话              列出本工作区的本地会话名称
   /压缩 [保留轮数]   预览本地上下文压缩；默认保留最近 4 轮，需确认后应用
   /统计              显示当前估算上下文、预算、累计用量和提供商报告
@@ -1068,7 +1068,10 @@ def run_console(
                     output("已取消恢复；当前上下文未改变。")
                     continue
             agent.restore(turns=loaded.turns, goal=loaded.goal, usage=loaded.usage)
-            output(f"已恢复会话 {loaded.name!r}，包含 {len(loaded.turns)} 个安全轮次。")
+            output(
+                f"已恢复历史会话 {loaded.name!r}，包含 {len(loaded.turns)} 个安全轮次。"
+                "审批与执行授权不会恢复，存档中的旧工具调用不会执行。"
+            )
             continue
         if command in {"/统计", "/stats"}:
             estimates = agent.estimated_context_breakdown()

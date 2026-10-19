@@ -28,7 +28,7 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Button, TextArea
 from wcwidth import wcswidth
 
-from .sessions import redact_likely_secrets
+from .sessions import SessionError, SessionStore, redact_likely_secrets
 from .tools import Workspace, WorkspaceError
 
 MAX_TRANSCRIPT_CHARS = 200_000
@@ -99,6 +99,23 @@ class CommandCompleter(Completer):
     def get_completions(self, document, complete_event):
         del complete_event
         before = document.text_before_cursor
+        if "\n" not in before and self._workspace is not None:
+            for command in ("/恢复 ", "/load "):
+                if before.startswith(command):
+                    prefix = before[len(command) :]
+                    if " " in prefix:
+                        return
+                    try:
+                        names = SessionStore(self._workspace).suggest_names(prefix)
+                    except SessionError:
+                        names = []
+                    for name in names:
+                        yield Completion(
+                            name,
+                            start_position=-len(prefix),
+                            display_meta="历史会话",
+                        )
+                    return
         path_context = self._path_context(document)
         if path_context is not None and self._workspace is not None:
             directory, prefix, braced, replace_chars = path_context

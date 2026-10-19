@@ -152,6 +152,132 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertEqual(sensitive, [])
         self.assertEqual(email, [])
 
+    def test_session_name_completion_and_real_input_save_reopen_restore_resume_cancel(self) -> None:
+        class CapturingMockProvider(MockProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.requests: list[list[dict[str, object]]] = []
+
+            def complete(self, messages, tools, **kwargs):
+                self.requests.append([dict(message) for message in messages])
+                return super().complete(messages, tools, **kwargs)
+
+        with tempfile.TemporaryDirectory(prefix="会话 工作区 ") as workspace:
+            first_provider = CapturingMockProvider()
+
+            def save_and_exit(pipe, ui: TerminalUI) -> None:
+                self._wait_until(
+                    lambda: ui._pending is not None and not ui._pending.approval,
+                    "initial TUI input did not become ready",
+                )
+                pipe.send_text("请记住这段中文合成历史\r")
+                self._wait_until(
+                    lambda: len(first_provider.requests) == 1
+                    and "[模拟模式] 已收到" in ui._transcript,
+                    "first mock dialogue did not finish",
+                )
+                pipe.send_text("/保存 中文会话\r")
+                self._wait_until(
+                    lambda: "已保存 1 个安全对话轮次" in ui._transcript,
+                    "session was not saved from the TUI",
+                )
+                pipe.send_text("/退出\r")
+
+            _first_ui, first_result = self._run_cli_ui(
+                workspace, first_provider, save_and_exit
+            )
+            self.assertEqual(first_result, 0)
+            archive = Path(workspace) / ".harness" / "sessions" / "中文会话.json"
+            original_archive = archive.read_bytes()
+
+            from prompt_toolkit.completion import CompleteEvent
+            from prompt_toolkit.document import Document
+
+            names = [
+                item.text
+                for item in CommandCompleter(Workspace(workspace)).get_completions(
+                    Document("/恢复 中"), CompleteEvent()
+                )
+            ]
+            self.assertEqual(names, ["中文会话"])
+
+            resumed_provider = CapturingMockProvider()
+
+            def restore_continue_and_exit(pipe, ui: TerminalUI) -> None:
+                self._wait_until(
+                    lambda: ui._pending is not None and not ui._pending.approval,
+                    "reopened TUI input did not become ready",
+                )
+                pipe.send_text("/恢复 ")
+                self._wait_until(
+                    lambda: ui._input_buffer.complete_state is not None
+                    and any(
+                        item.text == "中文会话"
+                        for item in ui._input_buffer.complete_state.completions
+                    ),
+                    "saved session name was not offered by the live TUI",
+                )
+                self.assertEqual(resumed_provider.requests, [])
+                pipe.send_text("\t\r")
+                self._wait_until(
+                    lambda: "已恢复历史会话 '中文会话'" in ui._transcript,
+                    "selected session was not restored",
+                )
+                self.assertIn("审批与执行授权不会恢复", ui._transcript)
+                self.assertIn("旧工具调用不会执行", ui._transcript)
+                self.assertEqual(resumed_provider.requests, [])
+                pipe.send_text("沿用历史内容继续讨论\r")
+                self._wait_until(
+                    lambda: len(resumed_provider.requests) == 1
+                    and "[模拟模式] 已收到" in ui._transcript,
+                    "mock conversation did not continue after restore",
+                )
+                pipe.send_text("/退出\r")
+
+            _resumed_ui, resumed_result = self._run_cli_ui(
+                workspace, resumed_provider, restore_continue_and_exit
+            )
+            self.assertEqual(resumed_result, 0)
+            request_text = "\n".join(
+                str(message.get("content", ""))
+                for message in resumed_provider.requests[0]
+            )
+            self.assertIn("请记住这段中文合成历史", request_text)
+            self.assertIn("沿用历史内容继续讨论", request_text)
+            self.assertEqual(archive.read_bytes(), original_archive)
+
+            cancelled_provider = CapturingMockProvider()
+
+            def cancel_selection_and_exit(pipe, ui: TerminalUI) -> None:
+                self._wait_until(
+                    lambda: ui._pending is not None and not ui._pending.approval,
+                    "cancel TUI input did not become ready",
+                )
+                pipe.send_text("/恢复 中")
+                self._wait_until(
+                    lambda: ui._input_buffer.complete_state is not None
+                    and bool(ui._input_buffer.complete_state.completions),
+                    "session suggestion was not available to cancel",
+                )
+                pipe.send_bytes(b"\x1b")
+                time.sleep(0.03)
+                self.assertIsNotNone(ui._pending, "Esc must only close suggestions")
+                pipe.send_bytes(b"\x03")
+                self._wait_until(
+                    lambda: ui._input_buffer.text == "",
+                    "Ctrl+C did not clear the unsubmitted restore selection",
+                )
+                self.assertEqual(cancelled_provider.requests, [])
+                self.assertNotIn("已恢复历史会话", ui._transcript)
+                pipe.send_text("/退出\r")
+
+            _cancelled_ui, cancelled_result = self._run_cli_ui(
+                workspace, cancelled_provider, cancel_selection_and_exit
+            )
+            self.assertEqual(cancelled_result, 0)
+            self.assertEqual(cancelled_provider.requests, [])
+            self.assertEqual(archive.read_bytes(), original_archive)
+
     def test_file_reference_completion_still_requires_read_approval_in_mock_cli(self) -> None:
         class CapturingMockProvider(MockProvider):
             def __init__(self) -> None:
