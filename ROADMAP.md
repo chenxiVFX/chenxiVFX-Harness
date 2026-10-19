@@ -144,7 +144,7 @@
 - `read_file` 在获批后返回原始 UTF-8 字节 SHA-256。新增 `patch_file`，只允许对单个已存在的普通文本文件做一次非空、精确、唯一的旧文本替换；不做模糊匹配或隐式多次替换。必须提供从读取结果取得的 64 位哈希；文件上限 64 KiB，old/new 片段各自最多 16 KiB，审批差异最多 32 KiB。拒绝空旧文本、未匹配/重复匹配、过期哈希、控制/格式字符、敏感/内部/链接/硬链接路径和过大差异。
 - 审批预览展示规范化目标、预期原始文件哈希和真实 unified diff；拒绝、EOF、取消、审批前参数错误或审批期间文件变化均不写入。获批补丁复用现有原字节复核、撤销备份、原子替换与 `/撤销`，没有第二次写入确认；计划模式仍在工具层阻止补丁，子代理不暴露该工具。
 - 合成 Agent 闭环逐轮执行 `read_file → patch_file → run_test_profile`。读取、补丁和测试启动各触发本地审批；测试输出分享另行审批，本次闭环拒绝分享并确认模型只收到本地查看状态。测试程序、目标文件和 profile 均为临时合成数据；profile 配置在补丁前后字节一致。没有运行用户项目或调用真实模型服务。
-- Debian / Python 3.12 离线回归：217 项，216 通过、1 项 Windows-only junction 跳过；包括中文 UTF-8、CRLF、无末尾换行、重复/空/近似匹配、并发改动、拒绝写入、差异终端转义膨胀及补丁后撤销。`compileall`、安装自检、TUI 合成交互和 unittest/pytest 合成 runner 自检通过；Windows/Linux × Python 3.11/3.12 矩阵与 Windows standalone packaging CI 状态待推送后跟踪。单元测试不等同于完整产品验收。
+- Debian / Python 3.12 离线回归：217 项，216 通过、1 项 Windows-only junction 跳过；包括中文 UTF-8、CRLF、无末尾换行、重复/空/近似匹配、并发改动、拒绝写入、差异终端转义膨胀及补丁后撤销。`compileall`、安装自检、TUI 合成交互和 unittest/pytest 合成 runner 自检通过。Windows/Linux × Python 3.11/3.12 四格离线 CI 全部通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39269065901)）；Windows x64 standalone 构建、审计和 smoke CI 通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39269065555)）。单元测试和打包 smoke 不等同于完整产品验收。
 
 ## 会话内受限子代理（2026-10-19）
 
