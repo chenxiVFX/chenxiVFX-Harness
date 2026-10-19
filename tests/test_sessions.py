@@ -6,6 +6,7 @@ import threading
 import sys
 import tempfile
 import time
+import unicodedata
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -403,6 +404,12 @@ class CompressionTests(unittest.TestCase):
             self.assertIn("\\x1b", rendered)
             self.assertIn("[已脱敏]", rendered)
             self.assertIn("第 1 轮 用户", rendered)
+            for line in rendered.splitlines():
+                terminal_cells = sum(
+                    2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+                    for char in line
+                )
+                self.assertLessEqual(terminal_cells, 76)
 
     def test_apply_compression_can_restore_checkpoint_until_successful_continuation(self) -> None:
         with local_temp() as temp:

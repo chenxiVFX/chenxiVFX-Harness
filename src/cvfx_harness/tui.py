@@ -9,8 +9,10 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from prompt_toolkit import Application
+from prompt_toolkit.clipboard import DummyClipboard
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters import Condition
+from prompt_toolkit.history import DummyHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import (
     Dimension,
@@ -245,10 +247,12 @@ class TerminalUI:
         self._transcript = ""
         self._conversation_started = False
         self._follow_output = True
+        self._ignore_next_scroll_inference = False
         self.input_area = TextArea(
             multiline=True,
             completer=CommandCompleter(reference_workspace),
             complete_while_typing=True,
+            history=DummyHistory(),
             wrap_lines=True,
             focus_on_click=True,
             read_only=Condition(
@@ -436,7 +440,7 @@ class TerminalUI:
             mouse_support=True,
             input=input,
             output=output,
-            refresh_interval=0.1,
+            clipboard=DummyClipboard(),
         )
 
     @property
@@ -736,6 +740,13 @@ class TerminalUI:
                     else _safe_text(value)
                 )
                 self._append_transcript(f"\n你> {shown_value}\n")
+                # Submitting a prompt is not a manual transcript scroll. A
+                # multiline or very long input can resize the transcript pane
+                # before the worker produces its first response; ignore that
+                # stale render position once and follow the new response.
+                self._follow_output = True
+                self.output_area.buffer.cursor_position = len(self._transcript)
+                self._ignore_next_scroll_inference = True
         self._resolve_pending(value=value)
 
     def _resolve_pending(
@@ -775,12 +786,13 @@ class TerminalUI:
 
     def _append_transcript(self, text: str) -> None:
         info = self.output_area.window.render_info
-        if info is not None:
+        if info is not None and not self._ignore_next_scroll_inference:
             at_bottom = info.vertical_scroll >= max(
                 0, info.content_height - info.window_height
             )
             if not at_bottom:
                 self._follow_output = False
+        self._ignore_next_scroll_inference = False
         old_cursor = self.output_area.buffer.cursor_position
         self._transcript += text
         if len(self._transcript) > MAX_TRANSCRIPT_CHARS:

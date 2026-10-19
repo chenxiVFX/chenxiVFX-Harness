@@ -40,7 +40,7 @@ Enter 提交当前输入，Ctrl+J 插入换行；TUI 生成期间会暂停输入
 
 启用 TTY 全屏渲染后，终端的 Unicode 字符宽度、鼠标能力与输入法组合仍取决于宿主。当前项目在 CI 中使用 prompt_toolkit 的合成输入和 Linux PTY 验证键位、布局启动/退出；Windows runner 使用其 Win32 输入模拟验证。尚未完成 Windows Terminal、PowerShell/ConPTY 和各中文 IME 组合的人工兼容验收。
 
-查看 [实际 Linux PTY 合成会话录屏](evidence/tui-synthetic-session.cast)及其[关键帧联系表](evidence/tui-keyframes.png)，其中包含主界面、命令候选高亮、多行草稿、审批预览和拒绝结果；各张 PNG 原图与回放说明见[证据说明](evidence/README.md)。
+查看[离线 Linux PTY 合成会话录屏](evidence/tui-synthetic-session.cast)和[本轮 TUI 证据说明](evidence/README.md)。录屏沿配置审阅、长中文对话、搜索/补丁/测试审批、会话恢复、计划候选、压缩预览拒绝及窄终端布局走了一遍；关键帧保留各自原始分辨率。它不代表 Windows Terminal、PowerShell/ConPTY 或中文输入法的人工兼容验收。
 
 ### Windows 独立程序试验
 

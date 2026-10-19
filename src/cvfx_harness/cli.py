@@ -110,28 +110,71 @@ def _format_turn_indexes(indexes: tuple[int, ...]) -> str:
     return "、".join(formatted)
 
 
+def _terminal_cell_width(text: str) -> int:
+    return sum(
+        2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+        for char in text
+    )
+
+
+def _wrap_preview_text(
+    text: str, *, columns: int = 76, indent: str = "  "
+) -> list[str]:
+    """Wrap untrusted preview text by terminal cells without splitting escapes."""
+    lines: list[str] = []
+    line = ""
+    used = 0
+    indent_width = _terminal_cell_width(indent)
+
+    def start_continuation() -> tuple[str, int]:
+        return indent, indent_width
+
+    for char in text:
+        if char == "\n":
+            lines.append(line)
+            line, used = start_continuation()
+            continue
+        category = unicodedata.category(char)
+        if category.startswith("C"):
+            codepoint = ord(char)
+            if codepoint <= 0xFF:
+                rendered, width = f"\\x{codepoint:02x}", 4
+            elif codepoint <= 0xFFFF:
+                rendered, width = f"\\u{codepoint:04x}", 6
+            else:
+                rendered, width = f"\\U{codepoint:08x}", 10
+        else:
+            rendered = char
+            width = 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+        if line and used + width > columns:
+            lines.append(line)
+            line, used = start_continuation()
+        line += rendered
+        used += width
+    lines.append(line)
+    return lines
+
+
 def _format_compression_summary(summary: str) -> str:
     """Render the deterministic summary fields in a readable, terminal-safe preview."""
     try:
         body = Agent._summary_body(summary)
     except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
-        return _safe_terminal_text(summary)
+        return "\n".join(_wrap_preview_text(summary))
 
     lines = ["（摘要会以不可信的用户上下文加入对话）"]
     loss_note = body.get("loss_note")
     if isinstance(loss_note, str):
-        lines.append(f"摘要说明：{_safe_terminal_text(loss_note)}")
+        lines.extend(_wrap_preview_text(f"摘要说明：{loss_note}"))
     goal = body.get("goal_context")
     if isinstance(goal, str) and goal:
-        lines.append(f"当前目标：{_safe_terminal_text(goal)}")
+        lines.extend(_wrap_preview_text(f"当前目标：{goal}"))
     constraints = body.get("explicit_constraints")
     if isinstance(constraints, list):
         lines.append(f"明确限制（{len(constraints)} 条，保留完整原文）：")
-        lines.extend(
-            f"  - {_safe_terminal_text(item)}"
-            for item in constraints
-            if isinstance(item, str)
-        )
+        for item in constraints:
+            if isinstance(item, str):
+                lines.extend(_wrap_preview_text(f"  - {item}"))
     excerpts = body.get("dialogue_excerpts")
     if isinstance(excerpts, list) and excerpts:
         lines.append("历史对话摘录：")
@@ -143,9 +186,9 @@ def _format_compression_summary(summary: str) -> str:
             user = item.get("user_excerpt")
             assistant = item.get("assistant_excerpt")
             if isinstance(user, str):
-                lines.append(f"  {label} 用户：{_safe_terminal_text(user)}")
+                lines.extend(_wrap_preview_text(f"  {label} 用户：{user}"))
             if isinstance(assistant, str):
-                lines.append(f"  {label} 助手：{_safe_terminal_text(assistant)}")
+                lines.extend(_wrap_preview_text(f"  {label} 助手：{assistant}"))
     earlier = body.get("earlier_summary_excerpts")
     if isinstance(earlier, list) and earlier:
         lines.append("更早摘要摘录：")
@@ -154,7 +197,7 @@ def _format_compression_summary(summary: str) -> str:
                 continue
             index = item.get("turn_index")
             label = f"第 {index} 轮" if type(index) is int and index > 0 else "旧摘要"
-            lines.append(f"  {label}：{_safe_terminal_text(item['excerpt'])}")
+            lines.extend(_wrap_preview_text(f"  {label}：{item['excerpt']}"))
     omitted = body.get("omitted_dialogue_excerpt_count")
     if type(omitted) is int and omitted > 0:
         lines.append(f"另有 {omitted} 个旧对话轮次没有短摘录；其内容不会完整保留。")
@@ -1036,9 +1079,17 @@ def run_console(
                         f"已保存到 {CONFIG_RELATIVE_PATH}。提供商、模型和端点的更改需下次启动生效；"
                         "本地预算和输出上限在未被覆盖时已即时应用。"
                     )
+                    source_labels = {
+                        "provider": "提供商",
+                        "model": "模型",
+                        "base_url": "Base URL",
+                        "token_budget": "本地估算上下文阈值",
+                        "max_output_tokens": "输出上限",
+                    }
                     for key in startup_config.sources:
                         if startup_config.sources[key] not in {"工作区配置", "默认"}:
-                            output(f"{key} 的工作区值已保存，但当前仍由 {startup_config.sources[key]} 覆盖。")
+                            label = source_labels.get(key, key)
+                            output(f"{label} 的工作区值已保存，但当前仍由 {startup_config.sources[key]} 覆盖。")
                     if startup_config.provider in {"openai", "deepseek-anthropic"}:
                         output(
                             f"DeepSeek 兼容模式只从环境变量 {DEEPSEEK_API_KEY_ENV} 读取密钥；"

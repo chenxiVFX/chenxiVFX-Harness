@@ -167,6 +167,8 @@ class PromptToolkitTests(unittest.TestCase):
             self.assertEqual(saved.model, "deepseek-v4-pro")
             self.assertIsNone(saved.base_url)
             self.assertIn("提供商：deepseek-anthropic", ui._transcript)
+            self.assertIn("提供商 的工作区值已保存", ui._transcript)
+            self.assertNotIn("provider 的工作区值已保存", ui._transcript)
 
     def test_tui_escape_cancels_config_draft_without_persisting(self) -> None:
         with tempfile.TemporaryDirectory(prefix="cvfx-tui-config-cancel-") as workspace:
@@ -190,6 +192,9 @@ class PromptToolkitTests(unittest.TestCase):
             self.assertIn("已取消配置编辑", ui._transcript)
 
     def test_secret_like_chat_input_is_hidden_and_rejected_offline(self) -> None:
+        from prompt_toolkit.clipboard import DummyClipboard
+        from prompt_toolkit.history import DummyHistory
+
         secret = "sk-" + "T" * 24
         with tempfile.TemporaryDirectory(prefix="cvfx-tui-secret-input-") as workspace:
             def drive(pipe, ui: TerminalUI) -> None:
@@ -210,6 +215,10 @@ class PromptToolkitTests(unittest.TestCase):
             ask.assert_not_called()
             self.assertEqual(rc, 0)
             self.assertNotIn(secret, ui._transcript)
+            self.assertIsInstance(ui._input_buffer.history, DummyHistory)
+            self.assertEqual(list(ui._input_buffer.history.load_history_strings()), [])
+            self.assertIsInstance(ui._application.clipboard, DummyClipboard)
+            self.assertEqual(ui._application.clipboard.get_data().text, "")
 
     def test_tui_plan_proposal_review_revision_and_acceptance_loop(self) -> None:
         from cvfx_harness.plans import PlanStore
@@ -688,6 +697,40 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertEqual(received, ["/命令"])
         self.assertIn("你> /命令", ui._transcript)
 
+    def test_mouse_click_fills_command_candidate_without_submitting(self) -> None:
+        received: list[str] = []
+
+        def worker(ui: TerminalUI) -> int:
+            received.append(ui.input("你> "))
+            return 0
+
+        def send(pipe, ui: TerminalUI) -> None:
+            pipe.send_text("/")
+            self._wait_until(
+                lambda: ui._input_buffer.complete_state is not None
+                and ui._completion_window.render_info is not None,
+                "command menu did not render for mouse selection",
+            )
+            render_info = ui._completion_window.render_info
+            assert render_info is not None
+            self.assertGreaterEqual(len(ui._input_buffer.complete_state.completions), 2)
+            click_x = render_info._x_offset + 1
+            click_y = render_info._y_offset + 2  # terminal mouse coordinates are one-based
+            pipe.send_bytes(
+                f"\x1b[<0;{click_x};{click_y}M\x1b[<0;{click_x};{click_y}m".encode()
+            )
+            self._wait_until(
+                lambda: ui._input_buffer.text == "/命令"
+                and ui._input_buffer.complete_state is None,
+                "mouse click did not fill the second command candidate",
+            )
+            self.assertIsNotNone(ui._pending, "clicking a candidate must not submit it")
+            pipe.send_text("\r")
+
+        ui, result = self._run_ui(worker, send)
+        self.assertEqual(result, 0)
+        self.assertEqual(received, ["/命令"])
+
     def test_ctrl_j_inserts_multiline_text_and_enter_submits(self) -> None:
         received: list[str] = []
 
@@ -962,6 +1005,26 @@ class PromptToolkitTests(unittest.TestCase):
                     self.assertIn("Esc 取消", line)
                 elif columns < 36:
                     self.assertNotIn("Tab/↑↓", line)
+
+    def test_long_prompt_submission_does_not_look_like_manual_transcript_scroll(self) -> None:
+        from cvfx_harness.tui import _InputRequest
+
+        with create_pipe_input() as pipe:
+            ui = TerminalUI(lambda _ui: 0, input=pipe, output=DummyOutput())
+            ui._transcript = "较早的合成对话\n" * 20
+            ui.output_area.text = ui._transcript
+            ui._follow_output = False
+            ui._pending = _InputRequest("你> ", False, threading.Event())
+            ui._input_buffer.text = "长中文提问" * 300
+
+            ui._submit_input()
+            self.assertTrue(ui._follow_output)
+            self.assertTrue(ui._ignore_next_scroll_inference)
+
+            ui._append_transcript("离线回答已完成。\n")
+            self.assertTrue(ui._follow_output)
+            self.assertFalse(ui._ignore_next_scroll_inference)
+            self.assertEqual(ui.output_area.buffer.cursor_position, len(ui._transcript))
 
     def test_empty_state_has_a_centered_invitation_without_persistent_shortcuts(self) -> None:
         class SizedDummyOutput(DummyOutput):
@@ -1360,7 +1423,10 @@ class PromptToolkitTests(unittest.TestCase):
 
     def test_tui_terminal_output_masks_controls_and_likely_credentials(self) -> None:
         def worker(ui: TerminalUI) -> int:
-            ui.output("Bearer SYNTHETIC_TUI_SECRET_1234567890 \x1b[2J")
+            ui.output(
+                "Bearer SYNTHETIC_TUI_SECRET_1234567890 \x1b[2J"
+                "\x1b]0;SYNTHETIC_TERMINAL_TITLE\x07"
+            )
             ui.input("继续> ")
             return 0
 
@@ -1369,6 +1435,7 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertNotIn("SYNTHETIC_TUI_SECRET_1234567890", ui._transcript)
         self.assertNotIn("\x1b", ui._transcript)
         self.assertIn("\\x1b[2J", ui._transcript)
+        self.assertIn("\\x1b]0;SYNTHETIC_TERMINAL_TITLE\\x07", ui._transcript)
 
     def test_stream_redactor_keeps_split_sensitive_values_until_complete(self) -> None:
         redactor = _StreamingSecretRedactor()

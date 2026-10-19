@@ -1,20 +1,28 @@
-# 中文 TUI 实际运行证据
+# 中文 TUI 走查证据
 
-`tui-synthetic-session.cast` 是在 Linux PTY 中启动真实 `TerminalUI` 录制的 asciinema v2 会话。操作过程展示主界面、命令候选与高亮、多行草稿、写入审批预览和默认拒绝结果。录制只使用合成文字和 Mock；没有调用模型服务、读取凭据或修改测试工作区文件。
+## 本轮覆盖的交互
 
-关键帧从这份 PTY 录屏回放导出，使用官方 asciinema `agg` v1.9.0 终端渲染器和 `ffmpeg` 转成 PNG；联系表由五张关键帧拼成。画面展示居中的空会话提示、单一青绿色强调、无箭头滚动条、收敛的状态栏和文字标记的审批选择。它们保留 PTY 的 ANSI、中文字体与布局输出；不是重画的终端模拟图，也不是 Windows 截图。
+这份录屏展示当前实现中的配置编辑预览与取消、长中文对话、工作区搜索确认、精确补丁的拒绝与批准、用户测试配置和运行审批、会话保存与恢复、计划候选拒绝、压缩预览与默认拒绝，以及 46×14 终端尺寸下的输入状态。压缩画面展示估算前后值、将概括/保留的轮次、目标和完整约束、摘要摘录与不可信上下文说明；输入框保留在底部，用户可先滚动阅读再明确确认。
+
+## 离线验证
+
+`tui-synthetic-session.cast` 是 Linux POSIX PTY 中运行真实 `TerminalUI` 的 asciinema v2 录屏。可用 `python scripts/record_tui_qa.py` 重现。脚本创建临时合成工作区，并替换为确定性的本地 provider fixture；子进程环境只保留运行所需变量。它没有调用模型 API、读取凭据或访问用户项目。补丁、配置、会话、测试 profile 和唯一 unittest 都只存在于临时目录。
+
+自动化测试另外覆盖 Tab/方向键候选填入、SGR 鼠标报告点击候选并只填入不提交、鼠标审批选择只切换状态不执行、快速重复 Enter、窄终端状态栏及审批默认拒绝。合成凭据输入会被隐藏并拒绝；输入 history 与 clipboard 使用不存内容的实现，合成控制序列只显示为可见文本。TUI 不设置操作系统终端标题，也不接入系统剪贴板。这些是 prompt_toolkit 合成输入事件，不是物理鼠标或 Windows 终端验收。
+
+关键帧由官方 asciinema `agg` v1.9.0 回放录屏并用 `ffmpeg` 导出；窄终端帧裁切到 46×14 PTY 视口。
 
 - [主界面](tui-frame-main.png)
-- [命令候选高亮](tui-frame-candidates.png)
-- [多行草稿](tui-frame-multiline.png)
-- [写入审批预览](tui-frame-approval.png)
-- [拒绝结果](tui-frame-rejected.png)
-- [关键帧联系表](tui-keyframes.png)
+- [补丁审阅与拒绝/批准](tui-frame-patch.png)
+- [压缩预览与默认拒绝](tui-frame-compression.png)
+- [窄终端布局](tui-frame-narrow.png)
 
-回放原始终端录屏：
+回放录屏：
 
 ```sh
 asciinema play evidence/tui-synthetic-session.cast
 ```
 
-录屏、POSIX PTY 测试验证 Linux PTY 下的实际 TUI 渲染与键盘流程；不代表 Windows Terminal、PowerShell/ConPTY 或中文输入法的人工兼容验收。Windows runner 的独立包合成键盘自检见 [Actions 运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39240989690)。
+## 验证边界
+
+这些证据说明当前 TUI 在合成离线流程中的行为。它们不验证真实 provider/API、网络 usage 或缓存计数，也不是 Windows Terminal、PowerShell/ConPTY、IME、剪贴板或屏幕阅读器的人工验收。CI 的 Windows/Linux 矩阵与 Windows standalone 检查是独立证据，不等于 Windows 交互终端实测。
