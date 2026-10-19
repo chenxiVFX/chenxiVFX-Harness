@@ -375,7 +375,7 @@ class QuestionnaireSchemaTests(unittest.TestCase):
                 call,
                 approve_action=lambda _request: self.fail("question must not approve"),
                 ask_user=lambda _request: QuestionnaireResult(
-                    "submitted", (UserQuestionAnswer("q1", secret),)
+                    "submitted", (UserQuestionAnswer("q1", secret),), True
                 ),
             )
             self.assertEqual(json.loads(secret_result)["status"], "blocked")
@@ -387,6 +387,22 @@ class QuestionnaireSchemaTests(unittest.TestCase):
                 ask_user=lambda _request: QuestionnaireResult("submitted", ()),
             )
             self.assertEqual(json.loads(malformed)["status"], "invalid_response")
+
+            seen_requests: list[QuestionnaireRequest] = []
+            forced_private = run_tool(
+                workspace,
+                call,
+                approve_action=lambda _request: self.fail("question must not approve"),
+                ask_user=lambda request: (
+                    seen_requests.append(request)
+                    or QuestionnaireResult(
+                        "submitted", (UserQuestionAnswer("q1", "普通澄清"),), True
+                    )
+                ),
+                allow_questionnaire_session_save=False,
+            )
+            self.assertFalse(seen_requests[0].save_allowed)
+            self.assertFalse(json.loads(forced_private)["save_with_session"])
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -2446,19 +2462,45 @@ class CliTests(unittest.TestCase):
                 {"id": "constraint", "question": "还有什么限制？"},
             ]
         })
-        values = iter(["1", "/多行", "只查看源码", "不要运行测试", "/提交", "是"])
+        values = iter(["1", "/多行", "只查看源码", "不要运行测试", "/提交", "n", "是"])
         outputs: list[str] = []
         result = _ask_user_cli(request, input_fn=lambda _prompt: next(values), output=outputs.append)
         self.assertEqual(result.status, "submitted")
+        self.assertFalse(result.save_with_session)
         self.assertEqual([answer.answer for answer in result.answers], ["src/", "只查看源码\n不要运行测试"])
         self.assertFalse(any("只查看源码" in line for line in outputs))
+        self.assertTrue(any("默认仅本次使用" in line for line in outputs))
+
+        allow_save_values = iter(["自然语言回答", "y", "是"])
+        save_result = _ask_user_cli(
+            parse_questionnaire({"questions": [{"id": "q", "question": "回答什么？"}]}),
+            input_fn=lambda _prompt: next(allow_save_values),
+            output=lambda _line: None,
+        )
+        self.assertTrue(save_result.save_with_session)
+
+        locked_inputs = iter(["仅本次回答", "是"])
+        locked_prompts: list[str] = []
+        locked_outputs: list[str] = []
+        locked_result = _ask_user_cli(
+            QuestionnaireRequest(
+                parse_questionnaire({"questions": [{"id": "q", "question": "回答什么？"}]}).questions,
+                save_allowed=False,
+            ),
+            input_fn=lambda prompt: (locked_prompts.append(prompt), next(locked_inputs))[1],
+            output=locked_outputs.append,
+        )
+        self.assertFalse(locked_result.save_with_session)
+        self.assertEqual(len(locked_prompts), 2, "save choice is unavailable, but submit confirmation remains")
+        self.assertTrue(any("不能随之后的 /保存" in line for line in locked_outputs))
 
     def test_plain_cli_empty_answer_is_explicit_and_cancel_discards_draft(self) -> None:
         request = parse_questionnaire({"questions": [{"id": "q", "question": "可以留空吗？"}]})
-        values = iter(["", "是"])
+        values = iter(["", "n", "是"])
         submitted = _ask_user_cli(request, input_fn=lambda _prompt: next(values), output=lambda _line: None)
         self.assertEqual(submitted.status, "submitted")
         self.assertEqual(submitted.answers[0].answer, "")
+        self.assertFalse(submitted.save_with_session)
         cancelled = _ask_user_cli(
             request,
             input_fn=lambda _prompt: "/取消",

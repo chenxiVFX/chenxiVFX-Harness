@@ -47,6 +47,7 @@ from .questions import (
     validate_question_answers,
 )
 from .sessions import (
+    describe_session_omissions,
     SessionError,
     SessionStore,
     contains_likely_secret,
@@ -526,7 +527,7 @@ def _help_text() -> str:
   /多行              开始多行提问；单独输入 /提交 发送，/取消 丢弃
   /退出              结束会话
 
-模型可在信息不足时使用结构化问卷询问 1–3 个非敏感问题；建议可选，用户可自由作答。TUI 按题编辑并审阅后显式提交，Esc 取消本问卷；Ctrl+C 取消当前模型请求。答案仅作为不可信上下文，不能授权任何操作，不会存入安全会话。疑似密钥、密码或 Token 请求会被阻止。
+模型可在信息不足时使用结构化问卷询问 1–3 个非敏感问题；建议可选，用户可自由作答。TUI 按题编辑并审阅后显式提交，Esc 取消本问卷；Ctrl+C 取消当前模型请求。默认问答仅本次使用；当前上下文安全时，用户可在提交前明确允许把普通问答随 /保存 写入工作区本地会话；已有未存档上下文时本地会禁用该选项。未同意保存的回答及其影响的后续轮次会从存档中省略，并显示恢复提示。疑似密钥、密码或 Token 请求会被阻止。
 文件引用：在提问中写 @相对路径，或用 @{包含空格的相对路径}。
 多行提问以换行符合并，最多 64 KiB UTF-8；Ctrl+C 或 /取消 会丢弃草稿，EOF 会结束会话且不提交。
 TTY 且提供 Python readline 时，Tab 补全命令名和固定选项（如 /模式 计划|执行）；不补路径、自由文本或凭据。输入历史（包括审批回答）不会保存或重放。
@@ -932,8 +933,29 @@ def _ask_user_cli(
             answers.append(validated[question_index].answer)
             break
 
+    if request.save_allowed:
+        output(
+            "\n隐私选择：默认仅本次使用，问答和受其影响的后续对话不会进入会话存档；"
+            "恢复后可能需要重新提供背景。若允许将普通问答写入工作区本地会话，请明确输入 是；"
+            "疑似凭据仍会被拒绝。"
+        )
+        try:
+            save_choice = input_fn("允许问卷随之后的 /保存 写入本地会话？[y/N] ")
+        except EOFError:
+            return QuestionnaireResult("cancelled")
+        except KeyboardInterrupt:
+            raise
+        if save_choice.strip() in {"/取消", "/cancel", "/退出", "/exit"}:
+            return QuestionnaireResult("cancelled")
+        save_with_session = _is_affirmative_answer(save_choice)
+    else:
+        output(
+            "\n隐私：当前对话含未存档上下文，本问卷不能随之后的 /保存 写入；"
+            "恢复后可能需要重新提供背景。疑似凭据仍会被拒绝。"
+        )
+        save_with_session = False
     try:
-        confirmed = input_fn("\n确认将回答交给本轮模型？输入 是 确认，其余取消 > ")
+        confirmed = input_fn("确认将回答交给本轮模型？输入 是 确认，其余取消 > ")
     except EOFError:
         return QuestionnaireResult("cancelled")
     except KeyboardInterrupt:
@@ -947,7 +969,7 @@ def _ask_user_cli(
             output("检测到疑似凭据；回答未提交。请使用 /配置 或受支持的环境变量设置。")
             return QuestionnaireResult("blocked_credential")
         return QuestionnaireResult("cancelled")
-    return QuestionnaireResult("submitted", validated)
+    return QuestionnaireResult("submitted", validated, save_with_session)
 
 
 def run_console(
@@ -1131,12 +1153,21 @@ def run_console(
             output("会话结束。")
             return 0
         if command in {"/状态", "/status"}:
+            _, omissions = agent.export_session()
+            omission_status = (
+                "当前或继承存档存在省略："
+                + describe_session_omissions(omissions)
+                + "；恢复后可能需要重新提供背景。"
+                if omissions
+                else "当前没有已记录的会话省略。"
+            )
             output(
                 f"提供商：{_safe_terminal_text(str(provider.label))}\n"
                 f"模型：{_safe_terminal_text(str(getattr(provider, 'model', '未知')))}\n"
                 f"工作区：{_safe_terminal_text(str(workspace.root))}\n"
                 f"模式：{mode}\n"
-                f"目标：{_safe_terminal_text(redact_likely_secrets(agent.goal)[0]) or '（未设置）'}"
+                f"目标：{_safe_terminal_text(redact_likely_secrets(agent.goal)[0]) or '（未设置）'}\n"
+                f"会话完整性：{omission_status}"
             )
             continue
         if command in {"/配置", "/config"}:
@@ -1698,15 +1729,21 @@ def run_console(
                     if not _is_affirmative_answer(answer):
                         output("已取消保存；现有存档未改变。")
                         continue
-                safe_turns = agent.safe_session_turns()
+                safe_turns, omissions = agent.export_session()
                 saved = session_store.save(
                     name,
                     safe_turns,
                     goal=agent.goal,
                     usage=agent.usage.to_dict(),
+                    omissions=omissions,
                 )
-                omitted = len(agent.turns) - saved
-                output(f"已保存 {saved} 个安全对话轮次到会话 {name!r}；省略 {omitted} 个不完整、工具或敏感轮次。")
+                if omissions:
+                    output(
+                        f"已保存 {saved} 个安全对话轮次到会话 {name!r}；存档省略状态："
+                        f"{describe_session_omissions(omissions)}。恢复后可能需要重新提供这些背景。"
+                    )
+                else:
+                    output(f"已保存 {saved} 个安全对话轮次到会话 {name!r}；未记录省略项。")
             except SessionError as exc:
                 output(f"会话未保存：{exc}")
             continue
@@ -1776,10 +1813,36 @@ def run_console(
                 if not _is_affirmative_answer(answer):
                     output("已取消恢复；当前上下文未改变。")
                     continue
-            agent.restore(turns=loaded.turns, goal=loaded.goal, usage=loaded.usage)
+            agent.restore(
+                turns=loaded.turns,
+                goal=loaded.goal,
+                usage=loaded.usage,
+                omissions=loaded.omissions,
+            )
+            if loaded.format_version < 2:
+                prior_omissions = {
+                    reason: count
+                    for reason, count in loaded.omissions.items()
+                    if reason != "legacy_completeness_unknown"
+                }
+                restore_notice = (
+                    "旧版存档没有完整性记录，无法确认保存前是否省略过历史。"
+                    + (
+                        "另外记录的省略项：" + describe_session_omissions(prior_omissions) + "。"
+                        if prior_omissions
+                        else ""
+                    )
+                )
+            elif loaded.omissions:
+                restore_notice = (
+                    f"存档省略状态：{describe_session_omissions(loaded.omissions)}。"
+                    "恢复后可能需要重新提供背景。"
+                )
+            else:
+                restore_notice = "存档没有记录已知省略项。"
             output(
                 f"已恢复历史会话 {loaded.name!r}，包含 {len(loaded.turns)} 个安全轮次。"
-                "审批与执行授权不会恢复，存档中的旧工具调用不会执行。"
+                f"{restore_notice}审批与执行授权不会恢复，存档中的旧工具调用不会执行。"
             )
             continue
         if command in {"/统计", "/stats"}:
@@ -1875,7 +1938,9 @@ def run_console(
                 f"不会摘要且将整轮丢弃的旧内容：{_format_turn_indexes(preview.dropped_turn_indexes)}；"
                 "旧工具调用及结果只会成组丢弃，不写入摘要。\n"
                 f"最近原样保留的轮次：{_format_turn_indexes(preview.preserved_recent_turn_indexes)}。"
-                f"摘要含 {preview.included_dialogue_excerpts} 条对话摘录；另有 {preview.omitted_dialogue_excerpts} 轮未摘录。\n"
+                f"摘要含 {preview.included_dialogue_excerpts} 条对话摘录；另有 {preview.omitted_dialogue_excerpts} 轮未摘录；"
+                f"已获准存档的问卷 {preview.preserved_questionnaires} 份纳入摘要，"
+                f"仅本次使用且被丢弃的问卷轮次 {preview.dropped_questionnaire_turns} 个。\n"
                 "将加入以下不可信用户上下文（有损摘要）：\n"
                 f"{_format_compression_summary(summary)}"
             )
@@ -1892,7 +1957,10 @@ def run_console(
             except ValueError as exc:
                 output(f"压缩未应用：{exc}")
                 continue
-            output("压缩已应用；历史摘要保留为不可信用户消息，系统提示未更改。")
+            output(
+                "压缩已应用；历史摘要保留为不可信用户消息，系统提示未更改。"
+                "未保存的问卷回答不会写入摘要；恢复存档时会显示省略状态。"
+            )
             continue
         if command in {"/子代理", "/delegate"}:
             subcommand, _, subargument = argument.strip().partition(" ")

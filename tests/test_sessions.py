@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from cvfx_harness.agent import Agent, SYSTEM_PROMPT
 from cvfx_harness.cli import _format_compression_summary, run_console
 from cvfx_harness.providers import AssistantTurn, MockProvider, ProviderCancelled, ProviderError, ToolCall
+from cvfx_harness.questions import QuestionnaireResult, UserQuestionAnswer
 from cvfx_harness.sessions import MAX_SESSION_BYTES, SessionError, SessionStore
 from cvfx_harness.tools import TOOL_SCHEMAS, Workspace
 from cvfx_harness.usage import ProviderUsage, UsageStats, estimate_payload_tokens, estimate_tokens
@@ -143,6 +144,61 @@ class SessionTests(unittest.TestCase):
             with self.assertRaisesRegex(SessionError, "结构无效"):
                 store.load("tampered")
 
+    def test_legacy_archive_marks_completeness_as_unknown(self) -> None:
+        with local_temp() as temp:
+            workspace = Workspace(temp)
+            store = SessionStore(workspace)
+            store.save("legacy", [{
+                "kind": "dialogue",
+                "messages": [
+                    {"role": "user", "content": "普通问题"},
+                    {"role": "assistant", "content": "普通答复"},
+                ],
+            }])
+            path = Path(temp) / ".harness" / "sessions" / "legacy.json"
+            archive = json.loads(path.read_text(encoding="utf-8"))
+            archive["version"] = 1
+            archive.pop("omissions")
+            path.write_text(json.dumps(archive, ensure_ascii=False), encoding="utf-8")
+            loaded = store.load("legacy")
+            self.assertEqual(loaded.format_version, 1)
+            self.assertEqual(loaded.omissions, {"legacy_completeness_unknown": 1})
+
+    def test_cli_save_and_restore_report_unsaved_questionnaire_context(self) -> None:
+        with local_temp() as temp:
+            class PrivateQuestionProvider(ScriptedProvider):
+                def __init__(self):
+                    super().__init__([
+                        AssistantTurn("", [ToolCall("ask-private-cli", "ask_user", {
+                            "questions": [{"id": "intent", "question": "希望优先解决什么？"}]
+                        })]),
+                        AssistantTurn("我会按仅本次信息继续。"),
+                    ])
+
+            args = SimpleNamespace(workspace=temp, provider="mock", model=None)
+            outputs: list[str] = []
+            inputs = iter(["请开始", "保密需求哨兵", "n", "是", "/保存 private", "/退出"])
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=PrivateQuestionProvider()):
+                self.assertEqual(
+                    run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append), 0
+                )
+            save_notice = "\n".join(outputs)
+            self.assertIn("仅本次使用", save_notice)
+            self.assertIn("恢复后可能需要重新提供", save_notice)
+            self.assertNotIn("保密需求哨兵", save_notice)
+
+            restored_outputs: list[str] = []
+            restore_inputs = iter(["/恢复 private", "/退出"])
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()):
+                self.assertEqual(
+                    run_console(args, input_fn=lambda _prompt: next(restore_inputs), output=restored_outputs.append),
+                    0,
+                )
+            restore_notice = "\n".join(restored_outputs)
+            self.assertIn("存档省略状态", restore_notice)
+            self.assertIn("仅本次使用、未存档的问卷回答", restore_notice)
+            self.assertNotIn("保密需求哨兵", restore_notice)
+
     def test_session_names_and_sensitive_records_are_rejected(self) -> None:
         with local_temp() as temp:
             store = SessionStore(Workspace(temp))
@@ -199,6 +255,197 @@ class SessionTests(unittest.TestCase):
             agent.ask("后续问题")
             self.assertEqual(agent.safe_session_turns(), [])
 
+    def test_explicitly_saved_questionnaire_round_trips_as_untrusted_dialogue(self) -> None:
+        with local_temp() as temp:
+            workspace = Workspace(temp)
+            provider = ScriptedProvider([
+                AssistantTurn("", [ToolCall("ask-save", "ask_user", {
+                    "questions": [{"id": "scope", "question": "优先检查什么范围？"}]
+                })]),
+                AssistantTurn("我会先检查 src/。"),
+            ])
+            agent = Agent(
+                provider,
+                workspace,
+                approve_action=lambda _request: self.fail("no action approval"),
+                ask_user=lambda _request: QuestionnaireResult(
+                    "submitted", (UserQuestionAnswer("scope", "仅检查 src/"),), True
+                ),
+            )
+            agent.ask("请协助检查代码", plan_only=True)
+            saved_turns, omissions = agent.export_session()
+            self.assertEqual(omissions, {})
+            self.assertEqual(len(saved_turns), 1)
+            self.assertEqual(saved_turns[0]["kind"], "dialogue")
+            serialized_user = saved_turns[0]["messages"][0]["content"]
+            self.assertIn("<untrusted-user-clarification version=\"1\">", serialized_user)
+            self.assertIn("仅检查 src/", serialized_user)
+            self.assertEqual(saved_turns[0]["messages"][1]["content"], "我会先检查 src/。")
+            self.assertNotIn("tool_calls", json.dumps(saved_turns, ensure_ascii=False))
+
+            store = SessionStore(workspace)
+            store.save("opted_in", saved_turns, omissions=omissions)
+            loaded = store.load("opted_in")
+            restored = Agent(ScriptedProvider([]), workspace, approve_action=lambda _request: False)
+            restored.restore(
+                turns=loaded.turns,
+                goal=loaded.goal,
+                usage=loaded.usage,
+                omissions=loaded.omissions,
+            )
+            self.assertIn("仅检查 src/", json.dumps(restored.messages, ensure_ascii=False))
+            self.assertFalse(any("tool_calls" in message for message in restored.messages))
+            restored.turns.extend(
+                _dialogue(f"恢复后的旧问题 {index}：" + "可摘要中文内容" * 240,
+                          f"恢复后的旧答复 {index}：" + "普通答复" * 180)
+                for index in range(5)
+            )
+            restored._rebuild_messages()
+            preview = restored.preview_compression(keep_recent_turns=1)
+            self.assertIsNotNone(preview)
+            assert preview is not None
+            self.assertEqual(preview.preserved_questionnaires, 1)
+            repeated_summary = next(
+                turn.messages[0]["content"] for turn in preview.replacement if turn.kind == "summary"
+            )
+            self.assertIn("仅检查 src/", repeated_summary)
+
+    def test_default_private_questionnaire_is_reported_and_taints_followups(self) -> None:
+        with local_temp() as temp:
+            workspace = Workspace(temp)
+            provider = ScriptedProvider([
+                AssistantTurn("", [ToolCall("ask-private", "ask_user", {
+                    "questions": [{"id": "goal", "question": "本次希望优先解决什么？"}]
+                })]),
+                AssistantTurn("收到；仅本次使用。"),
+                AssistantTurn("后续普通答复。"),
+            ])
+            notices: list[str] = []
+            agent = Agent(
+                provider,
+                workspace,
+                approve_action=lambda _request: self.fail("question never authorizes actions"),
+                emit_output=notices.append,
+                ask_user=lambda _request: QuestionnaireResult(
+                    "submitted", (UserQuestionAnswer("goal", "改善启动速度"),)
+                ),
+            )
+            agent.ask("先澄清需求", plan_only=True)
+            self.assertTrue(any("仅本次使用" in item and "不会进入会话存档" in item for item in notices))
+            agent.ask("继续做普通工作")
+            saved, omissions = agent.export_session()
+            self.assertEqual(saved, [])
+            self.assertGreaterEqual(omissions.get("unsaved_questionnaire_answers", 0), 1)
+            self.assertGreaterEqual(omissions.get("depends_on_unsaved_context", 0), 1)
+
+            store = SessionStore(workspace)
+            store.save("private", saved, omissions=omissions)
+            loaded = store.load("private")
+            self.assertEqual(loaded.omissions, omissions)
+            self.assertNotIn("改善启动速度", json.dumps(loaded.turns, ensure_ascii=False))
+
+    def test_unsaved_context_disables_opt_in_for_later_questionnaires(self) -> None:
+        with local_temp() as temp:
+            workspace = Workspace(temp)
+            provider = ScriptedProvider([
+                AssistantTurn("", [ToolCall("ask-first", "ask_user", {
+                    "questions": [{"id": "detail", "question": "先补充什么？"}]
+                })]),
+                AssistantTurn("已收到第一条私有回答。"),
+                AssistantTurn("", [ToolCall("ask-second", "ask_user", {
+                    "questions": [{"id": "followup", "question": "还有什么背景？"}]
+                })]),
+                AssistantTurn("已继续。"),
+            ])
+            seen_requests = []
+
+            def answer(request):
+                seen_requests.append(request)
+                answer_text = f"UNSAVED_CONTEXT_ANSWER_{len(seen_requests)}"
+                return QuestionnaireResult(
+                    "submitted",
+                    (UserQuestionAnswer(request.questions[0].question_id, answer_text),),
+                    save_with_session=len(seen_requests) > 1,
+                )
+
+            agent = Agent(
+                provider,
+                workspace,
+                approve_action=lambda _request: self.fail("question never authorizes actions"),
+                ask_user=answer,
+            )
+            agent.ask("先问一个普通澄清", plan_only=True)
+            agent.ask("在已有回答后再问", plan_only=True)
+
+            self.assertTrue(seen_requests[0].save_allowed)
+            self.assertFalse(seen_requests[1].save_allowed)
+            second_tool_result = json.loads(provider.requests[3][-1]["content"])
+            self.assertFalse(second_tool_result["save_with_session"])
+            safe, omissions = agent.export_session()
+            serialized = json.dumps(safe, ensure_ascii=False)
+            self.assertNotIn("UNSAVED_CONTEXT_ANSWER_1", serialized)
+            self.assertNotIn("UNSAVED_CONTEXT_ANSWER_2", serialized)
+            self.assertGreaterEqual(omissions.get("unsaved_questionnaire_answers", 0), 1)
+
+    def test_cancelled_question_does_not_block_later_normal_session_save(self) -> None:
+        with local_temp() as temp:
+            workspace = Workspace(temp)
+            provider = ScriptedProvider([
+                AssistantTurn("", [ToolCall("ask-cancel", "ask_user", {
+                    "questions": [{"id": "detail", "question": "需要什么澄清？"}]
+                })]),
+                AssistantTurn("没有收到回答；请在需要时补充。"),
+                AssistantTurn("稍后的普通答复。"),
+            ])
+            agent = Agent(
+                provider,
+                workspace,
+                approve_action=lambda _request: False,
+                ask_user=lambda _request: QuestionnaireResult("cancelled"),
+            )
+            agent.ask("先提出合成需求", plan_only=True)
+            agent.ask("后续普通问题")
+            safe, omissions = agent.export_session()
+            self.assertEqual(len(safe), 1)
+            self.assertEqual(safe[0]["messages"][0]["content"], "后续普通问题")
+            self.assertGreaterEqual(omissions.get("questionnaire_not_completed", 0), 1)
+            self.assertNotIn("需要什么澄清", json.dumps(safe, ensure_ascii=False))
+            store = SessionStore(workspace)
+            store.save("after_cancel", safe, omissions=omissions)
+            loaded = store.load("after_cancel")
+            self.assertEqual(len(loaded.turns), 1)
+            self.assertIn("后续普通问题", json.dumps(loaded.turns, ensure_ascii=False))
+            self.assertIn("questionnaire_not_completed", loaded.omissions)
+
+    def test_multiple_questionnaires_preserve_only_individually_approved_answers(self) -> None:
+        with local_temp() as temp:
+            workspace = Workspace(temp)
+            provider = ScriptedProvider([
+                AssistantTurn("", [ToolCall("ask-one", "ask_user", {
+                    "questions": [{"id": "one", "question": "第一项偏好？"}]
+                })]),
+                AssistantTurn("", [ToolCall("ask-two", "ask_user", {
+                    "questions": [{"id": "two", "question": "第二项限制？"}]
+                })]),
+                AssistantTurn("已根据本次信息继续。"),
+            ])
+            decisions = iter([
+                QuestionnaireResult("submitted", (UserQuestionAnswer("one", "优先中文文档"),), True),
+                QuestionnaireResult("submitted", (UserQuestionAnswer("two", "私人回答不保存"),), False),
+            ])
+            agent = Agent(
+                provider,
+                workspace,
+                approve_action=lambda _request: self.fail("questions never authorize actions"),
+                ask_user=lambda _request: next(decisions),
+            )
+            agent.ask("整理工作需求", plan_only=True)
+            saved, omissions = agent.export_session()
+            text = json.dumps(saved, ensure_ascii=False)
+            self.assertIn("优先中文文档", text)
+            self.assertNotIn("私人回答不保存", text)
+            self.assertGreaterEqual(omissions.get("unsaved_questionnaire_answers", 0), 1)
+
     def test_user_authored_checkpoint_redacts_and_never_imports_tool_output(self) -> None:
         with local_temp() as temp:
             store = SessionStore(Workspace(temp))
@@ -254,6 +501,86 @@ class SessionTests(unittest.TestCase):
 
 
 class CompressionTests(unittest.TestCase):
+    def test_compression_keeps_only_explicitly_saved_questionnaire_answers(self) -> None:
+        with local_temp() as temp:
+            workspace = Workspace(temp)
+            provider = ScriptedProvider([
+                AssistantTurn("旧答复"),
+                AssistantTurn("", [ToolCall("ask-save", "ask_user", {
+                    "questions": [{"id": "scope", "question": "保存范围？"}]
+                })]),
+                AssistantTurn("已按保存的范围继续。"),
+            ])
+            agent = Agent(
+                provider,
+                workspace,
+                approve_action=lambda _request: False,
+                ask_user=lambda _request: QuestionnaireResult(
+                    "submitted", (UserQuestionAnswer("scope", "仅维护中文 CLI"),), True
+                ),
+            )
+            agent.ask("旧需求" * 1800)
+            agent.ask("请先确认范围", plan_only=True)
+            agent.turns.extend(
+                _dialogue(f"近期长问题 {index}：" + "普通中文上下文" * 250,
+                          f"近期答复 {index}：" + "保留对话" * 250)
+                for index in range(5)
+            )
+            agent._rebuild_messages()
+            preview = agent.preview_compression(keep_recent_turns=1)
+            self.assertIsNotNone(preview)
+            assert preview is not None
+            self.assertEqual(preview.preserved_questionnaires, 1)
+            summary = next(turn.messages[0]["content"] for turn in preview.replacement if turn.kind == "summary")
+            body = json.loads(summary.split("\n", 2)[2].rsplit("\n", 1)[0])
+            self.assertIn("仅维护中文 CLI", json.dumps(body["saved_user_clarifications"], ensure_ascii=False))
+            agent.apply_compression(preview)
+            saved, omissions = agent.export_session()
+            self.assertIn("仅维护中文 CLI", json.dumps(saved, ensure_ascii=False))
+            self.assertGreaterEqual(omissions.get("tool_history", 0), 1)
+
+    def test_compression_drops_private_questionnaire_answer_and_records_omission(self) -> None:
+        with local_temp() as temp:
+            workspace = Workspace(temp)
+            provider = ScriptedProvider([
+                AssistantTurn("旧答复"),
+                AssistantTurn("", [ToolCall("ask-private", "ask_user", {
+                    "questions": [{"id": "goal", "question": "本次目标？"}]
+                })]),
+                AssistantTurn("收到，仅本次使用。"),
+            ])
+            agent = Agent(
+                provider,
+                workspace,
+                approve_action=lambda _request: False,
+                ask_user=lambda _request: QuestionnaireResult(
+                    "submitted", (UserQuestionAnswer("goal", "PRIVATE_ANSWER_SENTINEL"),), False
+                ),
+            )
+            agent.ask("旧需求" * 1800)
+            agent.ask("请先确认目标", plan_only=True)
+            affected = [
+                _dialogue(f"受私有上下文影响的问题 {index}：" + "后续中文内容" * 220,
+                          f"受影响答复 {index}：" + "不应静默存档" * 160, persistable=False)
+                for index in range(5)
+            ]
+            for turn in affected:
+                turn.omission_reasons["depends_on_unsaved_context"] = 1
+            agent.turns.extend(affected)
+            agent._rebuild_messages()
+            preview = agent.preview_compression(keep_recent_turns=1)
+            self.assertIsNotNone(preview)
+            assert preview is not None
+            self.assertEqual(preview.preserved_questionnaires, 0)
+            self.assertEqual(preview.dropped_questionnaire_turns, 1)
+            summary = next(turn.messages[0]["content"] for turn in preview.replacement if turn.kind == "summary")
+            self.assertNotIn("PRIVATE_ANSWER_SENTINEL", summary)
+            agent.apply_compression(preview)
+            saved, omissions = agent.export_session()
+            self.assertNotIn("PRIVATE_ANSWER_SENTINEL", json.dumps(saved, ensure_ascii=False))
+            self.assertGreaterEqual(omissions.get("unsaved_questionnaire_answers", 0), 1)
+            self.assertGreaterEqual(omissions.get("depends_on_unsaved_context", 0), 1)
+
     def test_long_chinese_compression_preserves_goal_and_complete_constraints(self) -> None:
         with local_temp() as temp:
             agent = Agent(MockProvider(), Workspace(temp), approve_action=lambda _request: False)

@@ -2704,10 +2704,13 @@ def run_tool(
     test_profile_store: Any | None = None,
     emit_output: Callable[[str], None] | None = None,
     ask_user: Callable[[QuestionnaireRequest], QuestionnaireResult] | None = None,
+    allow_questionnaire_session_save: bool = True,
 ) -> str:
     """Execute one validated tool; model output never grants local permission."""
 
     if call.name == "ask_user":
+        if type(allow_questionnaire_session_save) is not bool:
+            allow_questionnaire_session_save = False
         _raise_if_cancelled(cancellation_event)
         _validate_arguments(call, {"questions"})
         try:
@@ -2722,6 +2725,8 @@ def run_tool(
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+        if not allow_questionnaire_session_save:
+            request = QuestionnaireRequest(request.questions, save_allowed=False)
         if ask_user is None:
             return json.dumps(
                 {"status": "unavailable", "answers": [], "message": "当前界面不支持交互式提问；没有收集回答。"},
@@ -2735,7 +2740,8 @@ def run_tool(
                 raise QuestionRequestError("invalid_request")
             if result.status == "submitted":
                 if (
-                    not isinstance(result.answers, (tuple, list))
+                    type(result.save_with_session) is not bool
+                    or not isinstance(result.answers, (tuple, list))
                     or len(result.answers) != len(request.questions)
                     or any(not isinstance(answer, UserQuestionAnswer) for answer in result.answers)
                     or tuple(answer.question_id for answer in result.answers)
@@ -2746,8 +2752,15 @@ def run_tool(
                     request,
                     tuple(answer.answer for answer in result.answers),
                 )
-                result = QuestionnaireResult("submitted", normalized)
-            elif result.status != "cancelled" and result.status != "blocked_credential":
+                result = QuestionnaireResult(
+                    "submitted",
+                    normalized,
+                    result.save_with_session and request.save_allowed,
+                )
+            elif result.status in {"cancelled", "blocked_credential"}:
+                if result.answers or result.save_with_session:
+                    raise QuestionRequestError("invalid_request")
+            else:
                 raise QuestionRequestError("invalid_request")
         except QuestionRequestError as exc:
             if exc.code == "credential_request":
@@ -2762,7 +2775,16 @@ def run_tool(
         _raise_if_cancelled(cancellation_event)
         if emit_output is not None:
             if result.status == "submitted":
-                emit_output("已将本次用户回答交给当前模型；不会写入会话存档。")
+                if result.save_with_session:
+                    emit_output(
+                        "已将本次用户回答交给当前模型。你已允许将问卷内容保存到工作区本地会话；"
+                        "只有执行 /保存 时才会写入，疑似凭据仍不会保存。"
+                    )
+                else:
+                    emit_output(
+                        "已将本次用户回答交给当前模型。你选择仅本次使用；本轮及受其影响的后续对话不会进入会话存档，"
+                        "恢复后可能需要重新提供背景。"
+                    )
             elif result.status == "cancelled":
                 emit_output("已取消提问；没有提交回答。")
         return questionnaire_result_json(result)

@@ -279,11 +279,24 @@ class PromptToolkitTests(unittest.TestCase):
                 self.assertNotIn("不要运行测试", ui._transcript)
                 self.assertNotIn("本次先关注哪一方面", ui._transcript)
                 self.assertTrue(ui._application.layout.has_focus(ui._question_edit_button))
+                self.assertFalse(ui._question_save_with_session)
+                pipe.send_bytes(b"\t")
+                self._wait_until(
+                    lambda: ui._application.layout.has_focus(ui._question_save_button),
+                    "Tab did not focus the default-off local-save choice",
+                )
+                pipe.send_bytes(b"\r")
+                self._wait_until(
+                    lambda: ui._question_save_with_session,
+                    "explicit save choice did not toggle on",
+                )
+                self.assertIsNotNone(ui._question_pending, "save choice must not submit the questionnaire")
                 pipe.send_bytes(b"\t")
                 self._wait_until(
                     lambda: ui._application.layout.has_focus(ui._question_submit_button),
                     "Tab did not focus explicit questionnaire submit",
                 )
+                self.assertIsNotNone(ui._question_pending, "focus changes must not submit the questionnaire")
                 pipe.send_bytes(b"\r")
                 self._wait_until(
                     lambda: "已按用户本次回答继续。" in ui._transcript,
@@ -292,6 +305,7 @@ class PromptToolkitTests(unittest.TestCase):
                 self.assertEqual(provider.calls, 2)
                 tool_result = json.loads(provider.requests[1][-1]["content"])
                 self.assertEqual(tool_result["status"], "submitted")
+                self.assertTrue(tool_result["save_with_session"])
                 self.assertEqual(tool_result["answers"][0]["answer"], "稳定性")
                 self.assertEqual(tool_result["answers"][1]["answer"], "仅检查 src/\n\n不要运行测试")
                 self.assertEqual(tool_result["answers"][2]["answer"], "")
@@ -308,6 +322,37 @@ class PromptToolkitTests(unittest.TestCase):
             self.assertIsInstance(ui._question_answer_area.buffer.history, DummyHistory)
             self.assertIsInstance(ui._application.clipboard, DummyClipboard)
             self.assertEqual(list(ui._question_answer_area.buffer.history.load_history_strings()), [])
+
+    def test_questionnaire_save_choice_is_locked_for_unsaved_context(self) -> None:
+        request = QuestionnaireRequest(
+            (UserQuestion("detail", "请补充普通背景。", ()),),
+            save_allowed=False,
+        )
+        results: list[QuestionnaireResult] = []
+
+        def worker(ui: TerminalUI) -> int:
+            results.append(ui.ask_questions(request))
+            return 0
+
+        def drive(_pipe, ui: TerminalUI) -> None:
+            self._wait_until(lambda: ui._question_ready.is_set(), "locked questionnaire was not presented")
+            ui._question_answer_area.text = "普通背景"
+            ui._question_show_review()
+            self.assertIn("当前对话含未存档上下文", ui._question_review_area.text)
+            self.assertIn("不能随 /保存 存档", ui._question_review_area.text)
+            ui._question_toggle_session_save()
+            self.assertFalse(ui._question_save_with_session)
+            ui._application.layout.focus(ui._question_edit_button)
+            ui._focus_question_control(forward=True)
+            self.assertTrue(ui._application.layout.has_focus(ui._question_submit_button))
+            ui._question_submit()
+            self._wait_until(lambda: bool(results), "locked questionnaire did not return")
+
+        ui, rc = self._run_ui(worker, drive)
+        self.assertEqual(rc, 0)
+        self.assertEqual(results[0].status, "submitted")
+        self.assertFalse(results[0].save_with_session)
+        self.assertFalse(ui._question_save_with_session)
 
     def test_questionnaire_escape_returns_cancelled_empty_answers_and_resumes_prompt(self) -> None:
         class CancelQuestionProvider:

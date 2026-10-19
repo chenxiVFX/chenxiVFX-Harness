@@ -392,6 +392,7 @@ class TerminalUI:
         self._question_index = 0
         self._question_answers: list[str] = []
         self._question_reviewing = False
+        self._question_save_with_session = False
         self._worker_thread: threading.Thread | None = None
         self._worker_started = False
         self._worker_done = False
@@ -565,6 +566,17 @@ class TerminalUI:
         self._question_review_button = Button("查看回答", handler=self._question_show_review, width=14)
         self._question_cancel_button = Button("取消提问", handler=self._question_cancel, width=14)
         self._question_edit_button = Button("返回修改", handler=self._question_edit, width=14)
+        self._question_save_button = Button(
+            "存档：仅本次（默认）", handler=self._question_toggle_session_save, width=26
+        )
+        self._question_save_unavailable = Window(
+            FormattedTextControl(
+                "当前对话含未存档上下文，本问卷不能随 /保存 存档；恢复后可能需要重新提供背景。"
+            ),
+            height=Dimension(min=1, max=2),
+            wrap_lines=True,
+            style="class:approval",
+        )
         self._question_submit_button = Button("提交回答", handler=self._question_submit, width=14)
         self._question_input_container = ConditionalContainer(
             HSplit(
@@ -588,6 +600,20 @@ class TerminalUI:
                     Window(FormattedTextControl("审阅本次回答 · 不会自动提交"), height=1,
                            style="class:approval.heading"),
                     self._question_review_area,
+                    ConditionalContainer(
+                        VSplit([self._question_save_button], padding=1),
+                        Condition(
+                            lambda: self._question_pending is not None
+                            and self._question_pending.request.save_allowed
+                        ),
+                    ),
+                    ConditionalContainer(
+                        self._question_save_unavailable,
+                        Condition(
+                            lambda: self._question_pending is not None
+                            and not self._question_pending.request.save_allowed
+                        ),
+                    ),
                     VSplit([self._question_edit_button, self._question_submit_button,
                             self._question_cancel_button], padding=1),
                 ]
@@ -808,11 +834,21 @@ class TerminalUI:
                     self._question_index = 0
                     self._question_answers = [""] * len(value.request.questions)
                     self._question_reviewing = False
+                    self._question_save_with_session = False
+                    self._question_save_button.text = (
+                        "存档：仅本次（默认）"
+                        if value.request.save_allowed
+                        else "存档：当前不可用"
+                    )
                     self._question_answer_area.text = ""
                     self._question_review_area.text = ""
                     self._question_set_current()
                     self._status = "等待回答"
-                    self._notice = "建议答案只会填入草稿；查看回答后还需明确提交。"
+                    self._notice = (
+                        "建议答案只会填入草稿；查看回答后还需明确提交。"
+                        if value.request.save_allowed
+                        else "当前对话含未存档上下文；本问卷无法存档，提交前请先审阅。"
+                    )
                     self._application.layout.focus(self._question_answer_area)
                     self._question_ready.set()
                 elif kind == "question_cancel" and isinstance(value, _QuestionRequest):
@@ -1299,6 +1335,8 @@ class TerminalUI:
                 self._question_submit_button,
                 self._question_cancel_button,
             ]
+            if pending.request.save_allowed:
+                controls.insert(2, self._question_save_button)
         else:
             suggestions = pending.request.questions[self._question_index].suggestions
             controls = [self._question_answer_area]
@@ -1391,8 +1429,43 @@ class TerminalUI:
                 f"{question.question_id} · {_safe_text(question.prompt)}\n回答：{display_answer}"
             )
         self._question_review_area.text = "\n\n".join(entries)
+        self._question_review_area.text = (
+            (
+                "隐私：默认仅本次；切换为允许本地保存后，本问卷仅在 /保存 时写入工作区会话。\n\n"
+                if self._question_pending.request.save_allowed
+                else "隐私：当前对话含未存档上下文，本问卷不能随 /保存 存档；恢复后可能需要重新提供背景。\n\n"
+            )
+            + self._question_review_area.text
+        )
+        self._question_save_button.text = (
+            "存档：允许本地保存" if self._question_save_with_session
+            else "存档：仅本次（默认）" if self._question_pending.request.save_allowed
+            else "存档：当前不可用"
+        )
         self._application.layout.focus(self._question_edit_button)
-        self._notice = "检查全部回答；只有按“提交回答”才会发送给本轮模型。"
+        self._notice = (
+            "检查全部回答；选择存档方式后，仍需按“提交回答”才会发送给本轮模型。"
+            if self._question_pending.request.save_allowed
+            else "检查全部回答；本问卷无法存档，按“提交回答”后才会发送给本轮模型。"
+        )
+
+    def _question_toggle_session_save(self) -> None:
+        if (
+            self._question_pending is None
+            or not self._question_reviewing
+            or not self._question_pending.request.save_allowed
+        ):
+            return
+        self._question_save_with_session = not self._question_save_with_session
+        self._question_save_button.text = (
+            "存档：允许本地保存" if self._question_save_with_session
+            else "存档：仅本次（默认）"
+        )
+        self._notice = (
+            "已允许本问卷随之后的 /保存 写入工作区本地会话。"
+            if self._question_save_with_session
+            else "本问卷仍设为仅本次使用；受其影响的上下文不会进入会话存档。"
+        )
 
     def _question_edit(self) -> None:
         if self._question_pending is None:
@@ -1418,7 +1491,14 @@ class TerminalUI:
             else:
                 self._notice = f"回答无效或超过 {MAX_TOTAL_ANSWER_BYTES} bytes 上限；请返回修改。"
             return
-        self._finish_questionnaire(QuestionnaireResult("submitted", answers))
+        self._finish_questionnaire(
+            QuestionnaireResult(
+                "submitted",
+                answers,
+                self._question_save_with_session
+                and self._question_pending.request.save_allowed,
+            )
+        )
 
     def _question_cancel(self) -> None:
         if self._question_pending is not None:
@@ -1439,6 +1519,7 @@ class TerminalUI:
         self._question_answers = []
         self._question_index = 0
         self._question_reviewing = False
+        self._question_save_with_session = False
         self._question_answer_area.text = ""
         self._question_prompt_area.text = ""
         self._question_review_area.text = ""
@@ -1461,7 +1542,10 @@ class TerminalUI:
         buttons = [*self._question_suggestion_buttons,
                    self._question_prev_button, self._question_next_button,
                    self._question_review_button, self._question_cancel_button,
-                   self._question_edit_button, self._question_submit_button]
+                   self._question_edit_button]
+        if self._question_pending is not None and self._question_pending.request.save_allowed:
+            buttons.append(self._question_save_button)
+        buttons.append(self._question_submit_button)
         for button in buttons:
             if self._application.layout.has_focus(button):
                 button.handler()

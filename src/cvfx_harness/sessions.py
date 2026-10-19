@@ -9,12 +9,35 @@ from typing import Any
 
 from .tools import Workspace, WorkspaceError
 
-SESSION_FORMAT_VERSION = 1
+SESSION_FORMAT_VERSION = 2
 MAX_SESSION_BYTES = 4 * 1024 * 1024
 _SESSION_NAME = re.compile(r"^[\w-]{1,40}$", re.UNICODE)
 _SUMMARY_PREFIX = "<untrusted-history-summary version=\"1\">"
 _CHECKPOINT_PREFIX = "<untrusted-user-checkpoint version=\"1\">"
+_CLARIFICATION_PREFIX = "<untrusted-user-clarification version=\"1\">"
 MAX_CHECKPOINT_CHARS = 4000
+SESSION_OMISSION_REASONS = {
+    "unsaved_questionnaire_answers",
+    "questionnaire_not_completed",
+    "unserializable_questionnaire",
+    "tool_history",
+    "referenced_content",
+    "sensitive_content",
+    "depends_on_unsaved_context",
+    "unserializable_turn",
+    "legacy_completeness_unknown",
+}
+SESSION_OMISSION_LABELS = {
+    "unsaved_questionnaire_answers": "仅本次使用、未存档的问卷回答",
+    "questionnaire_not_completed": "取消或未完成的问卷",
+    "unserializable_questionnaire": "无法安全存档的问卷",
+    "tool_history": "工具调用与结果",
+    "referenced_content": "文件引用内容",
+    "sensitive_content": "疑似敏感内容",
+    "depends_on_unsaved_context": "受未存档上下文影响的后续轮次",
+    "unserializable_turn": "不完整或无法安全序列化的轮次",
+    "legacy_completeness_unknown": "旧版存档未记录完整性",
+}
 _LIKELY_SECRET_PATTERNS = (
     re.compile(r"(?i)\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b"),
     re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_-])"),
@@ -37,6 +60,40 @@ class LoadedSession:
     goal: str
     usage: dict[str, int]
     saved_at: str
+    omissions: dict[str, int]
+    format_version: int
+
+
+def normalize_session_omissions(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict) or len(value) > len(SESSION_OMISSION_REASONS):
+        raise ValueError("invalid session omission metadata")
+    normalized: dict[str, int] = {}
+    total = 0
+    for reason, count in value.items():
+        if (
+            not isinstance(reason, str)
+            or reason not in SESSION_OMISSION_REASONS
+            or type(count) is not int
+            or not 1 <= count <= 2000
+        ):
+            raise ValueError("invalid session omission metadata")
+        normalized[reason] = count
+        total += count
+        if total > 2000:
+            raise ValueError("session omission metadata exceeds limit")
+    return dict(sorted(normalized.items()))
+
+
+def describe_session_omissions(value: Any) -> str:
+    omissions = normalize_session_omissions(value)
+    return "、".join(
+        (
+            SESSION_OMISSION_LABELS[reason]
+            if reason == "legacy_completeness_unknown"
+            else f"{SESSION_OMISSION_LABELS[reason]} {count} 项"
+        )
+        for reason, count in omissions.items()
+    )
 
 
 def contains_likely_secret(text: str) -> bool:
@@ -178,7 +235,7 @@ class SessionStore:
                     raise SessionError("检测到疑似密钥或凭据文本，已阻止存档。")
                 safe_messages.append({"role": expected_role, "content": content})
             if kind == "summary" and not safe_messages[0]["content"].startswith(
-                (_SUMMARY_PREFIX, _CHECKPOINT_PREFIX)
+                (_SUMMARY_PREFIX, _CHECKPOINT_PREFIX, _CLARIFICATION_PREFIX)
             ):
                 raise SessionError("历史摘要缺少不可信内容标记。")
             clean_turns.append({"kind": kind, "messages": safe_messages})
@@ -191,12 +248,17 @@ class SessionStore:
         *,
         goal: str = "",
         usage: dict[str, int] | None = None,
+        omissions: dict[str, int] | None = None,
     ) -> int:
         safe_name = self.validate_name(name)
         safe_turns = self._validate_turn_records(turns)
         if not isinstance(goal, str) or contains_likely_secret(goal):
             raise SessionError("目标文本含疑似密钥或格式无效，已阻止存档。")
         usage = {} if usage is None else usage
+        try:
+            safe_omissions = normalize_session_omissions({} if omissions is None else omissions)
+        except ValueError:
+            raise SessionError("会话省略状态无效。") from None
         try:
             from .usage import UsageStats
 
@@ -210,6 +272,7 @@ class SessionStore:
             "goal": goal,
             "turns": safe_turns,
             "usage": safe_usage,
+            "omissions": safe_omissions,
         }
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(encoded) > MAX_SESSION_BYTES:
@@ -271,11 +334,15 @@ class SessionStore:
             raise
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             raise SessionError("会话存档损坏或不可读取；当前上下文未改变。") from None
+        version = data.get("version") if isinstance(data, dict) else None
+        expected_v1 = {"version", "name", "saved_at", "goal", "turns", "usage"}
+        expected_v2 = expected_v1 | {"omissions"}
         if (
             not isinstance(data, dict)
-            or set(data) != {"version", "name", "saved_at", "goal", "turns", "usage"}
-            or type(data.get("version")) is not int
-            or data.get("version") != SESSION_FORMAT_VERSION
+            or (type(version) is not int)
+            or (version == 1 and set(data) != expected_v1)
+            or (version == SESSION_FORMAT_VERSION and set(data) != expected_v2)
+            or version not in {1, SESSION_FORMAT_VERSION}
             or not isinstance(data.get("name"), str)
             or data["name"].casefold() != safe_name.casefold()
             or not isinstance(data.get("saved_at"), str)
@@ -285,6 +352,13 @@ class SessionStore:
         if not isinstance(goal, str) or contains_likely_secret(goal):
             raise SessionError("会话目标文本无效或疑似包含凭据；当前上下文未改变。")
         safe_turns = self._validate_turn_records(data.get("turns"))
+        try:
+            omissions = normalize_session_omissions(data.get("omissions", {}))
+        except ValueError:
+            raise SessionError("会话省略状态无效；当前上下文未改变。") from None
+        if version == 1:
+            omissions["legacy_completeness_unknown"] = 1
+            omissions = normalize_session_omissions(omissions)
         if len(json.dumps(data, ensure_ascii=False).encode("utf-8")) > MAX_SESSION_BYTES:
             raise SessionError("会话存档超过 4 MiB 上限。")
         try:
@@ -293,4 +367,12 @@ class SessionStore:
             safe_usage = UsageStats.from_dict(data.get("usage")).to_dict()
         except ValueError:
             raise SessionError("会话 Token 统计无效；当前上下文未改变。") from None
-        return LoadedSession(safe_name, safe_turns, goal, safe_usage, data["saved_at"])
+        return LoadedSession(
+            safe_name,
+            safe_turns,
+            goal,
+            safe_usage,
+            data["saved_at"],
+            omissions,
+            version,
+        )
