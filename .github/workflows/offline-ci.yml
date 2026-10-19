@@ -53,5 +53,25 @@ jobs:
       - name: Compile project and tests
         run: python -m compileall -q src tests scripts
 
-      - name: Run offline tests
-        run: python -m unittest discover -s tests -v
+      - name: Run offline tests (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -v 2>&1 | tee "$RUNNER_TEMP/offline-tests.log"
+
+      - name: Run offline tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -v 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\offline-tests.log"
+          exit $LASTEXITCODE
+
+      - name: Preserve offline test output after failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: offline-test-output-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: ${{ runner.temp }}/offline-tests.log
+          if-no-files-found: ignore
+          retention-days: 1
