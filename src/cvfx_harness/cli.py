@@ -21,9 +21,10 @@ from .providers import (
     DEEPSEEK_API_KEY_ENV,
     ProviderCancelled,
     ProviderError,
+    ProviderStreamError,
     provider_from_environment,
 )
-from .sessions import SessionError, SessionStore
+from .sessions import SessionError, SessionStore, redact_likely_secrets
 from .subagents import DelegationPlanError, build_delegation_plan, run_bounded_subagents
 from .tools import ActionRequest, Workspace, WorkspaceError
 from .usage import DEFAULT_TOKEN_BUDGET
@@ -51,6 +52,66 @@ def _safe_terminal_text(text: str) -> str:
         else:
             visible.append(char)
     return "".join(visible)
+
+
+class _StreamingSecretRedactor:
+    """Keep a short token tail so likely credentials split across SSE chunks are masked."""
+
+    def __init__(self) -> None:
+        self._pending_parts: list[str] = []
+        self._pending_chars = 0
+        self._word_starts: list[int] = []
+        self._in_word = False
+
+    def feed(self, fragment: str) -> str:
+        start = self._pending_chars
+        self._pending_parts.append(fragment)
+        self._pending_chars += len(fragment)
+        for offset, char in enumerate(fragment, start):
+            if char.isspace():
+                self._in_word = False
+            elif not self._in_word:
+                self._word_starts.append(offset)
+                self._in_word = True
+        if len(self._word_starts) <= 4:
+            return ""
+        cut = self._word_starts[-4]
+        return redact_likely_secrets(self._take_prefix(cut))[0]
+
+    def finish(self) -> str:
+        pending = "".join(self._pending_parts)
+        self._pending_parts = []
+        self._pending_chars = 0
+        self._word_starts = []
+        self._in_word = False
+        return redact_likely_secrets(pending)[0]
+
+    def _take_prefix(self, cut: int) -> str:
+        safe_parts: list[str] = []
+        remaining_parts: list[str] = []
+        offset = 0
+        for part in self._pending_parts:
+            end = offset + len(part)
+            if end <= cut:
+                safe_parts.append(part)
+            elif offset < cut:
+                safe_parts.append(part[: cut - offset])
+                remaining_parts.append(part[cut - offset :])
+            else:
+                remaining_parts.append(part)
+            offset = end
+        self._pending_parts = remaining_parts
+        self._pending_chars -= cut
+        self._word_starts = [position - cut for position in self._word_starts if position >= cut]
+        return "".join(safe_parts)
+
+
+def _write_stream_text(text: str, stream_write: Callable[[str], None] | None = None) -> None:
+    if stream_write is not None:
+        stream_write(text)
+        return
+    sys.stdout.write(text)
+    sys.stdout.flush()
 
 
 def configure_console_encoding() -> None:
@@ -173,6 +234,7 @@ def _help_text() -> str:
 敏感凭据路径默认禁止读取或修改。当前版本不会运行 shell 命令。
 工作区配置保存在 .harness/config/settings.json；优先级为默认值、工作区配置、环境变量、命令行。
 配置不接受或保存密钥；目前只支持 mock 和 DeepSeek OpenAI 兼容模式，Anthropic 未实现。
+OpenAI 兼容模式使用有界 SSE 流式文本；工具片段完整校验后仍走现有逐次审批循环。
 """
 
 
@@ -214,6 +276,7 @@ def run_console(
     *,
     input_fn: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
+    stream_write: Callable[[str], None] | None = None,
 ) -> int:
     try:
         workspace = Workspace(args.workspace)
@@ -247,6 +310,9 @@ def run_console(
     output(f"chenxiVFX Harness v0.5.0 | 提供商：{_safe_terminal_text(str(provider.label))}")
     output(f"工作区：{_safe_terminal_text(str(workspace.root))}")
     output("输入 /帮助 查看命令。默认使用离线模拟模型。")
+    sse_streaming = callable(getattr(provider, "complete_streaming", None))
+    if sse_streaming:
+        output("已启用有界 SSE 流式文本；工具调用完整校验后按原审批循环执行。")
 
     while True:
         try:
@@ -597,18 +663,55 @@ def run_console(
         except KeyboardInterrupt:
             output("已取消文件引用审批；没有读取或发送文件内容。")
             continue
+        stream_redactor = _StreamingSecretRedactor()
+        stream_state = {"received": False, "visible": False}
+
+        def on_text_delta(fragment: str) -> None:
+            stream_state["received"] = True
+            safe_text = _safe_terminal_text(stream_redactor.feed(fragment))
+            if safe_text:
+                _write_stream_text(safe_text, stream_write)
+                stream_state["visible"] = True
+
+        def end_stream_line() -> None:
+            if sse_streaming and stream_state["visible"]:
+                _write_stream_text("\n", stream_write)
+
         try:
-            answer = agent.ask(prompt, references=references, plan_only=mode == "计划")
+            answer = agent.ask(
+                prompt,
+                references=references,
+                plan_only=mode == "计划",
+                on_text_delta=on_text_delta if sse_streaming else None,
+            )
         except KeyboardInterrupt:
+            end_stream_line()
             output("\n已取消当前模型请求；不完整轮次不会写入会话存档。前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。")
             continue
+        except ProviderStreamError as exc:
+            end_stream_line()
+            output(
+                f"模型流失败：{exc}。未完成轮次不会写入会话；未完成的工具调用不会执行。"
+                "前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。"
+            )
+            continue
         except ProviderError as exc:
+            end_stream_line()
             output(f"模型请求失败：{exc}。前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。")
             continue
         except ProviderCancelled:
+            end_stream_line()
             output("已取消当前模型请求；不完整轮次不会写入会话存档。前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。")
             continue
-        output(_safe_terminal_text(answer))
+        if sse_streaming and stream_state["received"]:
+            tail = _safe_terminal_text(stream_redactor.finish())
+            if tail:
+                _write_stream_text(tail, stream_write)
+                stream_state["visible"] = True
+            end_stream_line()
+        else:
+            safe_answer = redact_likely_secrets(answer)[0]
+            output(_safe_terminal_text(safe_answer))
 
 
 def main(argv: list[str] | None = None) -> int:

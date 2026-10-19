@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
 import threading
+import time
 import unicodedata
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.parse import urlsplit
 
 from .usage import ProviderUsage, estimate_tokens
@@ -17,6 +19,13 @@ from .usage import ProviderUsage, estimate_tokens
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 MAX_PROVIDER_TOOL_CALLS = 16
 MAX_PROVIDER_TOOL_ARGUMENT_BYTES = 128 * 1024
+MAX_STREAM_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_STREAM_LINE_BYTES = 512 * 1024
+MAX_STREAM_EVENT_BYTES = 512 * 1024
+MAX_STREAM_EVENTS = 16384
+MAX_STREAM_ASSISTANT_BYTES = 2 * 1024 * 1024
+MAX_STREAM_DURATION_SECONDS = 120.0
+STREAM_READ_POLL_SECONDS = 0.25
 _URL_CREDENTIAL_MARKER = re.compile(
     r"(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|authorization)(?:=|%3d)"
 )
@@ -28,6 +37,109 @@ class ProviderError(RuntimeError):
 
 class ProviderCancelled(RuntimeError):
     """Raised when a caller cancels a provider operation at a safe boundary."""
+
+
+class ProviderStreamError(ProviderError):
+    """A bounded SSE transport or protocol error safe to show in the CLI."""
+
+
+class _SSEParser:
+    """Incremental UTF-8/SSE parser with limits on lines, events, and total bytes."""
+
+    def __init__(self, on_event: Callable[[str, str], bool]) -> None:
+        self._on_event = on_event
+        self._buffer = bytearray()
+        self._event_name = ""
+        self._data: list[str] = []
+        self._event_bytes = 0
+        self.total_bytes = 0
+        self.events = 0
+        self.done = False
+
+    def feed(self, chunk: bytes) -> bool:
+        if self.done:
+            if chunk:
+                raise ProviderStreamError("SSE 结束标记后收到额外数据。")
+            return True
+        self.total_bytes += len(chunk)
+        if self.total_bytes > MAX_STREAM_RESPONSE_BYTES:
+            raise ProviderStreamError("SSE 响应超过 4 MiB 上限。")
+        self._buffer.extend(chunk)
+        return self._drain(final=False)
+
+    def finish(self) -> bool:
+        if self.done:
+            return True
+        try:
+            bytes(self._buffer).decode("utf-8")
+        except UnicodeDecodeError:
+            raise ProviderStreamError("SSE 响应在 UTF-8 字符中途结束。") from None
+        self._drain(final=True)
+        if self._buffer or self._data or self._event_name:
+            raise ProviderStreamError("SSE 响应包含未完成事件。")
+        return False
+
+    def _drain(self, *, final: bool) -> bool:
+        buffer = self._buffer
+        cursor = 0
+        while cursor < len(buffer):
+            lf = buffer.find(b"\n", cursor)
+            cr = buffer.find(b"\r", cursor)
+            delimiters = [index for index in (lf, cr) if index >= 0]
+            if not delimiters:
+                if len(buffer) - cursor > MAX_STREAM_LINE_BYTES:
+                    raise ProviderStreamError("SSE 单行超过大小上限。")
+                break
+            index = min(delimiters)
+            char = buffer[index]
+            if char == 13 and index + 1 == len(buffer) and not final:
+                if index - cursor > MAX_STREAM_LINE_BYTES:
+                    raise ProviderStreamError("SSE 单行超过大小上限。")
+                break
+            width = 2 if char == 13 and buffer[index : index + 2] == b"\r\n" else 1
+            line_bytes = bytes(buffer[cursor:index])
+            cursor = index + width
+            if len(line_bytes) > MAX_STREAM_LINE_BYTES:
+                raise ProviderStreamError("SSE 单行超过大小上限。")
+            self._event_bytes += len(line_bytes) + width
+            if self._event_bytes > MAX_STREAM_EVENT_BYTES:
+                raise ProviderStreamError("SSE 事件超过大小上限。")
+            try:
+                line = line_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                raise ProviderStreamError("SSE 响应不是有效的 UTF-8 文本。") from None
+            if not line:
+                if self._data:
+                    self.events += 1
+                    if self.events > MAX_STREAM_EVENTS:
+                        raise ProviderStreamError("SSE 事件数量超过上限。")
+                    name = self._event_name or "message"
+                    payload = "\n".join(self._data)
+                    self._event_name = ""
+                    self._data = []
+                    self._event_bytes = 0
+                    self.done = self._on_event(name, payload)
+                    if self.done:
+                        if cursor < len(buffer):
+                            raise ProviderStreamError("SSE 结束标记后收到额外数据。")
+                        del buffer[:cursor]
+                        return True
+                else:
+                    self._event_name = ""
+                    self._event_bytes = 0
+                continue
+            if line.startswith(":"):
+                continue
+            field_name, separator, value = line.partition(":")
+            if separator and value.startswith(" "):
+                value = value[1:]
+            if field_name == "data":
+                self._data.append(value)
+            elif field_name == "event":
+                self._event_name = value
+        if cursor:
+            del buffer[:cursor]
+        return False
 
 
 def validate_base_url(base_url: str) -> str:
@@ -188,14 +300,24 @@ class OpenAICompatibleProvider:
         model: str,
         *,
         timeout: float = 45.0,
+        stream_timeout: float = MAX_STREAM_DURATION_SECONDS,
     ) -> None:
-        if not api_key:
-            raise ProviderError("未提供 API 密钥。")
+        if (
+            isinstance(stream_timeout, bool)
+            or not isinstance(stream_timeout, (int, float))
+            or not 0 < stream_timeout <= MAX_STREAM_DURATION_SECONDS
+        ):
+            raise ProviderError("SSE 总时限必须在 0 到 120 秒之间。")
         base_url = validate_base_url(base_url)
+        parsed_base = urlsplit(base_url)
+        is_loopback = (parsed_base.hostname or "").casefold() in {"localhost", "127.0.0.1", "::1"}
+        if not api_key and not is_loopback:
+            raise ProviderError("未提供 API 密钥。")
         self.endpoint = self._chat_endpoint(base_url)
         self._api_key = api_key
         self.model = model
         self.timeout = timeout
+        self.stream_timeout = float(stream_timeout)
 
     @staticmethod
     def _chat_endpoint(base_url: str) -> str:
@@ -227,14 +349,16 @@ class OpenAICompatibleProvider:
             body["tools"] = tools
             body["tool_choice"] = "auto"
 
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+        }
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
         request = urllib.request.Request(
             self.endpoint,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json; charset=utf-8",
-                "Accept": "application/json",
-            },
+            headers=headers,
             method="POST",
         )
         try:
@@ -254,8 +378,293 @@ class OpenAICompatibleProvider:
             raise ProviderError("模型响应超过 4 MiB 上限。")
         try:
             payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            raise ProviderError("模型响应格式无效。") from None
+        return self._turn_from_payload(payload)
+
+    def complete_streaming(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        cancellation_event: threading.Event | None = None,
+        max_tokens: int = 2048,
+        on_text_delta: Callable[[str], None],
+    ) -> AssistantTurn:
+        """Receive bounded SSE deltas; never return partial tool calls to Agent."""
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise ProviderCancelled("provider stream cancelled before send")
+        if type(max_tokens) is not int or not 1 <= max_tokens <= 65536:
+            raise ProviderError("max_tokens must be between 1 and 65536")
+        if not callable(on_text_delta):
+            raise ProviderStreamError("SSE 文本回调无效。")
+
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "reasoning_effort": "high",
+            "thinking": {"type": "enabled"},
+            "stream": True,
+        }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "text/event-stream",
+        }
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        request = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_parts: dict[int, dict[str, list[str]]] = {}
+        tool_sizes: dict[int, dict[str, int]] = {}
+        usage_value: Any = None
+        finish_reason: str | None = None
+        assistant_bytes = 0
+
+        def append_text(target: list[str], value: Any, *, display: bool) -> None:
+            nonlocal assistant_bytes
+            if value is None:
+                return
+            if not isinstance(value, str):
+                raise ProviderStreamError("SSE 文本片段格式无效。")
+            try:
+                size = len(value.encode("utf-8"))
+            except UnicodeEncodeError:
+                raise ProviderStreamError("SSE 文本片段格式无效。") from None
+            assistant_bytes += size
+            if assistant_bytes > MAX_STREAM_ASSISTANT_BYTES:
+                raise ProviderStreamError("SSE 助手内容超过 2 MiB 上限。")
+            target.append(value)
+            if display and value:
+                try:
+                    on_text_delta(value)
+                except Exception:
+                    raise ProviderStreamError("无法显示 SSE 流式文本。") from None
+
+        def collect_event(event_name: str, data: str) -> bool:
+            nonlocal usage_value, finish_reason
+            if event_name == "error":
+                raise ProviderStreamError("模型服务返回 SSE 错误事件。")
+            if data == "[DONE]":
+                if finish_reason is None:
+                    raise ProviderStreamError("SSE 流在结束前缺少完成状态。")
+                if tool_parts and finish_reason != "tool_calls":
+                    raise ProviderStreamError("SSE 工具调用与完成状态不一致。")
+                if finish_reason == "tool_calls" and not tool_parts:
+                    raise ProviderStreamError("SSE 完成状态要求工具调用，但未收到调用内容。")
+                return True
+            try:
+                chunk = json.loads(data)
+            except (json.JSONDecodeError, RecursionError):
+                raise ProviderStreamError("SSE 事件 JSON 格式无效。") from None
+            if not isinstance(chunk, dict) or "error" in chunk:
+                raise ProviderStreamError("模型服务返回格式无效的 SSE 事件。")
+            if "usage" in chunk:
+                usage_value = chunk["usage"]
+            choices = chunk.get("choices")
+            if choices is None:
+                if "usage" in chunk:
+                    return False
+                raise ProviderStreamError("SSE 事件缺少 choices。")
+            if not isinstance(choices, list) or len(choices) > 1:
+                raise ProviderStreamError("SSE 仅支持单个模型候选项。")
+            if not choices:
+                if "usage" in chunk:
+                    return False
+                raise ProviderStreamError("SSE choices 为空。")
+            choice = choices[0]
+            if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+                raise ProviderStreamError("SSE 候选项格式无效。")
+            if choice.get("logprobs") is not None:
+                raise ProviderStreamError("SSE logprobs 模式尚未支持。")
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                raise ProviderStreamError("SSE delta 格式无效。")
+            if set(delta) - {"role", "content", "reasoning_content", "tool_calls"}:
+                raise ProviderStreamError("SSE 含有尚未支持的响应类型。")
+            if delta.get("role") not in (None, "assistant"):
+                raise ProviderStreamError("SSE 消息角色无效。")
+            append_text(content_parts, delta.get("content"), display=True)
+            append_text(reasoning_parts, delta.get("reasoning_content"), display=False)
+            tool_deltas = delta.get("tool_calls")
+            if tool_deltas is not None:
+                if not isinstance(tool_deltas, list) or len(tool_deltas) > MAX_PROVIDER_TOOL_CALLS:
+                    raise ProviderStreamError("SSE 工具调用片段格式无效。")
+                for tool_delta in tool_deltas:
+                    if not isinstance(tool_delta, dict):
+                        raise ProviderStreamError("SSE 工具调用片段格式无效。")
+                    if set(tool_delta) - {"index", "type", "id", "function"}:
+                        raise ProviderStreamError("SSE 工具调用包含尚未支持的字段。")
+                    index = tool_delta.get("index")
+                    if type(index) is not int or not 0 <= index < MAX_PROVIDER_TOOL_CALLS:
+                        raise ProviderStreamError("SSE 工具调用索引无效。")
+                    if tool_delta.get("type") not in (None, "function"):
+                        raise ProviderStreamError("SSE 仅支持函数工具调用。")
+                    slot = tool_parts.setdefault(index, {"id": [], "name": [], "arguments": []})
+                    sizes = tool_sizes.setdefault(index, {"id": 0, "name": 0, "arguments": 0})
+                    call_id_fragment = tool_delta.get("id")
+                    if call_id_fragment is not None:
+                        if not isinstance(call_id_fragment, str):
+                            raise ProviderStreamError("SSE 工具调用片段格式无效。")
+                        try:
+                            sizes["id"] += len(call_id_fragment.encode("utf-8"))
+                        except UnicodeEncodeError:
+                            raise ProviderStreamError("SSE 工具调用片段格式无效。") from None
+                        slot["id"].append(call_id_fragment)
+                    function = tool_delta.get("function")
+                    if function is not None:
+                        if not isinstance(function, dict) or set(function) - {"name", "arguments"}:
+                            raise ProviderStreamError("SSE 函数工具片段格式无效。")
+                        for field_name in ("name", "arguments"):
+                            fragment = function.get(field_name)
+                            if fragment is not None:
+                                if not isinstance(fragment, str):
+                                    raise ProviderStreamError("SSE 函数工具片段格式无效。")
+                                try:
+                                    sizes[field_name] += len(fragment.encode("utf-8"))
+                                except UnicodeEncodeError:
+                                    raise ProviderStreamError("SSE 函数工具片段格式无效。") from None
+                                slot[field_name].append(fragment)
+                    if (
+                        sizes["id"] > 128
+                        or sizes["name"] > 128
+                        or sizes["arguments"] > MAX_PROVIDER_TOOL_ARGUMENT_BYTES
+                    ):
+                        raise ProviderStreamError("SSE 工具调用超过本地大小上限。")
+            current_finish_reason = choice.get("finish_reason")
+            if current_finish_reason is not None:
+                if not isinstance(current_finish_reason, str) or current_finish_reason not in {
+                    "stop", "length", "tool_calls", "content_filter"
+                }:
+                    raise ProviderStreamError("SSE 完成状态尚未支持。")
+                if finish_reason is not None and finish_reason != current_finish_reason:
+                    raise ProviderStreamError("SSE 完成状态不一致。")
+                finish_reason = current_finish_reason
+            return False
+
+        parser = _SSEParser(collect_event)
+        deadline = time.monotonic() + self.stream_timeout
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=min(self.timeout, self.stream_timeout),
+            ) as response:
+                headers = getattr(response, "headers", None)
+                content_type = ""
+                if headers is not None:
+                    getter = getattr(headers, "get_content_type", None)
+                    content_type = getter() if callable(getter) else str(headers.get("Content-Type", ""))
+                if content_type.partition(";")[0].strip().casefold() != "text/event-stream":
+                    raise ProviderStreamError("模型服务没有返回 text/event-stream。")
+                content_length = headers.get("Content-Length") if headers is not None else None
+                if content_length is not None:
+                    try:
+                        if int(content_length) > MAX_STREAM_RESPONSE_BYTES:
+                            raise ProviderStreamError("SSE 响应超过 4 MiB 上限。")
+                    except ValueError:
+                        raise ProviderStreamError("SSE Content-Length 格式无效。") from None
+                raw_socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+                if raw_socket is None:
+                    raise ProviderStreamError("无法建立有界 SSE 网络读取。")
+                while True:
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        raise ProviderCancelled("provider stream cancelled")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ProviderStreamError("SSE 流超过总时限。")
+                    if raw_socket is not None:
+                        try:
+                            raw_socket.settimeout(min(STREAM_READ_POLL_SECONDS, remaining))
+                        except OSError:
+                            try:
+                                socket_closed = raw_socket.fileno() < 0
+                            except OSError:
+                                socket_closed = True
+                            if not socket_closed:
+                                raise ProviderStreamError("SSE 网络读取失败。") from None
+                            # A peer may close after sending Content-Length bytes; buffered
+                            # response data can still be consumed and EOF is bounded.
+                            raw_socket = None
+                    try:
+                        chunk = response.read1(8192)
+                    except http.client.IncompleteRead:
+                        raise ProviderStreamError("SSE 响应在完成标记前结束。") from None
+                    except TimeoutError:
+                        if cancellation_event is not None and cancellation_event.is_set():
+                            raise ProviderCancelled("provider stream cancelled") from None
+                        if time.monotonic() >= deadline:
+                            raise ProviderStreamError("SSE 流超过总时限。") from None
+                        continue
+                    except (OSError, urllib.error.URLError):
+                        raise ProviderStreamError("SSE 网络读取失败。") from None
+                    except Exception:
+                        raise ProviderStreamError("SSE 网络读取失败。") from None
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        raise ProviderCancelled("provider stream cancelled")
+                    if time.monotonic() >= deadline:
+                        raise ProviderStreamError("SSE 流超过总时限。")
+                    if not chunk:
+                        parser.finish()
+                        raise ProviderStreamError("SSE 响应在完成标记前结束。")
+                    stream_done = parser.feed(chunk)
+                    if time.monotonic() >= deadline:
+                        raise ProviderStreamError("SSE 流超过总时限。")
+                    if stream_done:
+                        break
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            exc.close()
+            raise ProviderStreamError(f"模型服务返回 HTTP {status}。") from None
+        except ProviderStreamError:
+            raise
+        except ProviderCancelled:
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError):
+            raise ProviderStreamError("SSE 连接失败或超时；请检查网络和 Base URL。") from None
+        except Exception:
+            raise ProviderStreamError("SSE 连接或响应处理失败。") from None
+
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise ProviderCancelled("provider stream cancelled")
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(content_parts) or None,
+        }
+        if reasoning_parts:
+            message["reasoning_content"] = "".join(reasoning_parts)
+        if tool_parts:
+            message["tool_calls"] = [
+                {
+                    "id": "".join(tool_parts[index]["id"]),
+                    "type": "function",
+                    "function": {
+                        "name": "".join(tool_parts[index]["name"]),
+                        "arguments": "".join(tool_parts[index]["arguments"]),
+                    },
+                }
+                for index in sorted(tool_parts)
+            ]
+        return self._turn_from_payload(
+            {
+                "choices": [{"message": message}],
+                "usage": usage_value,
+            }
+        )
+
+    def _turn_from_payload(self, payload: Any) -> AssistantTurn:
+        try:
             message = payload["choices"][0]["message"]
-        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, RecursionError):
+        except (KeyError, IndexError, TypeError, RecursionError):
             raise ProviderError("模型响应格式无效。") from None
         if not isinstance(message, dict):
             raise ProviderError("模型响应格式无效。")

@@ -7,7 +7,8 @@
 | Windows 中文 CLI、帮助与 UTF-8 | 已实现 / 离线可测 | PowerShell 启动脚本、中文命令、UTF-8 I/O；Windows Python 3.13 本机运行 |
 | 工作区模型配置与启动优先级 | 已实现 / 离线可测 | `.harness/config/settings.json` 仅存非敏感设置；默认 < 工作区配置 < 环境变量 < CLI；DeepSeek 凭据仍只从环境读取 |
 | Mock provider | 已实现 / 离线可测 | 默认离线，不发请求、不读密钥 |
-| OpenAI 兼容 Chat Completions | 已实现 / 离线可测 | stdlib HTTP、`reasoning_content` 工具往返、usage、`max_tokens` 上限、429 不重试、脱敏错误和边界取消；无工具基础 smoke 与合成只读目录工具闭环已有限在线验证；其他产品路径仍未验收 |
+| OpenAI 兼容 Chat Completions | 已实现 / 离线可测 | stdlib HTTP、`reasoning_content` 工具往返、usage、`max_tokens` 上限、429 不重试、脱敏错误；CLI 默认 SSE 流式输出，具备大小/时限/事件边界和取消检查 |
+| 有界 SSE 中文流式交互 | 已实现 / 离线可测 | UTF-8 跨块、CRLF/LF 与多行 data；最多 4 MiB 响应、2 MiB 助手文本、512 KiB 行/事件、16,384 个事件、120 秒；工具调用累积并完整校验后沿用 Agent 审批循环；未完成流不执行工具 |
 | DeepSeek API key 读取 | 已实现 / 离线可测 | OpenAI 模式读取 `DEEPSEEK_API_KEY`，只允许 HTTPS `api.deepseek.com:443`；Mock 不查询该值，配置页不显示。Network secret 的基本对话与合成目录只读工具闭环均已有限在线验证；其他工具与完整产品流程仍未验收 |
 | 受限真实 DeepSeek smoke | 已完成（有限验收） | 独立新环境通过 `api.deepseek.com:443` 的网络 secret 代理，以 `deepseek-flash` 发起一次、128-token 上限、无工具的合成请求；HTTP 200，答复“连接成功”，usage 输入 36 / 输出 43 / 总计 79。只证明认证与基本对话通路，不证明多轮工具闭环 |
 | 受限真实目录工具闭环 | 已完成（有限验收） | 两次 `api.deepseek.com:443` / `deepseek-flash` 请求，单次 `max_tokens=256`、合计上限 512；仅批准合成 `synthetic/hello.txt` 的只读列表，HTTP 200×2，usage 输入 1022 / 输出 82 / 总计 1104；不代表完整产品通过 |
@@ -93,6 +94,18 @@
 - 配置测试仅使用临时工作区、合成数据和 patched provider；不读取或写入密钥、不发真实请求。
 - 测试统计审计：`c6dab6e`、`3f2f670`、`cacfb7c` 均有 65 个测试方法，比较中没有删除或合并；旧版三个链接用例受 opt-in gate 跳过，因此“65 通过、3 跳过”措辞错误，按代码口径应是 65 总、62 通过、3 跳过。当前添加 14 个配置测试后共 79 项。
 - Debian 13 / Python 3.12 当前本地结果：79 总、78 通过、1 跳过（Windows-only junction）；symlink 与 hardlink 集成测试均执行通过。远端 Windows/Linux 矩阵将在推送后记录；未调用真实 API。
+
+## SSE 流式交互（2026-10-19）
+
+- OpenAI 兼容 CLI 改为有界 SSE 流式输出；增量 UTF-8 解码处理跨块中文，解析 LF/CRLF、跨块行结束符和多行 `data`，要求完整 `[DONE]` 及 finish reason。
+- 上限：4 MiB 流响应、2 MiB 助手文本与推理、512 KiB 单行/事件、16,384 个事件、120 秒总时限；响应体读取期间最多每 250 ms 检查取消。建连和响应头等待使用 provider timeout。
+- 文本先做终端控制字符可见转义及疑似凭据脱敏。错误只显示固定安全说明/HTTP 状态，不显示响应体、请求头、URL 或原始异常。
+- 支持文本、内部保留但不显示的 `reasoning_content`、单候选项与函数工具调用。工具增量完整组装和 JSON 校验后才返回 Agent；截断/畸形流会清除当前未完成轮次，不执行未完成工具。
+- 明确拒绝 Mock/自定义 provider 的 SSE 请求、多个候选项、多模态/logprobs/未知增量字段和缺少完成标记的流。流式文本可能先于完成标记显示；错误后不自动撤回已显示片段。完整产品验收仍不在单元测试范围内。
+- 新增 loopback HTTP fixture 与纯解析器用例，涵盖跨字节中文、工具往返、截断不审批、错误脱敏、大小/时间上限和取消；fixture 不含 Authorization 头。未访问真实模型或读取配置凭据。
+- Debian / Python 3.12：`python -m unittest discover -s tests -v` 共 90 项，89 通过、1 项 Windows-only junction 跳过；`compileall`、editable install、安装自检及 `git diff --check` 通过。
+- 当前工作树未调用真实模型 API、未读取环境凭据；SSE HTTP 用例只访问本机 loopback，且不发送 Authorization 头。四矩阵 GitHub Actions 链接待推送后补录。
+- 真实 API 用量账本（父任务累计）：历史已用 1,222 tokens（79 + 1,104 + 39）；本轮预分配上限 20,000，实际请求 0 次、失败 0 次、用量 0；累计仍为 1,222 / 2,000,000，余 1,998,778。未读取凭据或 Network secret。
 
 ## 参考项目复用边界
 

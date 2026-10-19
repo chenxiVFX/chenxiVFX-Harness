@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,7 +18,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cvfx_harness.agent import Agent, SYSTEM_PROMPT
-from cvfx_harness.cli import parse_references, run_console
+from cvfx_harness.cli import _StreamingSecretRedactor, _safe_terminal_text, parse_references, run_console
 from cvfx_harness.providers import (
     AssistantTurn,
     DEEPSEEK_API_KEY_ENV,
@@ -25,7 +26,9 @@ from cvfx_harness.providers import (
     OpenAICompatibleProvider,
     ProviderCancelled,
     ProviderError,
+    ProviderStreamError,
     ToolCall,
+    _SSEParser,
     provider_from_environment,
 )
 from cvfx_harness.tools import ActionRequest, Workspace, WorkspaceError, run_tool
@@ -35,6 +38,32 @@ def make_test_temp(prefix: str = "case-") -> tempfile.TemporaryDirectory:
     local_temp = Path(__file__).resolve().parents[1] / ".test-tmp"
     local_temp.mkdir(exist_ok=True)
     return tempfile.TemporaryDirectory(dir=local_temp, prefix=prefix)
+
+
+def local_http_fixture(handler_function):
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            size = int(self.headers.get("Content-Length", "0"))
+            request_body = self.rfile.read(size)
+            handler_function(self, request_body)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    return server, worker
+
+
+def fixture_sse_frames(events: list[dict[str, object]], *, done: bool = True) -> bytes:
+    frames = b"".join(
+        f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\r\n\r\n".encode("utf-8")
+        for event in events
+    )
+    if done:
+        frames += b"data: [DONE]\r\n\r\n"
+    return frames
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -561,6 +590,17 @@ class AgentTests(unittest.TestCase):
         self.assertIn("[模拟模式]", turn.content)
         self.assertIn("你好", turn.content)
 
+    def test_provider_without_sse_support_is_rejected_explicitly(self) -> None:
+        with make_test_temp(prefix="sse-unsupported-") as temp:
+            agent = Agent(
+                MockProvider(),
+                Workspace(temp),
+                approve_action=lambda _request: self.fail("offline mock has no tools"),
+            )
+            with self.assertRaisesRegex(ProviderError, "不支持 SSE"):
+                agent.ask("你好", on_text_delta=lambda _fragment: None)
+            self.assertEqual(agent.turns, [])
+
     def test_tool_cycle_passes_result_and_requires_write_approval(self) -> None:
         with make_test_temp() as temp:
             workspace = Workspace(temp)
@@ -834,6 +874,50 @@ class AgentTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_cli_displays_streamed_chinese_safely(self) -> None:
+        output_text: list[str] = []
+        stream_text: list[str] = []
+        synthetic_secret = "SYNTHETIC_STREAM_SECRET_1234567890"
+        answer = f"中文开头 Bearer {synthetic_secret} 结束\x1b[31m"
+
+        class StreamingProvider:
+            label = "fixture-stream"
+            model = "fixture-model"
+
+            def complete_streaming(
+                self,
+                _messages,
+                _tools,
+                *,
+                cancellation_event=None,
+                max_tokens=2048,
+                on_text_delta,
+            ):
+                del cancellation_event, max_tokens
+                on_text_delta("中文开头 Bearer ")
+                on_text_delta("SYNTHETIC_STREAM_SECRET_")
+                on_text_delta("1234567890 结束\x1b[31m")
+                return AssistantTurn(answer, assistant_message={"role": "assistant", "content": answer})
+
+        with make_test_temp(prefix="cli-sse-") as temp:
+            args = SimpleNamespace(workspace=temp, provider="openai", model=None)
+            inputs = iter(["你好", "/退出"])
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=StreamingProvider()):
+                rc = run_console(
+                    args,
+                    input_fn=lambda _prompt: next(inputs),
+                    output=output_text.append,
+                    stream_write=stream_text.append,
+                )
+
+        combined = "".join(stream_text) + "\n".join(output_text)
+        self.assertEqual(rc, 0)
+        self.assertIn("中文开头", combined)
+        self.assertIn("[已脱敏]", combined)
+        self.assertNotIn(synthetic_secret, combined)
+        self.assertNotIn("\x1b", combined)
+        self.assertIn("\\x1b", combined)
+
     def test_cli_previews_write_and_undo_before_each_confirmation(self) -> None:
         with make_test_temp() as temp:
             workspace = Workspace(temp)
@@ -870,6 +954,328 @@ class CliTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_sse_parser_handles_utf8_and_crlf_boundaries_across_byte_chunks(self) -> None:
+        events: list[tuple[str, str]] = []
+        parser = _SSEParser(lambda name, data: events.append((name, data)) or data == "[DONE]")
+        wire = 'event: message\r\ndata: {"text":"你好，世界"}\r\n\r\ndata: [DONE]\r\n\r\n'.encode("utf-8")
+        for byte in wire:
+            if parser.feed(bytes([byte])):
+                break
+        self.assertTrue(parser.done)
+        self.assertEqual(events, [("message", '{"text":"你好，世界"}'), ("message", "[DONE]")])
+
+    def test_sse_parser_rejects_incomplete_event_and_oversized_line(self) -> None:
+        parser = _SSEParser(lambda _name, _data: False)
+        parser.feed(b"data: incomplete")
+        with self.assertRaisesRegex(ProviderStreamError, "未完成事件"):
+            parser.finish()
+
+        parser = _SSEParser(lambda _name, _data: False)
+        with patch("cvfx_harness.providers.MAX_STREAM_LINE_BYTES", 8):
+            with self.assertRaisesRegex(ProviderStreamError, "单行超过"):
+                parser.feed(b"data: way too long")
+
+    def test_sse_local_http_fixture_streams_unicode_and_omits_auth_without_a_key(self) -> None:
+        captured: dict[str, object] = {}
+        body = fixture_sse_frames([
+            {"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {"reasoning_content": "私有推理"}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {"content": "你"}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {"content": "好"}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}},
+        ])
+
+        def serve(handler, request_body: bytes) -> None:
+            captured["authorization"] = handler.headers.get("Authorization")
+            captured["accept"] = handler.headers.get("Accept")
+            captured["request"] = json.loads(request_body.decode("utf-8"))
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            for offset in range(0, len(body), 7):
+                handler.wfile.write(body[offset : offset + 7])
+                handler.wfile.flush()
+                time.sleep(0.001)
+
+        server, worker = local_http_fixture(serve)
+        pieces: list[str] = []
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "fixture-model", stream_timeout=2.0
+            )
+            turn = provider.complete_streaming(
+                [{"role": "user", "content": "合成中文请求"}], [], on_text_delta=pieces.append
+            )
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+        self.assertEqual(pieces, ["你", "好"])
+        self.assertEqual(turn.content, "你好")
+        self.assertEqual(turn.usage.total_tokens, 9)
+        self.assertNotIn("reasoning", "".join(pieces))
+        self.assertIsNone(captured["authorization"])
+        self.assertEqual(captured["accept"], "text/event-stream")
+        self.assertTrue(captured["request"]["stream"])
+
+    def test_sse_streamed_tool_calls_roundtrip_through_existing_approval_loop(self) -> None:
+        request_bodies: list[dict[str, object]] = []
+        responses = [
+            fixture_sse_frames([
+                {"choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0, "id": "call-local-1", "type": "function",
+                    "function": {"name": "list_directory", "arguments": "{\"path\":"},
+                }]}, "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0, "function": {"arguments": "\".\"}"},
+                }]}, "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+            ]),
+            fixture_sse_frames([
+                {"choices": [{"index": 0, "delta": {"content": "目录读取完成"}, "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            ]),
+        ]
+
+        def serve(handler, request_body: bytes) -> None:
+            request_bodies.append(json.loads(request_body.decode("utf-8")))
+            response = responses.pop(0)
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            handler.send_header("Content-Length", str(len(response)))
+            handler.end_headers()
+            handler.wfile.write(response)
+
+        server, worker = local_http_fixture(serve)
+        approvals: list[ActionRequest] = []
+        streamed: list[str] = []
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "fixture-model", stream_timeout=2.0
+            )
+            with make_test_temp(prefix="sse-tool-loop-") as temp:
+                (Path(temp) / "synthetic.txt").write_text("only fixture data", encoding="utf-8")
+                agent = Agent(
+                    provider,
+                    Workspace(temp),
+                    approve_action=lambda request: approvals.append(request) or True,
+                )
+                answer = agent.ask("列出目录", on_text_delta=streamed.append)
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+        self.assertEqual(answer, "目录读取完成")
+        self.assertEqual(streamed, ["目录读取完成"])
+        self.assertEqual([request.operation for request in approvals], ["list"])
+        self.assertTrue(request_bodies[0]["stream"])
+        self.assertTrue(request_bodies[0]["tools"])
+        self.assertEqual(request_bodies[1]["messages"][-1]["role"], "tool")
+        self.assertIsNone(request_bodies[0].get("authorization"))
+
+    def test_incomplete_sse_tool_call_never_reaches_tool_approval(self) -> None:
+        partial = fixture_sse_frames([
+            {"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "call-incomplete", "type": "function",
+                "function": {"name": "list_directory", "arguments": "{\"path\":\".\"}"},
+            }]}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+        ], done=False)
+
+        def serve(handler, _request_body: bytes) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Length", str(len(partial)))
+            handler.end_headers()
+            handler.wfile.write(partial)
+
+        server, worker = local_http_fixture(serve)
+        approvals: list[ActionRequest] = []
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "fixture-model", stream_timeout=2.0
+            )
+            with make_test_temp(prefix="sse-incomplete-") as temp:
+                agent = Agent(
+                    provider,
+                    Workspace(temp),
+                    approve_action=lambda request: approvals.append(request) or True,
+                )
+                with self.assertRaisesRegex(ProviderStreamError, "完成标记前结束"):
+                    agent.ask("列出目录", on_text_delta=lambda _fragment: None)
+                self.assertEqual(agent.turns, [])
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+        self.assertEqual(approvals, [])
+
+    def test_sse_rejects_unsupported_delta_shapes_instead_of_ignoring_them(self) -> None:
+        unsupported = fixture_sse_frames([
+            {"choices": [{"index": 0, "delta": {"audio": {"data": "fixture"}}, "finish_reason": None}]},
+        ])
+
+        def serve(handler, _request_body: bytes) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Length", str(len(unsupported)))
+            handler.end_headers()
+            handler.wfile.write(unsupported)
+
+        server, worker = local_http_fixture(serve)
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "fixture-model", stream_timeout=1.0
+            )
+            with self.assertRaisesRegex(ProviderStreamError, "尚未支持"):
+                provider.complete_streaming(
+                    [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
+                )
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+    def test_sse_cancellation_and_deadline_are_bounded_on_loopback(self) -> None:
+        cancellation = threading.Event()
+        prefix = fixture_sse_frames([
+            {"choices": [{"index": 0, "delta": {"content": "部分文本"}, "finish_reason": None}]},
+        ], done=False)
+
+        def serve(handler, _request_body: bytes) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Length", str(len(prefix) + 100))
+            handler.end_headers()
+            handler.wfile.write(prefix)
+            handler.wfile.flush()
+            threading.Timer(0.05, cancellation.set).start()
+            time.sleep(0.3)
+
+        server, worker = local_http_fixture(serve)
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "fixture-model", stream_timeout=1.0
+            )
+            with self.assertRaises(ProviderCancelled):
+                provider.complete_streaming(
+                    [{"role": "user", "content": "fixture"}], [],
+                    cancellation_event=cancellation, on_text_delta=lambda _fragment: None,
+                )
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+        def delayed_body(handler, _request_body: bytes) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Length", str(len(prefix) + 100))
+            handler.end_headers()
+            time.sleep(0.25)
+
+        server, worker = local_http_fixture(delayed_body)
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "fixture-model", stream_timeout=0.1
+            )
+            with self.assertRaises(ProviderStreamError):
+                provider.complete_streaming(
+                    [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
+                )
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+    def test_sse_response_size_limit_and_server_error_are_redacted(self) -> None:
+        oversized = b"data: " + b"x" * 100 + b"\n\n"
+
+        def serve(handler, _request_body: bytes) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Length", str(len(oversized)))
+            handler.end_headers()
+            handler.wfile.write(oversized)
+
+        server, worker = local_http_fixture(serve)
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "fixture-model", stream_timeout=1.0
+            )
+            with patch("cvfx_harness.providers.MAX_STREAM_RESPONSE_BYTES", 64):
+                with self.assertRaisesRegex(ProviderStreamError, "4 MiB"):
+                    provider.complete_streaming(
+                        [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
+                    )
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+        private_event = b'event: error\ndata: {"message":"synthetic_private_event_details"}\n\n'
+
+        def fail_event(handler, _request_body: bytes) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Length", str(len(private_event)))
+            handler.end_headers()
+            handler.wfile.write(private_event)
+
+        server, worker = local_http_fixture(fail_event)
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "fixture-model", stream_timeout=1.0
+            )
+            with self.assertRaises(ProviderStreamError) as caught:
+                provider.complete_streaming(
+                    [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
+                )
+            self.assertNotIn("synthetic_private_event_details", str(caught.exception))
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+        private_body = b"synthetic_private_error_data"
+
+        def fail(handler, _request_body: bytes) -> None:
+            handler.send_response(503)
+            handler.send_header("Content-Length", str(len(private_body)))
+            handler.end_headers()
+            handler.wfile.write(private_body)
+
+        server, worker = local_http_fixture(fail)
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "fixture-model", stream_timeout=1.0
+            )
+            with self.assertRaisesRegex(ProviderStreamError, "HTTP 503") as caught:
+                provider.complete_streaming(
+                    [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
+                )
+            self.assertNotIn(private_body.decode(), str(caught.exception))
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+    def test_streamed_terminal_text_masks_chunked_credentials_and_controls(self) -> None:
+        redactor = _StreamingSecretRedactor()
+        pieces = [
+            redactor.feed("这是合成输出。 Bearer "),
+            redactor.feed("SYNTHETIC_PRIVATE_TOKEN_1234567890 后面还有正常文字，继续展示。"),
+            redactor.finish(),
+        ]
+        rendered = _safe_terminal_text("".join(pieces))
+        self.assertNotIn("SYNTHETIC_PRIVATE_TOKEN_1234567890", rendered)
+        self.assertIn("[已脱敏]", rendered)
+        self.assertNotIn("\x1b", _safe_terminal_text("中文\x1b[31m\r\n"))
+
     def test_openai_request_keeps_key_out_of_body(self) -> None:
         provider = OpenAICompatibleProvider(
             "https://api.deepseek.com", "TEST_KEY_ONLY", "deepseek-flash"

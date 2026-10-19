@@ -2,7 +2,7 @@
 
 ## 运行边界
 
-项目使用 Python 3.11+ 标准库，提供 Windows PowerShell 启动脚本。默认 Mock provider；Mock 不查询 DeepSeek 密钥变量。工作区非敏感设置位于 `.harness/config/settings.json`，按默认值、工作区配置、环境变量、CLI 参数的顺序覆盖。真实 HTTP 只会在用户显式选择 DeepSeek OpenAI 兼容 provider 并提供凭据时调用。没有 shell 执行工具、自动文件写权限或常驻后台服务。
+项目使用 Python 3.11+ 标准库，提供 Windows PowerShell 启动脚本。默认 Mock provider；Mock 不查询 DeepSeek 密钥变量。工作区非敏感设置位于 `.harness/config/settings.json`，按默认值、工作区配置、环境变量、CLI 参数的顺序覆盖。远端 HTTP 只会在用户显式选择 DeepSeek OpenAI 兼容 provider 并提供凭据时调用；本机 loopback HTTP 可用无凭据 fixture 验证协议。没有 shell 执行工具、自动文件写权限或常驻后台服务。
 
 ```text
 终端 UTF-8 输入
@@ -25,6 +25,12 @@ Agent 的 system message 在每个请求、恢复和压缩后保持固定文本�
 每次提问的输出预算默认为 2048 tokens，跨模型请求累计；默认最多 4 次请求。每次请求的 `max_tokens` 按剩余预算和剩余请求数分配，并从总预算中预留完整额度，使发送的单次上限之和不超过总预算。Provider usage 用于统计和检查单次上限；缺少 usage 时，字符估算只用于发现明显超限响应，不承担精确计量。超预算、取消、provider 错误或格式错误会清除当前未完成对话轮次，避免把断开的工具交换带到下一次请求。已经由用户批准并完成的文件操作不会因后续请求取消或失败自动回滚；CLI 会提示用户用 `/撤销` 检查写入。该估算不是 tokenizer，因此不能保证与远端计量完全一致。
 
 系统提示、工具输出、文件内容、历史摘要和模型回复之间的权限信任边界由本地执行代码维护。摘要只能是标注为 `untrusted-history-summary` 的 `user` 消息，不能合并进 system prompt。缓存友好前缀是结构设计目标，不承诺缓存命中率。
+
+## SSE 流式传输
+
+OpenAI 兼容 CLI 通过 `complete_streaming` 使用 `text/event-stream`。SSE 解析器增量解码严格 UTF-8，并识别 LF、CRLF、多行 `data` 和注释行；每条事件经完成空行分发，必须收到合法 finish reason 与 `[DONE]`。响应最多 4 MiB、助手文本/推理合计 2 MiB、单行或事件 512 KiB、16,384 个事件、最长 120 秒。响应体读取期间以不超过 250 ms 的 socket read timeout 检查取消；建连/响应头使用 provider timeout。
+
+普通内容片段可立即交给 CLI；reasoning 内容不显示。流式函数工具调用按索引累积，结束后复用已有完整消息/参数校验，之后 Agent 才执行原有逐次人工审批。未收到完整终止标记、格式错误或超限时，Provider 抛出安全的流错误，Agent 清除未完成轮次且不返回工具调用。流式文字可能已显示一部分，错误后不会撤回；终端输出先脱敏疑似凭据并转义控制字符。当前拒绝多候选项、多模态、logprobs、未知 delta 字段和不支持流式的 provider。
 
 ## 会话格式
 
@@ -52,11 +58,10 @@ Agent 的 system message 在每个请求、恢复和压缩后保持固定文本�
 - 普通 Python 进程不能提供 OS 级沙箱。若未来加入 shell，须先设计并实测工作区隔离，不能把路径检查误称为进程沙箱。
 - 子代理仅从 CLI 明确列出的任务创建；工具层逐项展示确切任务文本并要求审批。每个 child 新建独立的 system/user 消息列表，不继承父会话、文件引用、工具结果、目标或工具 schema。仅有 `MockProvider.complete_subagent` 被开放；每项一次调用、输入最多 512 估算 tokens、输出最多 256 估算 tokens、超时 5 秒、最多 3 项、深度 0。
 - 取消事件、预算和状态按 child 独立。失败、超时、取消、拒绝或预算耗尽不阻止其他已批准 child；结果只生成 JSON 编码的不可信汇总，不加入父 Agent 上下文，不调用文件/命令工具。
-- OpenAI 兼容请求支持请求前和响应后的取消检查；标准库 `urlopen` 阻塞期间只能依靠请求超时，不能承诺即时中断。429 不自动重试；记录 provider 返回的 Token 用量，不估算货币成本，也不把价格写入代码。
+- 非流式 OpenAI 请求在请求前和响应后检查取消；CLI 的 SSE 响应体采用短 socket 读取超时并轮询取消，建连/响应头等待仍由 provider timeout 约束。429 不自动重试；记录 provider 返回的 Token 用量，不估算货币成本，也不把价格写入代码。
 - OpenAI 兼容 CLI 只在该 provider 启动时读取 `DEEPSEEK_API_KEY`；环境密钥限定 HTTPS `api.deepseek.com:443`，不能通过 `HARNESS_BASE_URL` 转发到其他主机。`/配置` 不显示值，密钥只作为 Bearer 认证头，不加入对话、存档或 Harness 日志。Mock 不查询密钥变量。
 - Codex Cloud Network secret 可把 `DEEPSEEK_API_KEY` placeholder 交给程序，再由 HTTPS 代理向允许的 DeepSeek 目标替换真实值；官方文档没有确认本适配器 Bearer 头的端到端兼容性，本项目尚未使用真实密钥验证。普通环境变量会直接对 task 代码可见，云端应由用户自行选择 Network secret 并限定 Allowed domains。
 - 本地回环 HTTP fixture 验证请求/响应、密钥只在认证头、错误不披露请求认证值；这些结果不代表真实 DeepSeek API 或云端代理已验收。真实 API smoke 仍需要用户完成环境配置并单独确认测试范围。
-- OpenAI 兼容请求支持请求前和响应后的取消检查；标准库 `urlopen` 阻塞期间只能依靠请求超时，不能承诺即时中断。429 不自动重试；记录 provider 返回的 Token 用量，不估算货币成本，也不把价格写入代码。
 
 ## 语义假设
 

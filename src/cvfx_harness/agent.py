@@ -4,7 +4,7 @@ import hashlib
 import json
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .providers import AssistantTurn, Provider, ProviderCancelled, ProviderError, ToolCall
 from .sessions import contains_likely_secret
@@ -104,6 +104,7 @@ class Agent:
         references: list[tuple[str, str]] | None = None,
         plan_only: bool = False,
         cancellation_event: threading.Event | None = None,
+        on_text_delta: Callable[[str], None] | None = None,
     ) -> str:
         references = references or []
         content = self._user_content(user_text, self.goal, references)
@@ -130,12 +131,24 @@ class Agent:
                 )
                 estimated_input = estimate_payload_tokens(self.messages, TOOL_SCHEMAS)
                 self.usage.record_request(estimated_input)
-                response = self.provider.complete(
-                    self.messages,
-                    TOOL_SCHEMAS,
-                    cancellation_event=cancellation_event,
-                    max_tokens=request_max_tokens,
-                )
+                if on_text_delta is None:
+                    response = self.provider.complete(
+                        self.messages,
+                        TOOL_SCHEMAS,
+                        cancellation_event=cancellation_event,
+                        max_tokens=request_max_tokens,
+                    )
+                else:
+                    complete_streaming = getattr(self.provider, "complete_streaming", None)
+                    if not callable(complete_streaming):
+                        raise ProviderError("当前提供商不支持 SSE 流式响应。")
+                    response = complete_streaming(
+                        self.messages,
+                        TOOL_SCHEMAS,
+                        cancellation_event=cancellation_event,
+                        max_tokens=request_max_tokens,
+                        on_text_delta=on_text_delta,
+                    )
                 self._raise_if_cancelled(cancellation_event)
                 if not isinstance(response, AssistantTurn):
                     raise ProviderError("模型响应格式无效。")

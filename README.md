@@ -88,11 +88,17 @@ Token 数由本地字符启发式估算，不是提供商 tokenizer 的精确数
 
 ## DeepSeek OpenAI 兼容模式
 
-适配器默认端点为 `https://api.deepseek.com/chat/completions`，模型默认为 `deepseek-flash`；工作区配置、环境变量和 CLI 参数可设置非敏感字段。选择 OpenAI 模式后，程序只读取 `DEEPSEEK_API_KEY`；Mock 模式不会查询这个变量。环境密钥只允许发往 `https://api.deepseek.com:443`。`/配置` 会显示变量名，不显示值；认证头不会进入模型消息、会话或 Harness 日志。请勿把密钥放进 URL、命令行、项目文件、聊天或 Git。
+适配器默认端点为 `https://api.deepseek.com/chat/completions`，模型默认为 `deepseek-flash`；工作区配置、环境变量和 CLI 参数可设置非敏感字段。选择 OpenAI 模式后，程序只读取 `DEEPSEEK_API_KEY`；Mock 模式不会查询这个变量。环境密钥只允许发往 `https://api.deepseek.com:443`。`/配置` 会显示变量名，不显示值；认证头不会进入模型消息、会话或 Harness 日志。HTTP 仅对本机 loopback 开放且仅供本地合成 fixture 使用；无凭据 provider 只允许 loopback。请勿把密钥放进 URL、命令行、项目文件、聊天或 Git。
 
 本地 CLI 尚无隐藏输入界面；若直接使用普通环境变量，原值会进入 Harness 进程。若以后要在 Codex Cloud 使用 DeepSeek，用户可自行在该环境的 **Network secrets** 中添加变量 `DEEPSEEK_API_KEY`，Allowed domains 设为 `api.deepseek.com`。[Codex Cloud 官方说明](https://learn.chatgpt.com/docs/environments/cloud-environments)指出，Network secret 会以 placeholder 交给程序，并由代理在允许目标的 HTTPS 443 请求中替换原值，不把原始值放入本地进程或文件；普通 Environment variable 的值对 task 可见。保存环境改动后需要 Republish 并新建 task。网络密钥须使用自己的 Key，不能与同名直接环境变量冲突。
 
-离线回归使用合成数据和本机 HTTP fixture。另一次无工具 DeepSeek smoke 返回 HTTP 200 和“连接成功”（usage 输入 36、输出 43、总计 79）。本轮在全新临时目录完成了有限真实工具闭环：向 `api.deepseek.com:443` 的 `deepseek-flash` 发出 2 次请求，单次 `max_tokens` 为 256、合计上限 512；模型仅获 `list_directory` schema，并获准列出 `synthetic/hello.txt`，两次 HTTP 均为 200，usage 输入 1022、输出 82、合计 1104。只传了合成提示和列表结果，没有发送仓库或用户文件；这只验证了该受限路径，不代表完整产品或其他工具已通过。HTTP 429 不自动重试；适配器只统计 provider 返回的 Token usage，不核算费用。取消信号会在发送前和收到响应后检查；标准库阻塞中的 HTTP 请求只能由配置的超时结束，不能保证即时中断。
+离线回归使用合成数据和本机 HTTP fixture。另一次无工具 DeepSeek smoke 返回 HTTP 200 和“连接成功”（usage 输入 36、输出 43、总计 79）。本轮在全新临时目录完成了有限真实工具闭环：向 `api.deepseek.com:443` 的 `deepseek-flash` 发出 2 次请求，单次 `max_tokens` 为 256、合计上限 512；模型仅获 `list_directory` schema，并获准列出 `synthetic/hello.txt`，两次 HTTP 均为 200，usage 输入 1022、输出 82、合计 1104。只传了合成提示和列表结果，没有发送仓库或用户文件；这只验证了该受限路径，不代表完整产品或其他工具已通过。HTTP 429 不自动重试；适配器只统计 provider 返回的 Token usage，不核算费用。直接调用保留的非流式 JSON `complete()` 时，取消信号只在发送前和收到响应后检查；CLI SSE 流在响应体读取期间每 250 ms 检查一次，建连/响应头仍受 provider 超时限制。
+
+### 有界 SSE 流式交互
+
+OpenAI 兼容模式在 CLI 中使用 SSE 逐段显示中文文本；UTF-8 解码器和事件解析器可跨任意网络分块处理中文、LF/CRLF 行界与多行 `data`。请求必须返回 `text/event-stream`，并收到完成状态及 `[DONE]`；响应上限为 4 MiB、助手文本和推理合计上限为 2 MiB、单行/单事件上限为 512 KiB、最多 16,384 个事件、总时限最多 120 秒。取消事件在响应体读取期间每 250 ms 检查一次；建连和响应头等待受 provider 超时限制。HTTP 错误体、模型错误事件和原始异常内容不显示。
+
+工具调用片段会先在内存中累积并校验，收到完整结束标记后才交给既有 Agent 循环；工具仍逐次审批。截断、无效或超限流不会返回不完整工具调用，因此不能触发该轮工具。当前 SSE 只支持单个候选项、普通文本、`reasoning_content` 和函数工具调用；多模态、`logprobs`、未知增量字段等会明确报错。Mock 默认离线且不使用 SSE；请求流式输出的 provider 若没有 `complete_streaming` 会明确拒绝。流式文本可能在完整状态尚未到达前已显示；取消或传输失败后不完整轮次不会写入会话，已显示片段不会自动撤回。控制字符会以可见转义显示，疑似凭据片段在终端输出前脱敏。
 
 ## 权限与边界
 
