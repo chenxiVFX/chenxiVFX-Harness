@@ -386,7 +386,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("4755 → 0755", requests[0].diff)
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
 
-    def test_windows_dacl_copy_comparison_preserves_permissions_not_buffer_capacity(self) -> None:
+    def test_windows_dacl_copy_comparison_preserves_access_and_inheritance_semantics(self) -> None:
         # Synthetic S-1-0-0 SID, never an account or environment identifier.
         sid = bytes((1, 1)) + bytes(10)
 
@@ -417,6 +417,17 @@ class WorkspaceTests(unittest.TestCase):
             Workspace._windows_dacl_copy_token(snapshot((allow, deny), extra_capacity=64)),
             expected,
         )
+        for normalized_control in (0x1000, 0x1500):
+            self.assertEqual(
+                Workspace._windows_dacl_copy_token(snapshot((allow, deny), control=normalized_control)),
+                expected,
+            )
+        defaulted = bytearray(snapshot((allow, deny)))
+        defaulted[len(b"cvfx-windows-dacl-v1\0") + 3] = 1
+        self.assertEqual(Workspace._windows_dacl_copy_token(bytes(defaulted)), expected)
+        revised = bytearray(snapshot((allow, deny)))
+        revised[len(b"cvfx-windows-dacl-v1\0") + 8] = 4
+        self.assertEqual(Workspace._windows_dacl_copy_token(bytes(revised)), expected)
         for changed in (
             snapshot((deny, allow)),
             snapshot((ace(0, 0, 1), deny)),
@@ -430,23 +441,29 @@ class WorkspaceTests(unittest.TestCase):
             Workspace._windows_dacl_copy_token(empty_acl),
             Workspace._windows_dacl_copy_token(null_acl),
         )
-        for invalid in (b"", snapshot((allow,))[:-1], snapshot((allow,)) + b"extra"):
+        unsupported_revision = bytearray(snapshot((allow,)))
+        unsupported_revision[len(b"cvfx-windows-dacl-v1\0") + 8] = 3
+        for invalid in (b"", snapshot((allow,))[:-1], snapshot((allow,)) + b"extra", bytes(unsupported_revision)):
             with self.assertRaises(WorkspaceError):
                 Workspace._windows_dacl_copy_token(invalid)
 
     @unittest.skipUnless(os.name == "nt", "Windows DACL semantics require a Windows fixture")
     def test_write_preserves_protected_and_inherited_windows_dacls(self) -> None:
-        for index, protected in enumerate((True, False)):
+        for index, protected in enumerate((None, True, False)):
             with self.subTest(protected=protected):
                 target = self.root / f"windows-dacl-{index}.txt"
                 target.write_bytes(b"before")
-                _set_windows_dacl_protection(target, protected)
+                # The untouched default DACL is essential: calling SetNamed-
+                # SecurityInfo here first would hide its conversion markers.
+                if protected is not None:
+                    _set_windows_dacl_protection(target, protected)
                 before_token = Workspace._windows_dacl_token(target)
                 prefix = b"cvfx-windows-dacl-v1\0"
                 control = int.from_bytes(
                     before_token[len(prefix) : len(prefix) + 2], "little"
                 )
-                self.assertEqual(bool(control & 0x1000), protected)
+                if protected is not None:
+                    self.assertEqual(bool(control & 0x1000), protected)
 
                 run_tool(
                     self.workspace,
@@ -1990,6 +2007,12 @@ class CliTests(unittest.TestCase):
                 # the text races with readline consuming the trailing carriage
                 # return, which can turn the interrupted line into an empty line.
                 read_until("多行> ".encode("utf-8"), start=start)
+                # A prompt can be visible just before readline finishes setting
+                # up its signal handler. Echo without a pending newline proves
+                # this read is active, so SIGINT cannot race between two reads.
+                pending_start = len(transcript)
+                os.write(master_fd, "尚未提交的行".encode("utf-8"))
+                read_until("尚未提交的行".encode("utf-8"), start=pending_start)
                 interrupt_start = len(transcript)
                 process.send_signal(signal.SIGINT)
                 read_until("已丢弃多行草稿".encode("utf-8"), start=interrupt_start)

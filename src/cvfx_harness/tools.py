@@ -1007,19 +1007,28 @@ class Workspace:
 
     @staticmethod
     def _windows_dacl_copy_token(snapshot: bytes) -> bytes:
-        """Compare ordered ACEs and inheritance, excluding ACL buffer allocation."""
+        """Compare file access/inheritance semantics after Windows normalization."""
         prefix = b"cvfx-windows-dacl-v1\0"
         header_size = len(prefix) + 8
         if not snapshot.startswith(prefix) or len(snapshot) < header_size:
             raise WorkspaceError("Windows DACL 快照无效；目标文件未替换。")
-        state = snapshot[len(prefix) : len(prefix) + 4]
+        control = int.from_bytes(snapshot[len(prefix) : len(prefix) + 2], "little")
+        # SetNamedSecurityInfo may convert an ACL to the current automatic
+        # inheritance model and recompute AUTO_INHERIT_* / DEFAULTED markers.
+        # Keep the actual protection barrier and DACL presence. Every ACE flag,
+        # including INHERITED_ACE and propagation flags, is compared below.
+        state = (control & 0x1000).to_bytes(2, "little") + snapshot[len(prefix) + 2 : len(prefix) + 3]
         acl_length = int.from_bytes(snapshot[len(prefix) + 4 : header_size], "little")
         acl = snapshot[header_size:]
         if len(acl) != acl_length:
             raise WorkspaceError("Windows DACL 快照长度无效；目标文件未替换。")
         if not acl:
             return state + b"\0"
-        if len(acl) < 8 or int.from_bytes(acl[2:4], "little") < len(acl):
+        if (
+            len(acl) < 8
+            or acl[0] not in (2, 4)  # ACL_REVISION / ACL_REVISION_DS
+            or int.from_bytes(acl[2:4], "little") < len(acl)
+        ):
             raise WorkspaceError("Windows DACL 结构无效；目标文件未替换。")
         ace_count = int.from_bytes(acl[4:6], "little")
         entries: list[bytes] = []
@@ -1036,8 +1045,9 @@ class Workspace:
             raise WorkspaceError("Windows DACL 条目范围无效；目标文件未替换。")
         # Preserve ACE order and every ACE byte, including inheritance flags,
         # access masks, SIDs, object GUIDs, and callback/conditional data. The ACL
-        # header's capacity/reserved fields do not describe access permissions.
-        return state + b"\1" + acl[:1] + ace_count.to_bytes(2, "little") + b"".join(entries)
+        # header's valid revision, capacity and reserved fields do not describe
+        # access permissions. Raw approval/race snapshots remain unchanged.
+        return state + b"\1" + ace_count.to_bytes(2, "little") + b"".join(entries)
 
     @staticmethod
     def _copy_windows_dacl(source: Path, destination: Path) -> None:
@@ -1128,7 +1138,8 @@ class Workspace:
         source_token = Workspace._windows_dacl_copy_token(Workspace._windows_dacl_token(source))
         destination_token = Workspace._windows_dacl_copy_token(Workspace._windows_dacl_token(destination))
         if source_token != destination_token:
-            raise WorkspaceError("替换文件的 Windows DACL 与继承状态不匹配；目标文件未替换。")
+            category = "保护/存在状态" if source_token[:3] != destination_token[:3] else "有序权限条目"
+            raise WorkspaceError(f"替换文件的 Windows DACL 与继承状态不匹配（{category}）；目标文件未替换。")
 
     def _snapshot_matches(
         self,
