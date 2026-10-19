@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 PYINSTALLER_VERSION = "6.22.3"
+_CURRENT_STAGE = "初始化"
 EXPECTED_ARTIFACT_FILES = {
     "cvfx-harness.exe",
     "README-standalone-zh-CN.txt",
@@ -41,17 +42,21 @@ FORBIDDEN_BUNDLE_PARTS = {
 
 
 def _fail(message: str) -> None:
+    safe_message = f"阶段：{_CURRENT_STAGE}；{message}"
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         try:
             with open(summary_path, "a", encoding="utf-8", newline="\n") as summary:
-                summary.write(f"\n### Windows 单文件自检失败\n\n{message}\n")
+                summary.write(f"\n### Windows 单文件自检失败\n\n{safe_message}\n")
         except OSError:
             pass
-    raise SystemExit(f"Windows 单文件包构建失败：{message}")
+    print(f"::error title=Windows 单文件自检失败::{safe_message}", file=sys.stderr)
+    raise SystemExit(f"Windows 单文件包构建失败：{safe_message}")
 
 
 def _record_stage(name: str) -> None:
+    global _CURRENT_STAGE
+    _CURRENT_STAGE = name
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
         return
