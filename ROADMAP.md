@@ -203,7 +203,7 @@
 - 新增只接受用户 profile ID 的 `run_test_profile` 工具。`/测试` 配置仍由用户交互管理，模型文件工具不可访问 `.harness/config/test_profiles.json`；profile 只保存固定框架和工作区相对 cwd/target。每次用户明确要求运行时，先预览当前 Python、完整 argv、cwd、120 秒时限、32 KiB 合并输出上限、shell=false 和当前用户权限/非沙箱属性，再单独审批。一次提问最多启动一个测试进程，计划模式不提供且工具层仍拦截。
 - 环境白名单不包含运行时凭据；Linux 新建独立进程组并在超时/取消时终止普通进程树；Windows 以 `CREATE_SUSPENDED` 启动，分配 kill-on-close Job Object 后才恢复主线程，任何监督设置失败均在代码启动前失败关闭。输出最多保留 32 KiB；本地显示前做凭据样式脱敏和终端控制字符转义；向模型发送最多 16 KiB 输出要另行批准。拒绝分享时仅回传状态与退出码，工具轮次不可存档。
 - OpenAI 兼容 SSE loopback fixture 验证跨片段 ID/工具参数组装后按现有 Agent 循环执行 profile；fixture 只访问本机，不含认证头。合成静态测试项目覆盖正常/失败退出、输出截断、普通子进程超时和取消、子进程停止、重复模型请求拦截、审批期间 profile 变化和 Windows Job 成员关系。没有执行用户项目测试或真实模型请求；自动化结果不等于完整产品验收。
-- Linux / Python 3.12 清洁环境全量离线回归：206 项，205 通过、1 项 Windows-only junction 跳过；12 项受限测试运行器用例、`compileall`、安装自检和 `git diff --check` 均通过。Windows 进程监督与四矩阵 CI 将在推送后验证。
+- Linux / Python 3.12 清洁环境全量离线回归：206 项，205 通过、1 项 Windows-only junction 跳过；12 项受限测试运行器用例、`compileall`、安装自检和 `git diff --check` 均通过。提交 `c955e7e0f7ba51ba840aa2edcd74014798d0d79b` 的 Windows/Linux × Python 3.11/3.12 四矩阵 CI 已成功（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39262256476)）；Windows standalone 构建、审查、smoke 和 artifact 上传已成功（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39262256497)）。这些自动测试不等同完整产品验收。
 
 ## 参考项目复用边界
 
