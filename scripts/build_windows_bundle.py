@@ -421,10 +421,11 @@ def main() -> int:
             if resume_result.returncode != 0:
                 _fail("打包 EXE 冷启动续跑合成流程返回失败状态")
             expected_resume_markers = (
-                "当前进程目标为空",
+                "可用上下文：仅已保存步骤说明",
                 "补充本次续跑需要的目标/约束",
-                "聊天历史、问卷答案和工具结果没有恢复",
-                "确认在仅掌握已保存的第 1 步上下文时启动新的 Agent 并继续？",
+                "旧目标、聊天、问卷答案和工具结果不恢复",
+                "续跑将启动空白 Agent；不重放旧工具调用或审批",
+                "确认继续？",
                 "第 1 步保持 in-progress",
             )
             if any(marker not in resume_result.stdout for marker in expected_resume_markers):

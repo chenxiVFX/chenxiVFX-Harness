@@ -505,11 +505,21 @@ class TerminalUI:
             height=Dimension(min=1, max=4),
             style="class:approval",
         )
+        self._approval_prompt_area = TextArea(
+            text="",
+            multiline=True,
+            read_only=True,
+            focusable=False,
+            wrap_lines=True,
+            scrollbar=False,
+            height=Dimension(min=1, max=3),
+            style="class:approval.heading",
+        )
         self._approval_no_button = Button(
-            "拒绝（当前）", handler=self._select_no, width=18
+            "拒绝", handler=self._select_no, width=10
         )
         self._approval_yes_button = Button(
-            "批准本次", handler=self._select_yes, width=18
+            "本次批准", handler=self._select_yes, width=12
         )
         self._approval_container = ConditionalContainer(
             HSplit(
@@ -519,14 +529,20 @@ class TerminalUI:
                         height=1,
                         style="class:approval.heading",
                     ),
-                    self._approval_area,
+                    ConditionalContainer(
+                        self._approval_area,
+                        Condition(lambda: bool(self._approval_text)),
+                    ),
+                    self._approval_prompt_area,
                     VSplit(
                         [self._approval_no_button, self._approval_yes_button],
                         padding=1,
                     ),
                 ]
             ),
-            Condition(lambda: bool(self._approval_text)),
+            Condition(
+                lambda: self._pending is not None and self._pending.approval
+            ),
         )
         self._question_heading = Window(
             FormattedTextControl(lambda: self._question_heading_text()),
@@ -668,7 +684,11 @@ class TerminalUI:
             ]
         )
         self._input_block_container = ConditionalContainer(
-            input_block, Condition(lambda: self._question_pending is None)
+            input_block,
+            Condition(
+                lambda: self._question_pending is None
+                and (self._pending is None or not self._pending.approval)
+            ),
         )
         content = HSplit(
             [
@@ -822,11 +842,14 @@ class TerminalUI:
                             # Keep the decision area compact; the complete
                             # rolling diff stays in the scrollable transcript.
                             self._approval_text = "\n".join(patch_context.splitlines()[:2])
+                        elif patch_context.startswith("工作区文本搜索审批范围"):
+                            self._approval_text = "\n".join(patch_context.splitlines()[:2])
                         elif any(marker in context for marker in ("差异", "审批范围")):
                             self._approval_text = _safe_text(context)
                         else:
-                            self._approval_text = self._prompt
+                            self._approval_text = ""
                         self._approval_area.text = self._approval_text
+                        self._approval_prompt_area.text = self._prompt
                     else:
                         self._application.layout.focus(self.input_area)
                         self._cancel_event.clear()
@@ -834,6 +857,7 @@ class TerminalUI:
                         self._approval_choice_yes = False
                         self._approval_text = ""
                         self._approval_area.text = ""
+                        self._approval_prompt_area.text = ""
                         self._status = "等待输入"
                     self._application.layout.focus(
                         self._approval_no_button if value.approval else self.input_area
@@ -1172,6 +1196,7 @@ class TerminalUI:
         self._prompt = ""
         self._approval_text = ""
         self._approval_area.text = ""
+        self._approval_prompt_area.text = ""
         self._last_output = ""
         self._request_ready.clear()
         self._status = "运行中"
@@ -1329,12 +1354,10 @@ class TerminalUI:
             self._select_yes()
 
     def _update_approval_buttons(self) -> None:
-        self._approval_no_button.text = (
-            "拒绝（默认）" if self._approval_choice_yes else "拒绝（当前）"
-        )
-        self._approval_yes_button.text = (
-            "批准（当前）" if self._approval_choice_yes else "批准本次"
-        )
+        # Focus styling indicates the current choice; the labels stay short so
+        # the review and both actions remain legible in narrow terminals.
+        self._approval_no_button.text = "拒绝"
+        self._approval_yes_button.text = "本次批准"
 
     def _question_suggestion_row(self):
         rows = []
@@ -1607,19 +1630,21 @@ class TerminalUI:
                 line = "回答 · Enter换行 · Esc取消"
             if self._notice:
                 line = self._notice
+        elif self._pending is not None and self._pending.approval:
+            if columns >= 48:
+                line = "PgUp/PgDn审阅 · Tab/↑↓选择 · Enter确认 · Esc取消"
+            elif columns >= 38:
+                line = "Pg↑↓审阅 · Tab选 · Enter确认 · Esc取消"
+            elif columns >= 30:
+                line = "Pg↑↓审阅 · Enter确认 · Esc取消"
+            else:
+                line = "Enter确认 · Esc取消"
         elif self._notice:
             line = f"{self._status}  ·  {self._notice}"
         elif self._pending is None and not self._worker_done:
             line = "生成中  ·  Ctrl+C 取消"
         elif self._pending is None:
             line = self._status
-        elif self._pending.approval:
-            if columns >= 58:
-                line = "待审批  ·  Tab/↑↓ 选择  ·  Enter 确认  ·  Esc 取消"
-            elif columns >= 36:
-                line = "待审批 · Tab/↑↓选择 · Enter确认"
-            else:
-                line = "审批 · Enter确认"
         else:
             if columns >= 36:
                 line = "等待输入 · Tab补全 · Enter提交"

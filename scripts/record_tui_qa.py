@@ -401,6 +401,27 @@ def _child(
                 context=self._last_output,
                 accepted=self._approval_choice_yes,
             )
+        if (
+            self._pending is not None
+            and self._pending.approval
+            and self._prompt == "确认继续？"
+        ):
+            review_marker = "继续前复核："
+            review_start = self._transcript.rfind(review_marker)
+            _audit(
+                "resume_approval_view",
+                prompt=self._prompt,
+                question=self._approval_prompt_area.text,
+                review=(
+                    self._transcript[review_start:]
+                    if review_start >= 0
+                    else ""
+                ),
+                question_in_transcript="确认继续？" in self._transcript,
+                input_block_visible=bool(self._input_block_container.filter()),
+                status=self._status_line(),
+                accepted=self._approval_choice_yes,
+            )
         original_resolve(self, **kwargs)
 
     def audited_question_review(self) -> None:
@@ -885,7 +906,7 @@ def _exercise(walk: PtyWalkthrough, workspace: Path) -> None:
     resume_start = len(walk.raw)
     walk.command(
         "/继续 1",
-        expect="请检查当前工作区最近一次工具可能造成的影响；确认启动新的 Agent 并继续第 1 步？",
+        expect="确认继续？",
         wait_ready=False,
     )
     walk.mark("plan-resume-review")
@@ -1252,7 +1273,6 @@ def main() -> int:
             cold_plan_store.add("冷启动后按完成条件重新核对合成入口文件")
             cold_plan_store.transition(1, "in-progress")
             cold_plan_store.record_progress(1, "provider_request")
-            cold_plan_store.recover_unfinished()
 
             child_pid, master_fd = pty.fork()
             if child_pid == 0:
@@ -1279,10 +1299,22 @@ def main() -> int:
             walk.mark("plan-cold-resume-context")
             walk.send("\r")  # Choose the saved-step-only context explicitly.
             walk.wait(
-                "确认在仅掌握已保存的第 1 步上下文时启动新的 Agent 并继续？",
+                "确认继续？",
                 start=cold_start,
             )
             walk.mark("plan-cold-resume-confirmation")
+            walk.send(b"\x1b[5~")
+            walk._collect(0.1)
+            walk.send(b"\x1b[6~")
+            walk._collect(0.1)
+            narrow_review_start = len(walk.raw)
+            walk.resize(46, 14)
+            walk.wait("Pg↑↓审阅", start=narrow_review_start)
+            walk.send(b"\x1b[5~")
+            walk._collect(0.1)
+            walk.send(b"\x1b[6~")
+            walk._collect(0.1)
+            walk.mark("plan-cold-resume-narrow")
             walk.send("\t\r")
             walk.wait("冷启动合成步骤已按有限上下文重新检查。", start=cold_start)
             walk.wait("第 1 步保持 in-progress", start=cold_start)
@@ -1304,6 +1336,34 @@ def main() -> int:
                 for item in cold_responses
             ):
                 raise RuntimeError("cold-start fixture did not use its fixed limited-context response")
+            resume_views = [
+                item for item in cold_responses if item.get("kind") == "resume_approval_view"
+            ]
+            if len(resume_views) != 2:
+                raise RuntimeError(f"expected two unified continuation approval views, got {len(resume_views)}")
+            for view in resume_views:
+                review = view.get("review", "")
+                step_text = (
+                    "冷启动后按完成条件重新核对合成入口文件"
+                    if "冷启动合成工作区" in review
+                    else "检查中文配置读取路径"
+                )
+                if (
+                    view.get("prompt") != "确认继续？"
+                    or view.get("question") != "确认继续？"
+                    or view.get("input_block_visible")
+                    or view.get("question_in_transcript")
+                    or not view.get("accepted")
+                    or "Enter确认" not in view.get("status", "")
+                    or "Esc取消" not in view.get("status", "")
+                    or "续跑将启动空白 Agent" not in review
+                    or review.count("续跑将启动空白 Agent") != 1
+                    or review.count(step_text) != 1
+                    or review.count("完成条件：") != 1
+                    or "建议工具（不构成授权）" not in review
+                    or "确认继续？" in review
+                ):
+                    raise RuntimeError(f"continuation approval was repeated or lost an essential boundary: {view!r}")
             walk.send("/退出\r")
             deadline = time.monotonic() + 8
             cold_status = None
@@ -1324,7 +1384,7 @@ def main() -> int:
             if no_color and _has_sgr_color(recorded_output):
                 raise RuntimeError("NO_COLOR PTY output contained an ANSI color attribute")
             print(f"Recorded {len(walk.events)} PTY events to {output}")
-            print("Synthetic offline flow passed: project-guide preview/cancel/confirm/status, malicious guide blocked in plan mode, no subagent inheritance, config review/restart, questions, plan recovery and cold-start limited-context review, change-set compensation, session archive, compression, and narrow resize.")
+            print("Synthetic offline flow passed: project-guide preview/cancel/confirm/status, malicious guide blocked in plan mode, no subagent inheritance, config review/restart, questions, plan recovery with unified normal/narrow continuation review, change-set compensation, session archive, compression, and narrow resize.")
             return 0
         except BaseException:
             if walk.raw:

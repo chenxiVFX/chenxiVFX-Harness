@@ -642,10 +642,58 @@ class PlanCliTests(unittest.TestCase):
             )
             self.assertIn("检查保存的入口模块", user_text)
             self.assertIn("检查保存的入口模块", "\n".join(outputs))
-            self.assertIn("当前进程目标为空", "\n".join(outputs))
-            self.assertIn("聊天历史、问卷答案和工具结果没有恢复", "\n".join(outputs))
+            review = "\n".join(outputs)
+            self.assertIn("可用上下文：仅已保存步骤说明", review)
+            self.assertIn("旧目标、聊天、问卷答案和工具结果不恢复", review)
+            self.assertIn("续跑将启动空白 Agent；不重放旧工具调用或审批", review)
+            self.assertEqual(review.count("续跑将启动空白 Agent"), 1)
             self.assertTrue(any("补充本次续跑需要的目标/约束" in prompt for prompt in prompts))
-            self.assertTrue(any("仅掌握已保存的第 1 步上下文" in prompt for prompt in prompts))
+            self.assertIn("确认继续？[y/N] ", prompts)
+            self.assertEqual(store.load().steps[0].status, "in-progress")
+
+    def test_process_restart_shows_step_details_once_during_resume_review(self) -> None:
+        class CapturingProvider:
+            label = "offline-restarted-plan-review-test"
+            model = "synthetic"
+
+            def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                del messages, tools, cancellation_event, max_tokens
+                return AssistantTurn("已按有限步骤完成合成检查。")
+
+        with local_temp() as temp:
+            store = PlanStore(Workspace(temp))
+            step_text = "冷启动后仅复核一次的合成入口步骤"
+            store.add(step_text)
+            store.transition(1, "in-progress")
+            store.record_progress(1, "provider_request")
+            prompts: list[str] = []
+            outputs: list[str] = []
+            inputs = iter(["/继续 1", "", "是", "/退出"])
+
+            def input_fn(prompt: str) -> str:
+                prompts.append(prompt)
+                return next(inputs)
+
+            with patch(
+                "cvfx_harness.cli.provider_from_environment",
+                return_value=CapturingProvider(),
+            ):
+                rc = run_console(
+                    SimpleNamespace(workspace=temp, provider="mock", model=None),
+                    input_fn=input_fn,
+                    output=outputs.append,
+                )
+
+            transcript = "\n".join(outputs)
+            review = next(item for item in outputs if item.startswith("继续前复核："))
+            self.assertEqual(rc, 0)
+            self.assertEqual(review.count(step_text), 1)
+            self.assertEqual(review.count("续跑将启动空白 Agent"), 1)
+            self.assertIn("检测到上次进程中断，计划步骤已受阻", transcript)
+            self.assertIn("可用上下文：仅已保存步骤说明", review)
+            self.assertIn("旧目标、聊天、问卷答案和工具结果不恢复", review)
+            self.assertNotIn("计划步骤已受阻；不会自动续跑。下面只显示", transcript)
+            self.assertIn("确认继续？[y/N] ", prompts)
             self.assertEqual(store.load().steps[0].status, "in-progress")
 
     def test_resume_supplement_is_ephemeral_and_not_saved_in_plan_or_session(self) -> None:
@@ -685,7 +733,8 @@ class PlanCliTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(len(provider.requests), 1)
             self.assertIn(supplement, json.dumps(provider.requests[0], ensure_ascii=False))
-            self.assertTrue(any("本次临时补充目标/约束" in prompt for prompt in prompts))
+            self.assertIn("已接收本次临时目标/约束", "\n".join(outputs))
+            self.assertIn("确认继续？[y/N] ", prompts)
             self.assertIn("不会写入计划存档或主会话目标", "\n".join(outputs))
             plan_path = Path(temp) / ".harness" / "plans" / "current.json"
             archive_path = Path(temp) / ".harness" / "sessions" / "resume-private.json"
@@ -731,7 +780,9 @@ class PlanCliTests(unittest.TestCase):
             self.assertEqual(len(provider.requests), 1)
             self.assertIn(goal, json.dumps(provider.requests[0], ensure_ascii=False))
             self.assertFalse(any("补充本次续跑需要的目标/约束" in prompt for prompt in prompts))
-            self.assertTrue(any("当前进程目标会作为不可信上下文使用" in prompt for prompt in prompts))
+            review = "\n".join(outputs)
+            self.assertIn("当前进程目标作为不可信内容提供", review)
+            self.assertIn("确认继续？[y/N] ", prompts)
             self.assertFalse(any("当前进程目标为空" in line for line in outputs))
 
     def test_cancelling_resume_context_input_keeps_blocked_step_and_sends_nothing(self) -> None:
@@ -853,8 +904,8 @@ class PlanCliTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(len(provider.requests), 1)
             self.assertIn("旧版计划没有执行阶段记录", "\n".join(outputs))
-            self.assertIn("当前进程目标为空", "\n".join(outputs))
-            self.assertTrue(any("仅掌握已保存的第 1 步上下文" in prompt for prompt in prompts))
+            self.assertIn("可用上下文：仅已保存步骤说明", "\n".join(outputs))
+            self.assertIn("确认继续？[y/N] ", prompts)
             self.assertIn("旧存档中的合成步骤", json.dumps(provider.requests[0], ensure_ascii=False))
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["version"], 3)
 
@@ -934,7 +985,7 @@ class PlanCliTests(unittest.TestCase):
                 rc = run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append)
 
             self.assertEqual(rc, 0)
-            self.assertTrue(any("已设为受阻" in line for line in outputs))
+            self.assertTrue(any("不会自动续跑" in line for line in outputs))
             self.assertIn("尚未确认继续", "\n".join(outputs))
             self.assertEqual(PlanStore(Workspace(temp)).load().steps[0].status, "blocked")
 

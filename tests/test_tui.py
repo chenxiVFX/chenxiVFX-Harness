@@ -846,7 +846,7 @@ class PromptToolkitTests(unittest.TestCase):
                 )
                 self.assertEqual(provider.requests, [])
                 self.assertNotIn(content, ui._transcript)
-                self.assertIn("需求 文档.md", ui._approval_text)
+                self.assertIn("需求 文档.md", ui._approval_prompt_area.text)
                 pipe.send_text("\t\r")
                 self._wait_until(
                     lambda: ui._pending is not None
@@ -910,10 +910,12 @@ class PromptToolkitTests(unittest.TestCase):
                 )
                 self.assertEqual(len(provider.requests), 1)
                 self.assertTrue(ui._prompt.startswith("确认搜索该范围并将脱敏匹配片段发送给模型"))
+                self.assertTrue(ui._approval_prompt_area.text.startswith("确认搜索该范围并将脱敏匹配片段发送给模型"))
                 self.assertIn("预算阈值", ui._approval_text)
-                self.assertIn("工作区相对范围：src", ui._approval_text)
-                self.assertIn("*.py", ui._approval_text)
+                self.assertIn("工作区相对范围：src", ui._transcript)
+                self.assertIn("*.py", ui._transcript)
                 self.assertNotIn("16384", ui._transcript)
+                self.assertFalse(ui._input_block_container.filter())
                 pipe.send_text("\t\r")
                 self._wait_until(
                     lambda: ui._pending is not None
@@ -1159,7 +1161,10 @@ class PromptToolkitTests(unittest.TestCase):
             self.assertTrue(ui._pending.approval)
             self.assertEqual(ui._input_buffer.text, "")
             self.assertTrue(ui.input_area.buffer.read_only())
+            self.assertFalse(ui._input_block_container.filter())
             self.assertNotIn("[y/N]", ui._prompt)
+            self.assertEqual(ui._approval_prompt_area.text, "确认写入文件？")
+            self.assertNotIn("确认写入文件？", ui._transcript)
             self.assertFalse(ui._approval_choice_yes)
             pipe.send_text("\r")
 
@@ -1179,14 +1184,16 @@ class PromptToolkitTests(unittest.TestCase):
             self.assertTrue(ui._approval_choice_yes is False)
             self.assertIn("确认写入文件？", ui._prompt)
             self.assertNotIn("[y/N]", ui._prompt)
+            self.assertEqual(ui._approval_prompt_area.text, "确认写入文件？")
             self.assertTrue(ui._application.layout.has_focus(ui._approval_no_button))
-            self.assertIn("当前", ui._approval_no_button.text)
-            self.assertEqual(ui._approval_yes_button.text, "批准本次")
+            self.assertFalse(ui._input_block_container.filter())
+            self.assertEqual(ui._approval_no_button.text, "拒绝")
+            self.assertEqual(ui._approval_yes_button.text, "本次批准")
             pipe.send_text("\t")
             time.sleep(0.05)
             self.assertTrue(ui._approval_choice_yes)
             self.assertTrue(ui._application.layout.has_focus(ui._approval_yes_button))
-            self.assertIn("当前", ui._approval_yes_button.text)
+            self.assertEqual(ui._approval_yes_button.text, "本次批准")
             self.assertIsNotNone(ui._pending, "selection alone must not approve")
             pipe.send_text("\r")
 
@@ -1221,6 +1228,8 @@ class PromptToolkitTests(unittest.TestCase):
             self.assertNotIn("新内容乙", ui._approval_text)
             self.assertIn("新内容甲", ui._transcript)
             self.assertIn("新内容乙", ui._transcript)
+            self.assertEqual(ui._approval_prompt_area.text, "确认应用整批变更？")
+            self.assertNotIn("确认应用整批变更？", ui._transcript)
             pipe.send_text("\t\r")
 
         ui, result = self._run_ui(worker, send)
@@ -1354,7 +1363,7 @@ class PromptToolkitTests(unittest.TestCase):
             def get_size(self):
                 return Size(rows=24, columns=self.columns)
 
-        for columns in (20, 24, 36, 64, 80, 100):
+        for columns in (20, 24, 30, 36, 38, 46, 48, 64, 80, 100):
             with self.subTest(columns=columns), create_pipe_input() as pipe:
                 ui = TerminalUI(
                     lambda _ui: 0,
@@ -1379,10 +1388,13 @@ class PromptToolkitTests(unittest.TestCase):
                 line = ui._status_line()
                 self.assertLessEqual(wcswidth(line), columns)
                 self.assertIn("Enter", line)
+                self.assertIn("Esc取消", line)
+                if columns >= 30:
+                    self.assertIn("审阅", line)
+                if columns >= 38:
+                    self.assertIn("Tab", line)
                 if columns >= 58:
-                    self.assertIn("Esc 取消", line)
-                elif columns < 36:
-                    self.assertNotIn("Tab/↑↓", line)
+                    self.assertIn("PgUp/PgDn审阅", line)
 
     def test_header_truncates_provider_and_workspace_at_terminal_width(self) -> None:
         class SizedDummyOutput(DummyOutput):
@@ -1720,7 +1732,11 @@ class PromptToolkitTests(unittest.TestCase):
                     lambda: ui._pending is not None and ui._pending.approval,
                     "final cold resume confirmation was not shown",
                 )
-                self.assertIn("补充内容将发送给模型但不会保存", ui._prompt)
+                self.assertEqual(ui._prompt, "确认继续？")
+                self.assertFalse(ui._input_block_container.filter())
+                self.assertIn("已接收本次临时目标/约束", ui._transcript)
+                self.assertIn("续跑将启动空白 Agent；不重放旧工具调用或审批", ui._transcript)
+                self.assertIn("PgUp/PgDn审阅", ui._status_line())
                 ui._approval_yes_button.handler()
                 ui._submit_input()
                 self._wait_until(
@@ -1730,7 +1746,7 @@ class PromptToolkitTests(unittest.TestCase):
                     "confirmed resume did not return to the chat prompt",
                 )
                 self.assertIn(supplement, json.dumps(provider.requests, ensure_ascii=False))
-                self.assertIn("之前的完整目标、聊天历史", ui._transcript)
+                self.assertIn("可用上下文：仅已保存步骤说明", ui._transcript)
                 pipe.send_text("/退出")
                 pipe.send_bytes(b"\r")
                 self._wait_until(lambda: ui._worker_done, "TUI did not exit after the resumed step")
