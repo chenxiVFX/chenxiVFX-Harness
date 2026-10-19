@@ -104,7 +104,7 @@
 - 明确拒绝 Mock/自定义 provider 的 SSE 请求、多个候选项、多模态/logprobs/未知增量字段和缺少完成标记的流。流式文本可能先于完成标记显示；错误后不自动撤回已显示片段。完整产品验收仍不在单元测试范围内。
 - 新增 loopback HTTP fixture 与纯解析器用例，涵盖跨字节中文、工具往返、截断不审批、错误脱敏、大小/时间上限和取消；fixture 不含 Authorization 头。未访问真实模型或读取配置凭据。
 - Debian / Python 3.12：`python -m unittest discover -s tests -v` 共 90 项，89 通过、1 项 Windows-only junction 跳过；`compileall`、editable install、安装自检及 `git diff --check` 通过。
-- 当前工作树未调用真实模型 API、未读取环境凭据；SSE HTTP 用例只访问本机 loopback，且不发送 Authorization 头。四矩阵 GitHub Actions 链接待推送后补录。
+- 当前工作树未调用真实模型 API、未读取环境凭据；SSE HTTP 用例只访问本机 loopback，且不发送 Authorization 头。代码提交 `cf6d4401e26c0ba988b7551a69c52656f2ce0030` 的四矩阵 GitHub Actions 均以 `completed / success` 结束（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39206980429)）。
 - 真实 API 用量账本（父任务累计）：历史已用 1,222 tokens（79 + 1,104 + 39）；本轮预分配上限 20,000，实际请求 0 次、失败 0 次、用量 0；累计仍为 1,222 / 2,000,000，余 1,998,778。未读取凭据或 Network secret。
 
 ## 参考项目复用边界
