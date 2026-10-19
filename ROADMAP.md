@@ -13,7 +13,7 @@
 | Anthropic provider / 更多供应商 | 待实现 | 尚无独立协议适配；当前用户要求的 `deepseek-flash` 只配置了兼容接口 |
 | 多轮工具循环 | 已实现 / 离线可测 | 最多 4 轮、每轮最多执行 4 项，回填工具结果；重复调用编号、格式错误或超预算时关闭当前轮次 |
 | 工作区文件引用、目录列表与读写 | 已实现 / 离线可测 | 目录只返回名称/类型且逐次批准；文件读取与写入逐次批准；路径和敏感路径检查、写入差异预览与撤销备份 |
-| junction / symlink / hard link 逃逸 | 部分实现 / CI 验证中 | Linux 默认运行 symlink / hard link 集成用例；Windows 运行 junction 与可创建的 symlink / hard link 用例；Windows 系统策略拒绝 fixture 时会明确跳过 |
+| junction / symlink / hard link 逃逸 | 部分实现 / 跨平台 CI 通过 | Linux 默认运行 symlink / hard link 集成用例；Windows 运行 junction 与可创建的 symlink / hard link 用例；Windows 系统策略拒绝 fixture 时会明确跳过 |
 | 计划模式 | 已实现 / 离线可测 | 拒绝工具写入；没有 shell 工具 |
 | 目标模式 | 已实现（有限） | 目标仅作为不可信上下文；没有计划编排或权限变化 |
 | 安全会话保存/恢复 | 已实现 / 离线可测 | `.harness/sessions/`；默认存安全完整轮次；`/检查点` 另存用户手写脱敏摘要，预览确认后才保存；不复制工具结果 |
@@ -56,7 +56,7 @@
 
 ## 当前恢复点
 
-- 当前工作基于本地 `main` 提交 `c6dab6e`，其父提交为 `8c7a1e8`。推送前复核时 `origin/main` 指向该父提交；普通 push 会快进包含这两个本地提交和本轮提交，不重写历史。
+- 当前恢复点为本轮提交 `3f2f670`，基于 `c6dab6e`，再基于 `8c7a1e8`；已普通快进推送到 `origin/main`，未重写历史。
 - 本轮只更改 Harness 源码、测试和说明文档；`.harness/`、`.test-tmp/` 和 Python 缓存均忽略，不放入版本控制。
 - 本轮启用现有 symlink / hard link 集成用例的跨平台自动执行，并让 Windows junction 用例在 Windows 上自动运行；没有调整系统链接权限。
 
@@ -81,7 +81,8 @@
 - GitHub Actions 使用只读仓库权限，在 Windows/Linux 与 Python 3.11/3.12 矩阵中安装项目、运行自检、编译检查和完整 unittest；测试阶段不访问外部模型 API。
 - Windows 快速开始通过虚拟环境中的 Python 和 CLI 可执行文件直接运行，不需激活脚本或修改执行策略。
 - Debian 13 / Python 3.12：editable install、自检、compileall 和 65 项 unittest 通过（64 通过，1 项 Windows-only junction 用例跳过）；symlink 与 hard link 集成用例均执行通过。
-- GitHub Actions 的 `checkout` / `setup-python` tag 均固定到已核对的官方 commit SHA。Windows/Linux 远端矩阵结果及本轮提交号待推送后补录。
+- GitHub Actions 的 `checkout` / `setup-python` tag 均固定到已核对的官方 commit SHA。运行 [39203303235](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39203303235) 的 Ubuntu/Windows、Python 3.11/3.12 四项 job 均以 `completed / success` 结束。
+- 安装自检与 CI 的实现提交为 `3f2f67009ec95e74cff8482f69e3110e597d3ba4`；记录 CI 结果的后续提交号见 Git 历史。
 
 ## 参考项目复用边界
 

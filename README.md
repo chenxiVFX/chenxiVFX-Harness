@@ -87,4 +87,4 @@ python -m unittest discover -s tests -v
 .\run.ps1 --help
 ```
 
-`scripts/selfcheck.py` 需先安装项目；它会核对包版本、模块与命令行帮助，并用独立的 Mock 子进程验证 UTF-8 中文交互。测试只使用本地临时工作区、模拟提供商、loopback HTTP fixture 和 stub HTTP 响应，不读取实际环境密钥或访问外部 API。GitHub Actions 会在 Linux 与 Windows、Python 3.11 与 3.12 上运行安装自检和完整测试。符号链接和硬链接逃逸测试在支持的平台默认运行；junction 仅在 Windows 测试。若 Windows 策略拒绝创建符号链接或文件系统拒绝创建硬链接 fixture，对应 Windows 用例会明确跳过并说明原因。
+`scripts/selfcheck.py` 需先安装项目；它会核对包版本、模块与命令行帮助，并用独立的 Mock 子进程验证 UTF-8 中文交互。测试只使用本地临时工作区、模拟提供商、loopback HTTP fixture 和 stub HTTP 响应，不读取实际环境密钥或访问外部 API。GitHub Actions 的 Linux/Windows、Python 3.11/3.12 四项矩阵已全部通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39203303235)）。符号链接和硬链接逃逸测试在支持的平台默认运行；junction 仅在 Windows 测试。若 Windows 策略拒绝创建符号链接或文件系统拒绝创建硬链接 fixture，对应 Windows 用例会明确跳过并说明原因。
