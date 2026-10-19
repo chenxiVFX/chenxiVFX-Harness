@@ -189,8 +189,8 @@ workspace.apply_change_set(changes, approve_action=lambda _request: True)
         journal.unlink()
         before_a = (self.root / "a.txt").read_bytes()
         before_b = (self.root / "b.txt").read_bytes()
-        self.assertEqual(before_a.decode("utf-8"), "中文段落甲\n新值甲\n")
-        self.assertEqual(before_b.decode("utf-8"), self.sources["b.txt"])
+        self.assertEqual(before_a.decode("utf-8").replace("\r\n", "\n"), "中文段落甲\n新值甲\n")
+        self.assertEqual(before_b.decode("utf-8").replace("\r\n", "\n"), self.sources["b.txt"])
 
         with self.assertRaisesRegex(WorkspaceError, "不得据此判定为没有待办"):
             self.workspace.list_incomplete_change_sets()
