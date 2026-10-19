@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -65,6 +66,29 @@ def _record_stage(name: str) -> None:
             summary.write(f"- Windows 单文件阶段：{name}\n")
     except OSError:
         pass
+
+
+def _process_error_signature(result: subprocess.CompletedProcess[str]) -> str:
+    """Expose only an exception class and optional module name from a local smoke test."""
+    output = f"{result.stdout or ''}\n{result.stderr or ''}"
+    for line in reversed(output.splitlines()):
+        candidate = line.strip()
+        match = re.match(
+            r"^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Interrupt|Failure))(?::|$)",
+            candidate,
+        )
+        if not match:
+            continue
+        signature = match.group(1)
+        module = re.search(r"No module named ['\"]?([A-Za-z0-9_.]+)", candidate)
+        if module:
+            signature += f" (module {module.group(1)})"
+        dll = re.search(r"while importing ([A-Za-z0-9_.]+)", candidate, re.IGNORECASE)
+        if dll:
+            signature += f" (module {dll.group(1)})"
+        return signature
+    marker_present = "TUI 合成输入、命令补全和退出自检通过。" in output
+    return f"return code {result.returncode}; success marker {'present' if marker_present else 'absent'}"
 
 
 def _minimal_environment() -> dict[str, str]:
@@ -287,7 +311,8 @@ def main() -> int:
             environment=minimal_environment,
         )
         if tui_result.returncode != 0 or "TUI 合成输入、命令补全和退出自检通过。" not in tui_result.stdout:
-            _fail("打包程序 TUI 启动、命令补全或退出自检失败")
+            signature = _process_error_signature(tui_result)
+            _fail(f"打包程序 TUI 启动、命令补全或退出自检失败（{signature}）")
 
         _record_stage("EXE 离线 Mock 与中文工作区路径自检")
         with tempfile.TemporaryDirectory(prefix="cvfx harness 中文 ") as temporary_workspace:
