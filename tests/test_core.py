@@ -58,7 +58,15 @@ from cvfx_harness.providers import (
     _stream_transport_category,
     provider_from_environment,
 )
-from cvfx_harness.tools import ActionRequest, TOOL_SCHEMAS, Workspace, WorkspaceError, run_tool
+from cvfx_harness.tools import (
+    ActionRequest,
+    DIRECTORY_SCAN_LIMIT,
+    PATH_COMPLETION_LIMIT,
+    TOOL_SCHEMAS,
+    Workspace,
+    WorkspaceError,
+    run_tool,
+)
 from cvfx_harness.usage import ProviderUsage
 
 def make_test_temp(prefix: str = "case-") -> tempfile.TemporaryDirectory:
@@ -469,6 +477,65 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(len(checked), 1000)
         self.assertEqual(len(result["entries"]), 100)
         self.assertTrue(result["truncated"])
+
+    def test_path_suggestions_show_safe_names_without_reading_contents(self) -> None:
+        folder = self.root / "资料"
+        folder.mkdir()
+        (folder / "需求 文档.md").write_text("合成正文", encoding="utf-8")
+        (folder / "README.md").write_text("合成正文", encoding="utf-8")
+        (folder / "普通目录").mkdir()
+        link_target = folder / "link-target.md"
+        link_target.write_text("合成正文", encoding="utf-8")
+        try:
+            os.symlink(link_target, folder / "symlink.md")
+        except (OSError, NotImplementedError):
+            pass
+        try:
+            os.link(link_target, folder / "hardlink.md")
+        except OSError:
+            pass
+        (folder / "api_key.txt").write_text("synthetic", encoding="utf-8")
+        (folder / ".env").write_text("synthetic", encoding="utf-8")
+        (folder / ".aws").mkdir()
+        (folder / ".harness").mkdir()
+        (folder / "credentials").mkdir()
+        (folder / "too-large.txt").write_bytes(b"x" * (64 * 1024 + 1))
+
+        with patch.object(Path, "read_bytes", side_effect=AssertionError("completion read a file")):
+            braced = self.workspace.suggest_path_entries("资料", "需")
+            ordinary = self.workspace.suggest_path_entries("资料", "R")
+            all_safe = self.workspace.suggest_path_entries("资料", "")
+
+        self.assertEqual(braced, [("需求 文档.md", False)])
+        self.assertEqual(ordinary, [("README.md", False)])
+        self.assertEqual(
+            all_safe,
+            [("README.md", False), ("普通目录", True), ("需求 文档.md", False)],
+        )
+        self.assertNotIn(("symlink.md", False), all_safe)
+        self.assertNotIn(("hardlink.md", False), all_safe)
+        self.assertNotIn(("link-target.md", False), all_safe)
+
+    def test_path_suggestions_scan_and_return_within_fixed_limits(self) -> None:
+        folder = self.root / "many"
+        folder.mkdir()
+        for index in range(DIRECTORY_SCAN_LIMIT + 5):
+            (folder / f"item-{index:04d}.txt").touch()
+
+        checked: list[Path] = []
+        original = Workspace._is_reparse_point
+
+        def count_children(path: Path) -> bool:
+            if path.parent == folder:
+                checked.append(path)
+            return original(path)
+
+        with patch.object(Workspace, "_is_reparse_point", side_effect=count_children):
+            suggestions = self.workspace.suggest_path_entries("many", "item")
+
+        self.assertEqual(len(checked), DIRECTORY_SCAN_LIMIT)
+        self.assertEqual(len(suggestions), PATH_COMPLETION_LIMIT)
+        self.assertTrue(all(name.startswith("item-") and not is_directory for name, is_directory in suggestions))
 
     def test_cancel_during_directory_scan_stops_before_return(self) -> None:
         folder = self.root / "during-scan"

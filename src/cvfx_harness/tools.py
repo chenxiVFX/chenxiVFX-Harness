@@ -12,7 +12,7 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
 from .providers import ProviderCancelled, ToolCall
@@ -21,6 +21,7 @@ READ_LIMIT_BYTES = 64 * 1024
 WRITE_LIMIT_BYTES = 64 * 1024
 DIRECTORY_ENTRY_LIMIT = 100
 DIRECTORY_SCAN_LIMIT = 1000
+PATH_COMPLETION_LIMIT = 50
 _CONTROL_DIR = ".harness"
 _BACKUP_DIR = "backups"
 _SENSITIVE_DIRECTORIES = {
@@ -262,6 +263,71 @@ class Workspace:
         if not target.is_dir():
             raise WorkspaceError(f"目录不存在或不是目录：{relative_path}")
         return target
+
+    def suggest_path_entries(
+        self,
+        relative_directory: str,
+        prefix: str,
+        *,
+        limit: int = PATH_COMPLETION_LIMIT,
+    ) -> list[tuple[str, bool]]:
+        """Return bounded, safe child names without opening file contents.
+
+        Each item is ``(name, is_directory)``. Suggestions are conveniences only;
+        reading a selected file still goes through the existing per-read approval.
+        """
+        if (
+            not isinstance(prefix, str)
+            or len(prefix) > 255
+            or any(unicodedata.category(char).startswith("C") for char in prefix)
+        ):
+            return []
+        if type(limit) is not int or not 1 <= limit <= PATH_COMPLETION_LIMIT:
+            raise ValueError("path suggestion limit is outside the local bound")
+        try:
+            target = self.resolve_directory(relative_directory or ".")
+            suggestions: list[tuple[str, bool]] = []
+            scanned = 0
+            with os.scandir(target) as entries:
+                for entry in entries:
+                    if scanned >= DIRECTORY_SCAN_LIMIT:
+                        break
+                    scanned += 1
+                    name = entry.name
+                    if (
+                        name in {".", ".."}
+                        or not name.casefold().startswith(prefix.casefold())
+                        or any(char in name for char in "/\\:{}")
+                        or name.rstrip(" .") != name
+                        or any(unicodedata.category(char).startswith("C") for char in name)
+                    ):
+                        continue
+                    candidate_path = Path(entry.path)
+                    try:
+                        if self._is_reparse_point(candidate_path):
+                            continue
+                        info = entry.stat(follow_symlinks=False)
+                    except (OSError, WorkspaceError):
+                        continue
+                    is_directory = stat.S_ISDIR(info.st_mode)
+                    if not is_directory:
+                        if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+                            continue
+                        if info.st_size > READ_LIMIT_BYTES:
+                            continue
+                    relative = (PurePosixPath(relative_directory or ".") / name).as_posix()
+                    try:
+                        if is_directory:
+                            self.resolve_directory(relative)
+                        else:
+                            self.resolve(relative)
+                    except WorkspaceError:
+                        continue
+                    suggestions.append((name, is_directory))
+        except (OSError, WorkspaceError):
+            return []
+        suggestions.sort(key=lambda item: (item[0].casefold(), item[0]))
+        return suggestions[:limit]
 
     def _relative_parts(self, candidate: Path) -> tuple[str, ...]:
         try:

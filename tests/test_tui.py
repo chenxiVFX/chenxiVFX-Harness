@@ -29,12 +29,23 @@ from cvfx_harness.tui import CommandCompleter, TerminalUI, terminal_supports_tui
 
 
 class PromptToolkitTests(unittest.TestCase):
-    def _run_ui(self, worker, send_keys, *, output=None) -> tuple[TerminalUI, int]:
+    def _run_ui(
+        self,
+        worker,
+        send_keys,
+        *,
+        output=None,
+        workspace_root: str | Path | None = None,
+    ) -> tuple[TerminalUI, int]:
         with create_pipe_input() as pipe:
+            reference_workspace = (
+                Workspace(workspace_root) if workspace_root is not None else None
+            )
             ui = TerminalUI(
                 worker,
                 input=pipe,
                 output=DummyOutput() if output is None else output,
+                reference_workspace=reference_workspace,
             )
             errors: list[BaseException] = []
 
@@ -77,7 +88,7 @@ class PromptToolkitTests(unittest.TestCase):
             )
 
         with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
-            return self._run_ui(worker, send_keys)
+            return self._run_ui(worker, send_keys, workspace_root=workspace)
 
     @staticmethod
     def _wait_until(predicate, message: str, timeout: float = 5.0) -> None:
@@ -100,6 +111,108 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertEqual(command_items[0].display_meta_text, "显示完整说明")
         self.assertEqual(values, ["计划"])
         self.assertEqual(path_values, [])
+
+    def test_workspace_reference_completer_handles_braces_paths_and_filters(self) -> None:
+        from prompt_toolkit.completion import CompleteEvent
+        from prompt_toolkit.document import Document
+
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-complete-") as root:
+            folder = Path(root) / "资料"
+            folder.mkdir()
+            (folder / "需求 文档.md").write_text("合成正文", encoding="utf-8")
+            (folder / "README.md").write_text("合成正文", encoding="utf-8")
+            (folder / "api_key.txt").write_text("synthetic", encoding="utf-8")
+            (folder / "图像").mkdir()
+            workspace = Workspace(root)
+            completer = CommandCompleter(workspace)
+            event = CompleteEvent()
+
+            braced = list(
+                completer.get_completions(Document("请检查 @{资料/需"), event)
+            )
+            directory = list(
+                completer.get_completions(Document("请检查 @{资料/图"), event)
+            )
+            unbraced = list(
+                completer.get_completions(Document("请检查 @资料/READ"), event)
+            )
+            sensitive = list(
+                completer.get_completions(Document("请检查 @{资料/api"), event)
+            )
+            email = list(
+                completer.get_completions(Document("联系 user@exam"), event)
+            )
+
+        self.assertEqual([(item.text, item.start_position, item.display_meta_text) for item in braced],
+                         [("需求 文档.md}", -1, "文件")])
+        self.assertEqual([(item.text, item.display_meta_text) for item in directory],
+                         [("图像/", "目录")])
+        self.assertEqual([(item.text, item.display_meta_text) for item in unbraced],
+                         [("README.md ", "文件")])
+        self.assertEqual(sensitive, [])
+        self.assertEqual(email, [])
+
+    def test_file_reference_completion_still_requires_read_approval_in_mock_cli(self) -> None:
+        class CapturingMockProvider(MockProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.requests: list[list[dict[str, object]]] = []
+
+            def complete(self, messages, tools, **kwargs):
+                self.requests.append([dict(message) for message in messages])
+                return super().complete(messages, tools, **kwargs)
+
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-reference-") as workspace:
+            folder = Path(workspace) / "资料"
+            folder.mkdir()
+            content = "只有审批后才能发送的合成文件正文"
+            (folder / "需求 文档.md").write_text(content, encoding="utf-8")
+            provider = CapturingMockProvider()
+
+            def send(pipe, ui: TerminalUI) -> None:
+                self._wait_until(
+                    lambda: ui._pending is not None and not ui._pending.approval,
+                    "main input prompt did not become ready",
+                )
+                pipe.send_text("请检查 @{资料/需")
+                self._wait_until(
+                    lambda: ui._input_buffer.complete_state is not None
+                    and any(
+                        item.text == "需求 文档.md}"
+                        for item in ui._input_buffer.complete_state.completions
+                    ),
+                    "safe file-reference suggestion did not appear",
+                )
+                pipe.send_text("\t\r")
+                self._wait_until(
+                    lambda: ui._pending is not None and ui._pending.approval,
+                    "file reference did not ask for read approval",
+                )
+                self.assertEqual(provider.requests, [])
+                self.assertNotIn(content, ui._transcript)
+                self.assertIn("需求 文档.md", ui._approval_text)
+                pipe.send_text("\t\r")
+                self._wait_until(
+                    lambda: ui._pending is not None
+                    and not ui._pending.approval
+                    and bool(provider.requests),
+                    "approved file reference did not reach the offline provider",
+                )
+                self.assertTrue(
+                    any(
+                        content in message.get("content", "")
+                        for message in provider.requests[0]
+                        if message.get("role") == "user"
+                    )
+                )
+                pipe.send_text("/退出\r")
+
+            ui, result = self._run_cli_ui(workspace, provider, send)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(provider.requests), 1)
+        self.assertIn("审批选择：是（本次）", ui._transcript)
+        self.assertIn("[模拟模式] 已收到", ui._transcript)
 
     def test_tab_fills_filtered_command_and_enter_submits(self) -> None:
         received: list[str] = []
@@ -456,6 +569,7 @@ class PromptToolkitTests(unittest.TestCase):
                 line = ui._status_line()
                 self.assertLessEqual(wcswidth(line), columns)
                 self.assertIn("等待输入" if columns >= 26 else "输入", line)
+                self.assertIn("Tab补全" if columns >= 36 else "Enter", line)
                 self.assertLessEqual(wcswidth(ui._empty_hint()), columns)
                 self.assertIn(
                     "查看命令" if columns >= 42 else "/命令", ui._empty_hint()
@@ -933,8 +1047,14 @@ class PromptToolkitTests(unittest.TestCase):
                 os.close(master_fd)
 
     @unittest.skipUnless(os.name == "posix", "PTY key handling is POSIX-specific")
-    def test_real_posix_pty_shows_completion_menu_and_accepts_selected_command(self) -> None:
+    def test_real_posix_pty_completes_file_reference_without_skipping_approval(self) -> None:
         with tempfile.TemporaryDirectory(prefix="cvfx-tui-menu-pty-") as workspace:
+            folder = Path(workspace) / "资料"
+            folder.mkdir()
+            private_synthetic_content = "PTY_SYNTHETIC_BODY_REQUIRES_APPROVAL"
+            (folder / "需求 文档.md").write_text(
+                private_synthetic_content, encoding="utf-8"
+            )
             environment = {
                 "PATH": os.environ.get("PATH", ""),
                 "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
@@ -978,6 +1098,18 @@ class PromptToolkitTests(unittest.TestCase):
                 os.write(master_fd, b"\x1b[B\x1b[B\t\r")
                 read_until("命令：".encode("utf-8"), start=menu_start)
                 self.assertIn("/命令".encode("utf-8"), transcript[menu_start:])
+
+                path_start = len(transcript)
+                os.write(master_fd, "请检查 @{资料/需".encode("utf-8"))
+                read_until("需求 文档.md".encode("utf-8"), start=path_start)
+                read_until("文件".encode("utf-8"), start=path_start)
+                approval_start = len(transcript)
+                os.write(master_fd, b"\t\r")
+                read_until("确认读取？".encode("utf-8"), start=approval_start)
+                self.assertNotIn(private_synthetic_content.encode("utf-8"), transcript)
+                os.write(master_fd, b"\r")
+                read_until("你[执行]> ".encode("utf-8"), start=approval_start)
+                self.assertNotIn(private_synthetic_content.encode("utf-8"), transcript)
                 os.write(master_fd, "/退出\r".encode("utf-8"))
                 self.assertEqual(process.wait(timeout=8), 0)
             finally:

@@ -29,6 +29,7 @@ from prompt_toolkit.widgets import Button, TextArea
 from wcwidth import wcswidth
 
 from .sessions import redact_likely_secrets
+from .tools import Workspace, WorkspaceError
 
 MAX_TRANSCRIPT_CHARS = 200_000
 POLL_INTERVAL_SECONDS = 0.025
@@ -58,11 +59,65 @@ def _safe_text(value: str) -> str:
 
 
 class CommandCompleter(Completer):
-    """Offer only fixed commands and fixed enum values; never inspect workspace paths."""
+    """Offer fixed commands plus bounded, safe workspace file-reference names."""
+
+    def __init__(self, workspace: Workspace | None = None) -> None:
+        self._workspace = workspace
+
+    @staticmethod
+    def _path_context(document) -> tuple[str, str, bool, int] | None:
+        before = document.text_before_cursor
+        line_start = before.rfind("\n") + 1
+        line_before = before[line_start:]
+        if document.text_after_cursor.split("\n", 1)[0]:
+            return None
+        marker = line_before.rfind("@")
+        if marker < 0:
+            return None
+        absolute_marker = line_start + marker
+        if absolute_marker and re.match(r"\w|@", before[absolute_marker - 1]):
+            return None
+
+        reference = line_before[marker:]
+        braced = reference.startswith("@{")
+        if braced:
+            if "}" in reference or "{" in reference[2:]:
+                return None
+            path_prefix = reference[2:]
+        else:
+            path_prefix = reference[1:]
+            if any(char.isspace() for char in path_prefix) or "{" in path_prefix or "}" in path_prefix:
+                return None
+            if not path_prefix:
+                return None
+        if "\\" in path_prefix or len(path_prefix) > 4096:
+            return None
+        directory_prefix, separator, name_prefix = path_prefix.rpartition("/")
+        directory = directory_prefix if separator else "."
+        return directory, name_prefix, braced, len(name_prefix)
 
     def get_completions(self, document, complete_event):
         del complete_event
         before = document.text_before_cursor
+        path_context = self._path_context(document)
+        if path_context is not None and self._workspace is not None:
+            directory, prefix, braced, replace_chars = path_context
+            try:
+                entries = self._workspace.suggest_path_entries(directory, prefix)
+            except (WorkspaceError, OSError):
+                entries = []
+            for name, is_directory in entries:
+                if not braced and any(char.isspace() for char in name):
+                    continue
+                completion_text = name + "/" if is_directory else name + ("}" if braced else " ")
+                display = name + "/" if is_directory else name
+                yield Completion(
+                    completion_text,
+                    start_position=-replace_chars,
+                    display=display,
+                    display_meta="目录" if is_directory else "文件",
+                )
+            return
         if "\n" in before:
             return
         if before.startswith("/模式 "):
@@ -101,6 +156,7 @@ class TerminalUI:
         *,
         input: Any = None,
         output: Any = None,
+        reference_workspace: Workspace | None = None,
     ) -> None:
         self._worker_callable = worker
         self._input = input
@@ -128,7 +184,7 @@ class TerminalUI:
         self._follow_output = True
         self.input_area = TextArea(
             multiline=True,
-            completer=CommandCompleter(),
+            completer=CommandCompleter(reference_workspace),
             complete_while_typing=True,
             wrap_lines=True,
             focus_on_click=True,
@@ -767,7 +823,12 @@ class TerminalUI:
             else:
                 line = "审批 · Enter确认"
         else:
-            line = "等待输入 · Enter提交" if columns >= 26 else "输入 · Enter"
+            if columns >= 36:
+                line = "等待输入 · Tab补全 · Enter提交"
+            elif columns >= 26:
+                line = "等待输入 · Enter提交"
+            else:
+                line = "输入 · Enter"
 
         if wcswidth(line) <= columns:
             return line
@@ -796,7 +857,11 @@ def run_tui_console(args) -> int | None:
             cancellation_event=ui.cancellation_event,
         )
 
-    ui = TerminalUI(worker)
+    try:
+        reference_workspace = Workspace(args.workspace)
+    except (WorkspaceError, OSError, RuntimeError):
+        reference_workspace = None
+    ui = TerminalUI(worker, reference_workspace=reference_workspace)
     try:
         return ui.run()
     except (EOFError, NotImplementedError, OSError):
