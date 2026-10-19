@@ -593,6 +593,271 @@ class PlanProposalCliTests(unittest.TestCase):
 
 
 class PlanCliTests(unittest.TestCase):
+    @staticmethod
+    def _make_restart_blocked_step(temp: str, text: str = "检查合成文件") -> PlanStore:
+        store = PlanStore(Workspace(temp))
+        store.add(text)
+        store.transition(1, "in-progress")
+        store.record_progress(1, "provider_request")
+        store.recover_unfinished()
+        return store
+
+    def test_cold_resume_reviews_saved_step_and_requires_limited_context_confirmation(self) -> None:
+        class CapturingProvider:
+            label = "offline-cold-resume-test"
+            model = "synthetic"
+
+            def __init__(self) -> None:
+                self.requests: list[list[dict[str, object]]] = []
+
+            def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                del tools, cancellation_event, max_tokens
+                self.requests.append(json.loads(json.dumps(messages, ensure_ascii=False)))
+                return AssistantTurn("已按有限步骤上下文完成合成检查。")
+
+        with local_temp() as temp:
+            store = self._make_restart_blocked_step(temp, "检查保存的入口模块")
+            provider = CapturingProvider()
+            inputs = iter(["/继续 1", "", "是", "/退出"])
+            prompts: list[str] = []
+            outputs: list[str] = []
+
+            def input_fn(prompt: str) -> str:
+                prompts.append(prompt)
+                return next(inputs)
+
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                rc = run_console(
+                    SimpleNamespace(workspace=temp, provider="mock", model=None),
+                    input_fn=input_fn,
+                    output=outputs.append,
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(provider.requests), 1)
+            user_text = next(
+                message["content"]
+                for message in provider.requests[0]
+                if message["role"] == "user"
+            )
+            self.assertIn("检查保存的入口模块", user_text)
+            self.assertIn("检查保存的入口模块", "\n".join(outputs))
+            self.assertIn("当前进程目标为空", "\n".join(outputs))
+            self.assertIn("聊天历史、问卷答案和工具结果没有恢复", "\n".join(outputs))
+            self.assertTrue(any("补充本次续跑需要的目标/约束" in prompt for prompt in prompts))
+            self.assertTrue(any("仅掌握已保存的第 1 步上下文" in prompt for prompt in prompts))
+            self.assertEqual(store.load().steps[0].status, "in-progress")
+
+    def test_resume_supplement_is_ephemeral_and_not_saved_in_plan_or_session(self) -> None:
+        class CapturingProvider:
+            label = "offline-private-resume-test"
+            model = "synthetic"
+
+            def __init__(self) -> None:
+                self.requests: list[list[dict[str, object]]] = []
+
+            def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                del tools, cancellation_event, max_tokens
+                self.requests.append(json.loads(json.dumps(messages, ensure_ascii=False)))
+                return AssistantTurn("本次临时补充只用于合成步骤。")
+
+        with local_temp() as temp:
+            store = self._make_restart_blocked_step(temp, "核对临时补充的接口")
+            provider = CapturingProvider()
+            supplement = "SYNTHETIC_RESUME_CONTEXT_仅本次使用"
+            inputs = iter([
+                "/继续 1", supplement, "是", "/保存 resume-private", "/退出",
+            ])
+            prompts: list[str] = []
+            outputs: list[str] = []
+
+            def input_fn(prompt: str) -> str:
+                prompts.append(prompt)
+                return next(inputs)
+
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                rc = run_console(
+                    SimpleNamespace(workspace=temp, provider="mock", model=None),
+                    input_fn=input_fn,
+                    output=outputs.append,
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(provider.requests), 1)
+            self.assertIn(supplement, json.dumps(provider.requests[0], ensure_ascii=False))
+            self.assertTrue(any("本次临时补充目标/约束" in prompt for prompt in prompts))
+            self.assertIn("不会写入计划存档或主会话目标", "\n".join(outputs))
+            plan_path = Path(temp) / ".harness" / "plans" / "current.json"
+            archive_path = Path(temp) / ".harness" / "sessions" / "resume-private.json"
+            self.assertNotIn(supplement, plan_path.read_text(encoding="utf-8"))
+            archive = json.loads(archive_path.read_text(encoding="utf-8"))
+            self.assertNotIn(supplement, json.dumps(archive, ensure_ascii=False))
+            self.assertEqual(archive["goal"], "")
+            self.assertEqual(store.load().steps[0].status, "in-progress")
+
+    def test_existing_current_goal_is_reused_without_cold_start_prompt(self) -> None:
+        class CapturingProvider:
+            label = "offline-existing-goal-resume-test"
+            model = "synthetic"
+
+            def __init__(self) -> None:
+                self.requests: list[list[dict[str, object]]] = []
+
+            def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                del tools, cancellation_event, max_tokens
+                self.requests.append(json.loads(json.dumps(messages, ensure_ascii=False)))
+                return AssistantTurn("沿用当前目标完成合成检查。")
+
+        with local_temp() as temp:
+            self._make_restart_blocked_step(temp, "在现有目标内检查配置")
+            provider = CapturingProvider()
+            goal = "保持中文接口，只检查配置边界"
+            inputs = iter([f"/目标 {goal}", "/继续 1", "是", "/退出"])
+            prompts: list[str] = []
+            outputs: list[str] = []
+
+            def input_fn(prompt: str) -> str:
+                prompts.append(prompt)
+                return next(inputs)
+
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                rc = run_console(
+                    SimpleNamespace(workspace=temp, provider="mock", model=None),
+                    input_fn=input_fn,
+                    output=outputs.append,
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(provider.requests), 1)
+            self.assertIn(goal, json.dumps(provider.requests[0], ensure_ascii=False))
+            self.assertFalse(any("补充本次续跑需要的目标/约束" in prompt for prompt in prompts))
+            self.assertTrue(any("当前进程目标会作为不可信上下文使用" in prompt for prompt in prompts))
+            self.assertFalse(any("当前进程目标为空" in line for line in outputs))
+
+    def test_cancelling_resume_context_input_keeps_blocked_step_and_sends_nothing(self) -> None:
+        class NoRequestProvider:
+            label = "offline-cancel-resume-context-test"
+            model = "synthetic"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, *args, **kwargs):
+                del args, kwargs
+                self.calls += 1
+                raise AssertionError("cancelled context review must not request the provider")
+
+        with local_temp() as temp:
+            store = self._make_restart_blocked_step(temp, "取消时保持受阻")
+            provider = NoRequestProvider()
+            inputs = iter(["/继续 1", "/退出"])
+            outputs: list[str] = []
+            prompts: list[str] = []
+
+            def input_fn(prompt: str) -> str:
+                prompts.append(prompt)
+                if "补充本次续跑需要的目标/约束" in prompt:
+                    raise KeyboardInterrupt
+                return next(inputs)
+
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                rc = run_console(
+                    SimpleNamespace(workspace=temp, provider="mock", model=None),
+                    input_fn=input_fn,
+                    output=outputs.append,
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(provider.calls, 0)
+            self.assertIn("续跑上下文输入已取消", "\n".join(outputs))
+            self.assertEqual(store.load().steps[0].status, "blocked")
+
+    def test_resume_supplement_rejects_secret_control_and_oversize_without_echo_or_request(self) -> None:
+        class NoRequestProvider:
+            label = "offline-secret-resume-context-test"
+            model = "synthetic"
+
+            def complete(self, *args, **kwargs):
+                del args, kwargs
+                raise AssertionError("rejected resume context must not reach the provider")
+
+        invalid_inputs = (
+            ("api_key=synthetic-secret-value", "疑似凭据或控制字符"),
+            ("first\u2028second", "疑似凭据或控制字符"),
+            ("x" * 4097, "超过 4 KiB 上限"),
+        )
+        for value, message in invalid_inputs:
+            with self.subTest(message=message), local_temp() as temp:
+                store = self._make_restart_blocked_step(temp, "拒绝无效续跑补充")
+                inputs = iter(["/继续 1", value, "/退出"])
+                outputs: list[str] = []
+
+                with patch(
+                    "cvfx_harness.cli.provider_from_environment",
+                    return_value=NoRequestProvider(),
+                ):
+                    rc = run_console(
+                        SimpleNamespace(workspace=temp, provider="mock", model=None),
+                        input_fn=lambda _prompt: next(inputs),
+                        output=outputs.append,
+                    )
+
+                transcript = "\n".join(outputs)
+                self.assertEqual(rc, 0)
+                self.assertIn(message, transcript)
+                self.assertNotIn(value, transcript)
+                self.assertEqual(store.load().steps[0].status, "blocked")
+
+    def test_legacy_migration_resume_also_requires_context_choice(self) -> None:
+        class CapturingProvider:
+            label = "offline-legacy-context-test"
+            model = "synthetic"
+
+            def __init__(self) -> None:
+                self.requests: list[list[dict[str, object]]] = []
+
+            def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                del tools, cancellation_event, max_tokens
+                self.requests.append(json.loads(json.dumps(messages, ensure_ascii=False)))
+                return AssistantTurn("旧版步骤已从有限上下文开始重新检查。")
+
+        with local_temp() as temp:
+            path = Path(temp) / ".harness" / "plans" / "current.json"
+            path.parent.mkdir(parents=True)
+            legacy = {
+                "version": 2,
+                "steps": [{
+                    "text": "旧存档中的合成步骤",
+                    "status": "pending",
+                    "completion_criteria": "按当前工作区检查合成结果",
+                    "required_tools": [],
+                }],
+            }
+            path.write_bytes(json.dumps(legacy, ensure_ascii=False).encode("utf-8"))
+            provider = CapturingProvider()
+            inputs = iter(["/继续 核验 1", "是", "", "是", "/退出"])
+            prompts: list[str] = []
+            outputs: list[str] = []
+
+            def input_fn(prompt: str) -> str:
+                prompts.append(prompt)
+                return next(inputs)
+
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                rc = run_console(
+                    SimpleNamespace(workspace=temp, provider="mock", model=None),
+                    input_fn=input_fn,
+                    output=outputs.append,
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(provider.requests), 1)
+            self.assertIn("旧版计划没有执行阶段记录", "\n".join(outputs))
+            self.assertIn("当前进程目标为空", "\n".join(outputs))
+            self.assertTrue(any("仅掌握已保存的第 1 步上下文" in prompt for prompt in prompts))
+            self.assertIn("旧存档中的合成步骤", json.dumps(provider.requests[0], ensure_ascii=False))
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["version"], 3)
+
     def test_legacy_plan_verifies_each_step_without_starting_agent_early(self) -> None:
         class FinalProvider:
             label = "offline-legacy-plan-resume-test"
@@ -630,7 +895,7 @@ class PlanCliTests(unittest.TestCase):
             provider = FinalProvider(temp)
             inputs = iter([
                 "/继续 核验 1", "是",
-                "/继续 核验 2", "是",
+                "/继续 核验 2", "是", "", "是",
                 "/退出",
             ])
             outputs: list[str] = []
@@ -662,7 +927,7 @@ class PlanCliTests(unittest.TestCase):
                     del args, kwargs
                     raise AssertionError("declined resumed task must not contact provider")
 
-            inputs = iter(["/计划", "/继续 1", "n", "/退出"])
+            inputs = iter(["/计划", "/继续 1", "", "n", "/退出"])
             outputs: list[str] = []
             args = SimpleNamespace(workspace=temp, provider="mock", model=None)
             with patch("cvfx_harness.cli.provider_from_environment", return_value=NoRequestProvider()):
@@ -734,7 +999,7 @@ class PlanCliTests(unittest.TestCase):
             store.record_progress(1, "tool_execution", "write_file")
             store.recover_unfinished()
             provider = FinalProvider()
-            inputs = iter(["/继续 核验 1", "是", "/退出"])
+            inputs = iter(["/继续 核验 1", "是", "", "是", "/退出"])
             prompts: list[str] = []
             outputs: list[str] = []
 

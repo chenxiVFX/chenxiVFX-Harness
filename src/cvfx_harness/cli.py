@@ -69,6 +69,7 @@ from .usage import DEFAULT_TOKEN_BUDGET
 _REFERENCE = re.compile(r"(?<![\w@])@(?:\{([^{}]+)\}|([^\s]+))", re.UNICODE)
 _TRAILING_PUNCTUATION = ",，。;；!?！？)]}"
 MAX_MULTILINE_INPUT_BYTES = 64 * 1024
+MAX_RESUME_CONTEXT_BYTES = 4 * 1024
 _CLI_COMMANDS = (
     "/帮助", "/命令", "/状态", "/项目说明", "/模式", "/目标", "/计划", "/保存", "/检查点",
     "/恢复", "/继续", "/会话", "/多行", "/压缩", "/统计", "/预算", "/配置", "/测试", "/子代理",
@@ -603,7 +604,7 @@ def _help_text() -> str:
   /计划 添加 <步骤>  添加一条用户自写步骤（最多 3 条）
   /计划 执行 <编号>  确认后执行一步；每项工具仍单独审批，完成状态需人工确认
   /计划 完成|阻塞|取消 <编号>
-  /继续 <编号>      检查并继续被阻塞或中断的计划步骤
+  /继续 <编号>      检查并继续被阻塞或中断的计划步骤；冷启动时会审阅可用上下文
   /继续 核验 <编号> 工具结果未知或旧计划缺阶段记录时，逐步检查当前工作区
   /计划 重试 <编号> 将受阻/取消步骤退回待办；结果未知时必须先 /继续 核验
   /计划 清空        确认后清除当前计划
@@ -1335,6 +1336,8 @@ def run_console(
         command, _, argument = stripped.partition(" ")
         command = command.casefold()
         resume_confirmed = False
+        resume_goal_override: str | None = None
+        resume_context_mode: str | None = None
 
         if command in {"/继续", "/resume"}:
             parts = argument.strip().split()
@@ -1364,6 +1367,21 @@ def run_console(
             if step.status not in {"blocked", "cancelled"}:
                 output(f"第 {index} 步状态为 {step.status}；只有受阻、取消或重启中断的步骤可继续。")
                 continue
+            resume_project_guidance, guidance_invalidated = refresh_project_guidance()
+            if guidance_invalidated:
+                output(
+                    "已确认的项目说明版本发生变化；本次续跑未启动。"
+                    "如需继续使用它，请重新预览确认，然后重新审阅续跑步骤。"
+                )
+                continue
+            current_goal = redact_likely_secrets(agent.goal)[0].strip()
+            resume_context_mode = "current_goal" if current_goal else "saved_step_only"
+            resume_context_basis = f"已保存的第 {index} 步"
+            resume_context_for_confirmation = resume_context_basis
+            if resume_project_guidance is not None:
+                resume_context_for_confirmation += (
+                    f"及当前已确认项目说明 {resume_project_guidance.path}"
+                )
             progress = (
                 snapshot.progress
                 if snapshot.progress is not None and snapshot.progress.step_index == index
@@ -1409,6 +1427,21 @@ def run_console(
                 "继续前的工作区复核：程序将检查工作区根目录和未完成变更集；不会读取旧工具目标、参数或输出。\n"
                 f"当前路径：{_safe_terminal_text(str(workspace.root))}\n"
                 + _plan_snapshot_text(snapshot)
+                + (
+                    "\n当前进程目标不为空；它会作为不可信上下文用于本次新 Agent。"
+                    "旧聊天历史、问卷答案和工具结果不会恢复。"
+                    if current_goal
+                    else (
+                        "\n当前进程目标为空。之前的完整目标、聊天历史、问卷答案和工具结果没有恢复。"
+                        "新 Agent 目前只掌握已保存步骤的说明、完成条件和建议工具；"
+                        "不会自动把旧上下文补回。"
+                    )
+                )
+                + (
+                    "\n本次仍会附加以上已确认的根目录项目说明；它是不可信背景，不是授权。"
+                    if resume_project_guidance is not None
+                    else ""
+                )
                 + "\n恢复会创建新的空白 Agent；旧工具调用和审批不会重放或延续，后续每项工具仍须按当前工作区重新审批。"
             )
             try:
@@ -1431,17 +1464,88 @@ def run_console(
                 if not _is_affirmative_answer(reviewed):
                     output("尚未确认核验；步骤和中断记录未改变。")
                     continue
-            else:
+
+                if legacy_unverified and len(snapshot.unverified_steps) > 1:
+                    try:
+                        prepared = plan_store.prepare_resume(
+                            index,
+                            expected_snapshot=snapshot,
+                            verified_unknown_outcome=True,
+                        )
+                    except PlanError as exc:
+                        output(f"未记录核验：{exc}")
+                        continue
+                    output(
+                        "该旧版步骤已由你核验；其余旧版步骤仍需分别核验，尚未启动模型。\n"
+                        + _plan_snapshot_text(prepared)
+                    )
+                    continue
+
+            if not current_goal:
                 try:
-                    reviewed = input_fn(
-                        f"请检查当前工作区最近一次工具可能造成的影响；确认启动新的 Agent 并继续第 {index} 步？[y/N] "
+                    supplemental_goal = input_fn(
+                        "可补充本次续跑需要的目标/约束（最多 4 KiB；确认后会作为本次步骤的模型上下文发送，"
+                        "不写入计划、主会话目标或会话存档）；"
+                        "直接 Enter 表示按有限的已保存步骤上下文继续：[一行] "
                     )
                 except (EOFError, KeyboardInterrupt):
-                    output("继续确认已取消；步骤和中断记录未改变。")
+                    output("续跑上下文输入已取消；步骤状态未改变，模型请求未发出。")
                     continue
-                if not _is_affirmative_answer(reviewed):
-                    output("尚未确认继续；步骤和中断记录未改变。")
+                if not isinstance(supplemental_goal, str):
+                    output("续跑上下文无效；步骤状态未改变，模型请求未发出。")
                     continue
+                supplemental_goal = supplemental_goal.strip()
+                try:
+                    supplemental_bytes = supplemental_goal.encode("utf-8")
+                except UnicodeEncodeError:
+                    output("续跑上下文不是有效 UTF-8；步骤状态未改变，模型请求未发出。")
+                    continue
+                if len(supplemental_bytes) > MAX_RESUME_CONTEXT_BYTES:
+                    output("续跑上下文超过 4 KiB 上限；步骤状态未改变，模型请求未发出。")
+                    continue
+                if (
+                    contains_likely_secret(supplemental_goal)
+                    or any(
+                        unicodedata.category(char).startswith("C")
+                        or char in {"\u2028", "\u2029"}
+                        for char in supplemental_goal
+                    )
+                ):
+                    output("续跑上下文含疑似凭据或控制字符；内容未回显、未发送，步骤状态未改变。")
+                    continue
+                resume_goal_override = supplemental_goal
+                if supplemental_goal:
+                    resume_context_mode = "saved_step_plus_supplement"
+                    output(
+                        "已接收本次临时目标/约束；确认后会作为模型上下文发送，"
+                        "不会写入计划存档或主会话目标。"
+                    )
+                else:
+                    resume_context_mode = "saved_step_only"
+
+            if resume_context_mode == "saved_step_only":
+                confirmation_prompt = (
+                    f"确认在仅掌握{resume_context_for_confirmation}上下文时启动新的 Agent 并继续？"
+                    "没有恢复先前目标、对话或问卷；工具仍须逐次审批。[y/N] "
+                )
+            elif resume_context_mode == "saved_step_plus_supplement":
+                confirmation_prompt = (
+                    f"确认仅用{resume_context_for_confirmation}和本次临时补充目标/约束启动新 Agent？"
+                    "补充内容将发送给模型但不会保存；工具仍须逐次审批。[y/N] "
+                )
+            else:
+                confirmation_prompt = (
+                    f"请检查当前工作区最近一次工具可能造成的影响；确认启动新的 Agent 并继续第 {index} 步？"
+                    "当前进程目标会作为不可信上下文使用，后续工具仍须逐次审批。[y/N] "
+                )
+            try:
+                reviewed = input_fn(confirmation_prompt)
+            except (EOFError, KeyboardInterrupt):
+                output("继续确认已取消；步骤和中断记录未改变。")
+                continue
+            if not _is_affirmative_answer(reviewed):
+                output("尚未确认继续；步骤和中断记录未改变。")
+                continue
             try:
                 prepared = plan_store.prepare_resume(
                     index,
@@ -2101,7 +2205,12 @@ def run_console(
                     max_output_tokens=512,
                     max_provider_requests=2,
                 )
-                step_agent.goal = redact_likely_secrets(agent.goal)[0]
+                step_goal = (
+                    agent.goal
+                    if resume_goal_override is None
+                    else resume_goal_override
+                )
+                step_agent.goal = redact_likely_secrets(step_goal)[0]
                 step_redactor = _StreamingSecretRedactor()
                 step_stream = {"received": False, "visible": False}
 

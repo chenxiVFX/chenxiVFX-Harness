@@ -325,8 +325,8 @@ def main() -> int:
             )
             if help_result.returncode != 0:
                 _fail("打包程序 --help 返回失败状态")
-            if "Windows 优先" not in help_result.stdout or "--provider" not in help_result.stdout:
-                _fail("打包程序 --help 缺少中文说明或提供商选项")
+            if "--workspace" not in help_result.stdout or "--provider" not in help_result.stdout:
+                _fail("打包程序 --help 缺少工作区或提供商选项")
             help_timings.append(elapsed_ms)
 
         _record_stage("EXE TUI 合成键盘自检")
@@ -358,7 +358,7 @@ def main() -> int:
         expected_answer = "[模拟模式] 已收到：单文件中文合成测试"
         if mock_result.returncode != 0:
             _fail("打包程序 Mock 中文交互返回失败状态")
-        if "命令：" not in mock_result.stdout or expected_answer not in mock_result.stdout:
+        if "/检查点 <名称>" not in mock_result.stdout or expected_answer not in mock_result.stdout:
             _fail("打包程序未完成离线 Mock 中文交互")
         if workspace.name.casefold() not in mock_result.stdout.casefold():
             _fail("打包程序未正确处理含空格和中文的工作区路径")

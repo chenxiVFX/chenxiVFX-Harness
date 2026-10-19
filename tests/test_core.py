@@ -2990,11 +2990,11 @@ class CliTests(unittest.TestCase):
                 read_until("已取消当前输入".encode("utf-8"), start=interrupt_start)
                 read_until("你[执行]> ".encode("utf-8"), start=interrupt_start)
                 os.write(master_fd, "/帮\t\r".encode("utf-8"))
-                read_until("命令：".encode("utf-8"))
+                read_until("/检查点 <名称>".encode("utf-8"))
                 start = len(transcript)
                 os.write(master_fd, b"\x1b[A\r")
                 read_until("你[执行]> ".encode("utf-8"), start=start)
-                self.assertEqual(bytes(transcript).count("命令：".encode("utf-8")), 1)
+                self.assertEqual(bytes(transcript).count("/检查点 <名称>".encode("utf-8")), 1)
 
                 mode_start = len(transcript)
                 os.write(master_fd, "/模式 计\t\r".encode("utf-8"))

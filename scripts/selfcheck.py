@@ -71,7 +71,7 @@ def main() -> int:
         [sys.executable, "-m", "cvfx_harness", "--help"],
         environment=environment,
     )
-    if "Windows 优先" not in module_help or "--provider" not in module_help:
+    if "--workspace" not in module_help or "--provider" not in module_help:
         _fail("python -m cvfx_harness --help 输出不完整")
 
     executable_names = ("cvfx-harness.exe", "cvfx-harness")
@@ -89,16 +89,23 @@ def main() -> int:
         _fail("找不到已安装的 cvfx-harness 命令")
 
     console_help = _run([console_script, "--help"], environment=environment)
-    if "Windows 优先" not in console_help or "--provider" not in console_help:
+    if "--workspace" not in console_help or "--provider" not in console_help:
         _fail("cvfx-harness --help 输出不完整")
 
     with tempfile.TemporaryDirectory(prefix="cvfx-selfcheck-") as workspace:
+        help_output = _run(
+            [console_script, "--workspace", workspace, "--provider", "mock"],
+            environment=environment,
+            input_text="/帮助\n/退出\n",
+        )
         mock_output = _run(
             [console_script, "--workspace", workspace, "--provider", "mock"],
             environment=environment,
-            input_text="/帮助\n自检中文\n/退出\n",
+            input_text="自检中文\n/退出\n",
         )
-    if "命令：" not in mock_output or "[模拟模式] 已收到：自检中文" not in mock_output:
+    if "/检查点 <名称>" not in help_output:
+        _fail("CLI 命令帮助输出不完整")
+    if "[模拟模式] 已收到：自检中文" not in mock_output:
         _fail("Mock 中文交互输出不完整")
 
     print("安装、UTF-8 CLI 帮助和 Mock 中文交互自检通过。")

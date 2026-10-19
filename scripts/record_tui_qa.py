@@ -573,7 +573,7 @@ def _prepare_workspace(workspace: Path) -> str:
         newline="\n",
     )
     source = "# 合成演示配置：只在临时工作区使用。\nBUDGET_THRESHOLD = 16384\n"
-    (workspace / "src" / "配置.py").write_text(source, encoding="utf-8")
+    (workspace / "src" / "配置.py").write_text(source, encoding="utf-8", newline="\n")
     (workspace / "tests" / "test_demo.py").write_text(
         "import unittest\n\nclass DemoTests(unittest.TestCase):\n"
         "    def test_synthetic_arithmetic(self):\n"
@@ -1183,7 +1183,7 @@ def main() -> int:
             ]
             walk.send(b"\x1bOQ")  # xterm F2, parsed by prompt_toolkit as a function key
             walk.wait("/帮助", start=help_start)
-            if "命令：" in _ANSI.sub(
+            if "/检查点 <名称>" in _ANSI.sub(
                 "", bytes(walk.raw[help_start:]).decode("utf-8", errors="replace")
             ):
                 raise RuntimeError("function-key shortcut submitted the local command without Enter")

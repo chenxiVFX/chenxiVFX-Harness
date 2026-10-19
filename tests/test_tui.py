@@ -24,6 +24,7 @@ from prompt_toolkit.data_structures import Size
 from wcwidth import wcswidth
 
 from cvfx_harness.cli import _StreamingSecretRedactor, _confirm_action, build_parser, run_console
+from cvfx_harness.plans import PlanStore
 from cvfx_harness.profiles import TestProfileStore
 from cvfx_harness.providers import AssistantTurn, MockProvider, ProviderCancelled, ToolCall
 from cvfx_harness.questions import QuestionnaireRequest, QuestionnaireResult, UserQuestion, UserQuestionAnswer
@@ -1679,6 +1680,67 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertEqual(provider.calls, 2)
         self.assertIn("已取消当前模型请求", ui._transcript)
         self.assertIn("恢复后继续生成的合成流式答复。", ui._transcript)
+
+    def test_tui_cold_plan_resume_reviews_temporary_context_before_model_request(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-cold-plan-resume-") as workspace:
+            plan = PlanStore(Workspace(workspace))
+            plan.add("检查一个合成中文配置项")
+            plan.transition(1, "in-progress")
+            plan.record_progress(1, "provider_request")
+            plan.recover_unfinished()
+
+            class CapturingProvider(MockProvider):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.requests: list[list[dict[str, object]]] = []
+                    self.request_received = threading.Event()
+
+                def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                    del tools, cancellation_event, max_tokens
+                    self.requests.append([dict(message) for message in messages])
+                    self.request_received.set()
+                    return AssistantTurn("已按临时上下文完成合成续跑检查。")
+
+            provider = CapturingProvider()
+            supplement = "本次只核对合成配置的中文提示，不读取其他目录。"
+
+            def drive(pipe, ui: TerminalUI) -> None:
+                self._wait_until(lambda: ui._pending is not None, "initial CLI prompt was not ready")
+                pipe.send_text("/继续 1")
+                pipe.send_bytes(b"\r")
+                self._wait_until(
+                    lambda: ui._pending is not None
+                    and "补充本次续跑需要的目标/约束" in ui._pending.prompt,
+                    "cold resume context prompt was not shown in the TUI",
+                )
+                self.assertIn("模型上下文发送", ui._pending.prompt)
+                pipe.send_text(supplement)
+                pipe.send_bytes(b"\r")
+                self._wait_until(
+                    lambda: ui._pending is not None and ui._pending.approval,
+                    "final cold resume confirmation was not shown",
+                )
+                self.assertIn("补充内容将发送给模型但不会保存", ui._prompt)
+                ui._approval_yes_button.handler()
+                ui._submit_input()
+                self._wait_until(
+                    lambda: provider.request_received.is_set()
+                    and ui._pending is not None
+                    and not ui._pending.approval,
+                    "confirmed resume did not return to the chat prompt",
+                )
+                self.assertIn(supplement, json.dumps(provider.requests, ensure_ascii=False))
+                self.assertIn("之前的完整目标、聊天历史", ui._transcript)
+                pipe.send_text("/退出")
+                pipe.send_bytes(b"\r")
+                self._wait_until(lambda: ui._worker_done, "TUI did not exit after the resumed step")
+
+            ui, rc = self._run_cli_ui(workspace, provider, drive)
+            self.assertEqual(plan.load().steps[0].status, "in-progress")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(provider.requests), 1)
+        self.assertIn("已按临时上下文完成合成续跑检查。", ui._transcript)
 
     def test_patch_approval_shows_compact_diff_and_escapes_terminal_control(self) -> None:
         trusted_fingerprint = "b" * 64
