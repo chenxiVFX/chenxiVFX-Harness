@@ -1231,6 +1231,21 @@ class CliTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_usage_parser_reports_cache_hits_only_when_provider_supplies_valid_counts(self) -> None:
+        usage = OpenAICompatibleProvider._parse_usage({
+            "prompt_tokens": 100,
+            "completion_tokens": 12,
+            "total_tokens": 112,
+            "prompt_cache_hit_tokens": 80,
+        })
+        self.assertEqual(usage, ProviderUsage(100, 12, 112, 80))
+        invalid_cache = OpenAICompatibleProvider._parse_usage({
+            "prompt_tokens": 100,
+            "completion_tokens": 12,
+            "prompt_cache_hit_tokens": 101,
+        })
+        self.assertEqual(invalid_cache, ProviderUsage(100, 12, 112, None))
+
     def test_sse_parser_handles_utf8_and_crlf_boundaries_across_byte_chunks(self) -> None:
         events: list[tuple[str, str]] = []
         parser = _SSEParser(lambda name, data: events.append((name, data)) or data == "[DONE]")
@@ -1260,7 +1275,12 @@ class ProviderTests(unittest.TestCase):
             {"choices": [{"index": 0, "delta": {"content": "你"}, "finish_reason": None}]},
             {"choices": [{"index": 0, "delta": {"content": "好"}, "finish_reason": None}]},
             {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
-            {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}},
+            {"choices": [], "usage": {
+                "prompt_tokens": 7,
+                "completion_tokens": 2,
+                "total_tokens": 9,
+                "prompt_cache_hit_tokens": 5,
+            }},
         ])
 
         def serve(handler, request_body: bytes) -> None:
@@ -1293,6 +1313,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(pieces, ["你", "好"])
         self.assertEqual(turn.content, "你好")
         self.assertEqual(turn.usage.total_tokens, 9)
+        self.assertEqual(turn.usage.cached_prompt_tokens, 5)
         self.assertNotIn("reasoning", "".join(pieces))
         self.assertIsNone(captured["authorization"])
         self.assertEqual(captured["accept"], "text/event-stream")

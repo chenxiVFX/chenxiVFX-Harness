@@ -1038,7 +1038,10 @@ class OpenAICompatibleProvider:
             return None
         if type(total) is not int or total < 0:
             total = prompt + completion
-        return ProviderUsage(prompt, completion, total)
+        cached_prompt = value.get("prompt_cache_hit_tokens")
+        if type(cached_prompt) is not int or not 0 <= cached_prompt <= prompt:
+            cached_prompt = None
+        return ProviderUsage(prompt, completion, total, cached_prompt)
 
 
 def provider_from_environment(

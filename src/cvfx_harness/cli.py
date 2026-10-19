@@ -34,7 +34,7 @@ from .providers import (
 from .plans import MAX_PLAN_STEPS, MAX_STEP_CHARS, PlanError, PlanStore, PlanStatus
 from .sessions import SessionError, SessionStore, redact_likely_secrets
 from .subagents import DelegationPlanError, SubagentManager, build_delegation_plan
-from .tools import ActionRequest, Workspace, WorkspaceError
+from .tools import TOOL_SCHEMAS, ActionRequest, Workspace, WorkspaceError
 from .usage import DEFAULT_TOKEN_BUDGET
 
 _REFERENCE = re.compile(r"(?<![\w@])@(?:\{([^{}]+)\}|([^\s]+))", re.UNICODE)
@@ -860,7 +860,8 @@ def run_console(
             output(f"已恢复会话 {loaded.name!r}，包含 {len(loaded.turns)} 个安全轮次。")
             continue
         if command in {"/统计", "/stats"}:
-            context_tokens = agent.estimated_context_tokens()
+            estimates = agent.estimated_context_breakdown()
+            context_tokens = estimates["total"]
             percent = context_tokens * 100 / agent.token_budget
             stats = agent.usage
             provider_usage = (
@@ -868,11 +869,20 @@ def run_console(
                 if stats.provider_usage_reports
                 else "暂无提供商 usage 报告"
             )
+            provider_cache = (
+                f"{stats.provider_cached_prompt_reports} 次报告，共 {stats.provider_cached_prompt_tokens} tokens"
+                if stats.provider_cached_prompt_reports
+                else "暂无提供商缓存 usage 报告"
+            )
+            schema_count = len(TOOL_SCHEMAS)
             output(
                 f"当前上下文估算：{context_tokens} tokens（预算 {agent.token_budget}，约 {percent:.1f}%）\n"
+                f"稳定前缀独立估算（系统提示 + {schema_count} 项固定工具 schema）：{estimates['stable_prefix']} tokens\n"
+                f"会话消息独立估算：{estimates['conversation']} tokens；两个分项不相加，也不是缓存命中量\n"
                 f"累计请求：{stats.requests}\n"
                 f"累计估算输入/输出：{stats.estimated_input_tokens} / {stats.estimated_output_tokens} tokens\n"
                 f"提供商报告：{provider_usage}\n"
+                f"提供商缓存输入报告：{provider_cache}\n"
                 "估算使用本地字符启发式，不是 tokenizer 精确值；预算仅提示。"
             )
             continue
@@ -908,7 +918,9 @@ def run_console(
             output(
                 f"压缩预览：估算 {preview.before_tokens} → {preview.after_tokens} tokens；"
                 f"概括 {preview.summarized_turns} 轮、丢弃旧轮次 {preview.dropped_turns} 个"
-                f"（其中工具轮次 {preview.dropped_tool_turns} 个）。\n"
+                f"（其中工具轮次 {preview.dropped_tool_turns} 个）；摘要 {preview.summary_bytes} bytes，"
+                f"保留明确限制 {preview.preserved_constraint_count} 条，当前目标"
+                f"{'已纳入（敏感形态已脱敏）' if preview.goal_redacted else '已纳入' if preview.goal_preserved else '未设置'}。\n"
                 f"将加入以下不可信用户上下文：\n{_safe_terminal_text(summary)}"
             )
             try:

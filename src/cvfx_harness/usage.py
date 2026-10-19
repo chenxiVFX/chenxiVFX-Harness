@@ -16,6 +16,7 @@ class ProviderUsage:
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    cached_prompt_tokens: int | None = None
 
 
 @dataclass
@@ -26,6 +27,8 @@ class UsageStats:
     provider_usage_reports: int = 0
     provider_prompt_tokens: int = 0
     provider_completion_tokens: int = 0
+    provider_cached_prompt_reports: int = 0
+    provider_cached_prompt_tokens: int = 0
 
     def record_request(self, estimated_input_tokens: int) -> None:
         self.requests += 1
@@ -41,6 +44,9 @@ class UsageStats:
             self.provider_usage_reports += 1
             self.provider_prompt_tokens += provider_usage.prompt_tokens
             self.provider_completion_tokens += provider_usage.completion_tokens
+            if provider_usage.cached_prompt_tokens is not None:
+                self.provider_cached_prompt_reports += 1
+                self.provider_cached_prompt_tokens += provider_usage.cached_prompt_tokens
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -50,6 +56,8 @@ class UsageStats:
             "provider_usage_reports": self.provider_usage_reports,
             "provider_prompt_tokens": self.provider_prompt_tokens,
             "provider_completion_tokens": self.provider_completion_tokens,
+            "provider_cached_prompt_reports": self.provider_cached_prompt_reports,
+            "provider_cached_prompt_tokens": self.provider_cached_prompt_tokens,
         }
 
     @classmethod
@@ -63,6 +71,8 @@ class UsageStats:
             "provider_usage_reports",
             "provider_prompt_tokens",
             "provider_completion_tokens",
+            "provider_cached_prompt_reports",
+            "provider_cached_prompt_tokens",
         )
         if set(value) - set(fields):
             raise ValueError("usage counters contain unknown fields")
