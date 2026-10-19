@@ -46,14 +46,16 @@ def _fail(message: str) -> None:
 def _minimal_environment() -> dict[str, str]:
     system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
     temp_directory = os.environ.get("TEMP") or os.environ.get("TMP")
-    if not system_root or not temp_directory:
-        _fail("Windows runner 缺少 SystemRoot 或 TEMP")
+    user_profile = os.environ.get("USERPROFILE")
+    if not system_root or not temp_directory or not user_profile:
+        _fail("Windows runner 缺少系统目录、临时目录或用户目录")
     environment = {
         "PATH": str(Path(system_root) / "System32"),
         "SYSTEMROOT": system_root,
         "WINDIR": system_root,
         "TEMP": temp_directory,
         "TMP": temp_directory,
+        "USERPROFILE": user_profile,
         "PYTHONUTF8": "1",
         "PYTHONIOENCODING": "utf-8",
     }
