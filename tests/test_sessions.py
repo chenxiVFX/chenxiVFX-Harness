@@ -291,7 +291,7 @@ class CompressionTests(unittest.TestCase):
             self.assertEqual(before, after)
             self.assertEqual(
                 before,
-                ("read_file", "list_directory", "search_text", "write_file", "patch_file"),
+                ("ask_user", "read_file", "list_directory", "search_text", "write_file", "patch_file"),
             )
             self.assertEqual(agent.messages[0], {"role": "system", "content": SYSTEM_PROMPT})
 
@@ -802,6 +802,45 @@ class CompressionTests(unittest.TestCase):
 
 
 class DelegationTests(unittest.TestCase):
+    def test_subagent_cannot_request_user_input_and_reports_unsupported(self) -> None:
+        from cvfx_harness.subagents import build_delegation_plan, run_bounded_subagents
+
+        class UnexpectedQuestionProvider:
+            def __init__(self):
+                self.schemas = []
+
+            def complete_subagent(
+                self, messages, *, tools=None, timeout_seconds, max_output_tokens, cancellation_event
+            ):
+                del messages, timeout_seconds, max_output_tokens, cancellation_event
+                self.schemas.append(list(tools or []))
+                arguments = {"questions": [{"id": "q1", "question": "需要补充什么？"}]}
+                raw = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+                assistant = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "child-question",
+                        "type": "function",
+                        "function": {"name": "ask_user", "arguments": raw},
+                    }],
+                }
+                return AssistantTurn(
+                    "", [ToolCall("child-question", "ask_user", arguments)], assistant
+                )
+
+        provider = UnexpectedQuestionProvider()
+        outcome = run_bounded_subagents(
+            build_delegation_plan("完成只读合成子任务"),
+            provider,
+            approve_action=lambda _request: True,
+        )
+        result = outcome.results[0]
+        self.assertEqual(result.status, "failed")
+        self.assertIn("子代理不支持向用户提问", result.failure)
+        self.assertIn("主会话补充信息", result.failure)
+        self.assertNotIn("ask_user", [item["function"]["name"] for item in provider.schemas[0]])
+
     def test_delegation_plan_is_bounded_and_mock_execution_is_isolated(self) -> None:
         from cvfx_harness.subagents import DelegationPlanError, build_delegation_plan, run_bounded_subagents
 

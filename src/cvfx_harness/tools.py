@@ -18,6 +18,15 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
 from .providers import ProviderCancelled, ToolCall
+from .questions import (
+    QuestionnaireRequest,
+    QuestionnaireResult,
+    QuestionRequestError,
+    UserQuestionAnswer,
+    parse_questionnaire,
+    questionnaire_result_json,
+    validate_question_answers,
+)
 
 READ_LIMIT_BYTES = 64 * 1024
 WRITE_LIMIT_BYTES = 64 * 1024
@@ -78,6 +87,45 @@ _SENSITIVE_NAME_PART = re.compile(
 )
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user",
+            "description": (
+                "Ask the user one to three short clarifying questions. Each question may include a few suggested answers, "
+                "and the user may always write a free-form answer. This collects untrusted user data only; it never "
+                "approves file access, edits, tests, commands, or other actions. Do not ask for passwords, API keys, "
+                "tokens, secrets, or credentials; direct the user to /配置 or the supported environment settings instead. "
+                "A cancelled request has no answers and must not be guessed or treated as consent."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "maxLength": 32},
+                                "question": {"type": "string", "maxLength": 240},
+                                "suggestions": {
+                                    "type": "array",
+                                    "maxItems": 4,
+                                    "items": {"type": "string", "maxLength": 96},
+                                },
+                            },
+                            "required": ["id", "question"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["questions"],
+                "additionalProperties": False,
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -2655,8 +2703,69 @@ def run_tool(
     cancellation_event: Any | None = None,
     test_profile_store: Any | None = None,
     emit_output: Callable[[str], None] | None = None,
+    ask_user: Callable[[QuestionnaireRequest], QuestionnaireResult] | None = None,
 ) -> str:
     """Execute one validated tool; model output never grants local permission."""
+
+    if call.name == "ask_user":
+        _raise_if_cancelled(cancellation_event)
+        _validate_arguments(call, {"questions"})
+        try:
+            request = parse_questionnaire(call.arguments)
+        except QuestionRequestError as exc:
+            if exc.code == "credential_request":
+                if emit_output is not None:
+                    emit_output("已阻止通过提问收集凭据；请使用 /配置 或受支持的环境变量设置。")
+                return questionnaire_result_json(QuestionnaireResult("blocked_credential"))
+            return json.dumps(
+                {"status": "invalid_request", "answers": [], "message": "问题格式无效或超出限制；没有收集回答。"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        if ask_user is None:
+            return json.dumps(
+                {"status": "unavailable", "answers": [], "message": "当前界面不支持交互式提问；没有收集回答。"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        _raise_if_cancelled(cancellation_event)
+        try:
+            result = ask_user(request)
+            if not isinstance(result, QuestionnaireResult):
+                raise QuestionRequestError("invalid_request")
+            if result.status == "submitted":
+                if (
+                    not isinstance(result.answers, (tuple, list))
+                    or len(result.answers) != len(request.questions)
+                    or any(not isinstance(answer, UserQuestionAnswer) for answer in result.answers)
+                    or tuple(answer.question_id for answer in result.answers)
+                    != tuple(question.question_id for question in request.questions)
+                ):
+                    raise QuestionRequestError("invalid_request")
+                normalized = validate_question_answers(
+                    request,
+                    tuple(answer.answer for answer in result.answers),
+                )
+                result = QuestionnaireResult("submitted", normalized)
+            elif result.status != "cancelled" and result.status != "blocked_credential":
+                raise QuestionRequestError("invalid_request")
+        except QuestionRequestError as exc:
+            if exc.code == "credential_request":
+                if emit_output is not None:
+                    emit_output("已阻止提交疑似凭据；请使用 /配置 或受支持的环境变量设置。")
+                return questionnaire_result_json(QuestionnaireResult("blocked_credential"))
+            return json.dumps(
+                {"status": "invalid_response", "answers": [], "message": "回答格式无效；没有发送回答。"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        _raise_if_cancelled(cancellation_event)
+        if emit_output is not None:
+            if result.status == "submitted":
+                emit_output("已将本次用户回答交给当前模型；不会写入会话存档。")
+            elif result.status == "cancelled":
+                emit_output("已取消提问；没有提交回答。")
+        return questionnaire_result_json(result)
 
     if call.name == "read_file":
         _raise_if_cancelled(cancellation_event)

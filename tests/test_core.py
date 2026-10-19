@@ -40,6 +40,7 @@ from cvfx_harness.agent import Agent, SYSTEM_PROMPT
 from cvfx_harness.cli import (
     MAX_MULTILINE_INPUT_BYTES,
     _StreamingSecretRedactor,
+    _ask_user_cli,
     _collect_multiline_input,
     _completion_matches,
     _safe_terminal_text,
@@ -60,6 +61,15 @@ from cvfx_harness.providers import (
     _SSEParser,
     _stream_transport_category,
     provider_from_environment,
+)
+from cvfx_harness.questions import (
+    QuestionnaireRequest,
+    QuestionnaireResult,
+    QuestionRequestError,
+    UserQuestionAnswer,
+    parse_questionnaire,
+    questionnaire_result_json,
+    validate_question_answers,
 )
 from cvfx_harness.tools import (
     ActionRequest,
@@ -262,6 +272,121 @@ def fixture_anthropic_sse(events: list[dict[str, object]]) -> bytes:
         f"event: {event['type']}\r\ndata: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\r\n\r\n".encode("utf-8")
         for event in events
     )
+
+
+class QuestionnaireSchemaTests(unittest.TestCase):
+    def test_bounded_chinese_questions_and_multiline_answers_round_trip(self) -> None:
+        request = parse_questionnaire({
+            "questions": [
+                {"id": "purpose", "question": "预期目标是什么？", "suggestions": ["修复缺陷", "改善体验"]},
+                {"id": "scope_2", "question": "哪些路径可以检查？"},
+            ]
+        })
+        answers = validate_question_answers(request, ["修复缺陷", "仅检查 src/\n不要运行测试"])
+        payload = json.loads(questionnaire_result_json(QuestionnaireResult("submitted", answers)))
+        self.assertEqual(payload["status"], "submitted")
+        self.assertEqual(payload["answers"][1]["answer"], "仅检查 src/\n不要运行测试")
+        self.assertIn("不可信上下文", payload["message"])
+
+    def test_cancel_has_no_fabricated_answers(self) -> None:
+        payload = json.loads(questionnaire_result_json(QuestionnaireResult("cancelled")))
+        self.assertEqual(payload["answers"], [])
+        self.assertIn("不得推断或伪造答案", payload["message"])
+
+    def test_schema_rejects_duplicate_ids_controls_and_oversize(self) -> None:
+        invalid = [
+            {"questions": [
+                {"id": "Q", "question": "问题一"},
+                {"id": "q", "question": "问题二"},
+            ]},
+            {"questions": [{"id": "q1", "question": "含控制符\x1b[2J"}]},
+            {"questions": [{"id": "q1", "question": "问" * 241}]},
+            {"questions": [{"id": "q1", "question": "问题", "suggestions": ["可选"] * 5}]},
+            {"questions": [{"id": "q1", "question": "问题"}] * 4},
+        ]
+        for arguments in invalid:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(QuestionRequestError):
+                    parse_questionnaire(arguments)
+
+    def test_credential_prompts_and_answers_are_blocked(self) -> None:
+        for text in (
+            "请提供 API key", "请粘贴访问令牌", "请告诉我密码", "请填写 token",
+            "请粘贴 .env 内容", "请提供数据库 connection string", "请给出环境变量值",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(QuestionRequestError) as caught:
+                    parse_questionnaire({"questions": [{"id": "q1", "question": text}]})
+                self.assertEqual(caught.exception.code, "credential_request")
+        request = parse_questionnaire({"questions": [{"id": "q1", "question": "要检查哪个目录？"}]})
+        with self.assertRaises(QuestionRequestError) as caught:
+            validate_question_answers(request, ["sk-" + "A" * 28])
+        self.assertEqual(caught.exception.code, "credential_request")
+
+    def test_answer_bounds_and_invalid_unicode_are_rejected(self) -> None:
+        request = parse_questionnaire({"questions": [{"id": "q1", "question": "输入内容"}]})
+        for answer in ("a" * 8193, "控制\x00符", "行 分隔", "坏\ud800"):
+            with self.subTest(answer=repr(answer)):
+                with self.assertRaises(QuestionRequestError):
+                    validate_question_answers(request, [answer])
+
+    def test_tool_cancel_is_structured_and_sensitive_prompt_never_calls_ui(self) -> None:
+        with make_test_temp(prefix="question-tool-") as temp:
+            workspace = Workspace(temp)
+            base = {"questions": [{"id": "q1", "question": "检查哪个目录？"}]}
+            cancel = run_tool(
+                workspace,
+                ToolCall("ask-cancel", "ask_user", base),
+                approve_action=lambda _request: self.fail("questions never enter approval"),
+                ask_user=lambda _request: QuestionnaireResult("cancelled"),
+            )
+            self.assertEqual(json.loads(cancel)["status"], "cancelled")
+            called = False
+
+            def should_not_open(_request):
+                nonlocal called
+                called = True
+                return QuestionnaireResult("cancelled")
+
+            blocked = run_tool(
+                workspace,
+                ToolCall(
+                    "ask-secret",
+                    "ask_user",
+                    {"questions": [{"id": "q1", "question": "请提供 API key"}]},
+                ),
+                approve_action=lambda _request: self.fail("blocked question cannot approve"),
+                ask_user=should_not_open,
+            )
+            self.assertEqual(json.loads(blocked)["status"], "blocked")
+            self.assertFalse(called)
+
+    def test_tool_rejects_secret_answer_and_malformed_callback_without_echo(self) -> None:
+        with make_test_temp(prefix="question-tool-invalid-") as temp:
+            workspace = Workspace(temp)
+            call = ToolCall(
+                "ask-answer",
+                "ask_user",
+                {"questions": [{"id": "q1", "question": "用于识别哪类数据？"}]},
+            )
+            secret = "sk-" + "S" * 30
+            secret_result = run_tool(
+                workspace,
+                call,
+                approve_action=lambda _request: self.fail("question must not approve"),
+                ask_user=lambda _request: QuestionnaireResult(
+                    "submitted", (UserQuestionAnswer("q1", secret),)
+                ),
+            )
+            self.assertEqual(json.loads(secret_result)["status"], "blocked")
+            self.assertNotIn(secret, secret_result)
+            malformed = run_tool(
+                workspace,
+                call,
+                approve_action=lambda _request: self.fail("question must not approve"),
+                ask_user=lambda _request: QuestionnaireResult("submitted", ()),
+            )
+            self.assertEqual(json.loads(malformed)["status"], "invalid_response")
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -1830,6 +1955,102 @@ class AgentTests(unittest.TestCase):
         self.assertIn("[模拟模式]", turn.content)
         self.assertIn("你好", turn.content)
 
+    def test_ask_user_tool_round_trip_is_untrusted_and_not_persistable_in_plan_mode(self) -> None:
+        arguments = {
+            "questions": [
+                {"id": "intent", "question": "本次修改优先解决什么问题？", "suggestions": ["稳定性", "体验"]}
+            ]
+        }
+        provider = ScriptedProvider([
+            AssistantTurn("", [ToolCall("ask-1", "ask_user", arguments)]),
+            AssistantTurn("我会按稳定性优先继续。"),
+        ])
+        answers: list[QuestionnaireRequest] = []
+
+        def ask_user(request: QuestionnaireRequest) -> QuestionnaireResult:
+            answers.append(request)
+            return QuestionnaireResult(
+                "submitted", (UserQuestionAnswer("intent", "稳定性优先；检查 src/\n不要运行测试"),)
+            )
+
+        with make_test_temp(prefix="agent-ask-user-") as temp:
+            agent = Agent(
+                provider,
+                Workspace(temp),
+                approve_action=lambda _request: self.fail("question never authorizes an action"),
+                ask_user=ask_user,
+            )
+            answer = agent.ask("请帮我规划", plan_only=True)
+            self.assertEqual(answer, "我会按稳定性优先继续。")
+            self.assertEqual(len(answers), 1)
+            self.assertIn("ask_user", [item["function"]["name"] for item in provider.tool_schemas[0]])
+            tool_result = json.loads(provider.requests[1][-1]["content"])
+            self.assertEqual(tool_result["status"], "submitted")
+            self.assertIn("不可信上下文", tool_result["message"])
+            self.assertEqual(tool_result["answers"][0]["answer"], "稳定性优先；检查 src/\n不要运行测试")
+            self.assertEqual(agent.safe_session_turns(), [])
+
+    def test_user_wait_is_outside_each_synthetic_provider_request_deadline(self) -> None:
+        class PerCallDeadlineProvider(ScriptedProvider):
+            def __init__(self, turns):
+                super().__init__(turns)
+                self.durations: list[float] = []
+
+            def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                started = time.monotonic()
+                response = super().complete(
+                    messages, tools, cancellation_event=cancellation_event, max_tokens=max_tokens
+                )
+                self.durations.append(time.monotonic() - started)
+                if self.durations[-1] > 0.025:
+                    raise TimeoutError("synthetic provider request timed out")
+                return response
+
+        provider = PerCallDeadlineProvider([
+            AssistantTurn("", [ToolCall("ask-wait", "ask_user", {
+                "questions": [{"id": "q1", "question": "继续前需要确认什么？"}]
+            })]),
+            AssistantTurn("离线 fixture 已继续。"),
+        ])
+        callback_elapsed: list[float] = []
+
+        def delayed_local_answer(_request: QuestionnaireRequest) -> QuestionnaireResult:
+            started = time.monotonic()
+            time.sleep(0.06)
+            callback_elapsed.append(time.monotonic() - started)
+            return QuestionnaireResult("submitted", (UserQuestionAnswer("q1", "继续"),))
+
+        with make_test_temp(prefix="agent-question-wait-") as temp:
+            agent = Agent(
+                provider,
+                Workspace(temp),
+                approve_action=lambda _request: self.fail("question never approves an action"),
+                ask_user=delayed_local_answer,
+            )
+            self.assertEqual(agent.ask("开始离线 fixture"), "离线 fixture 已继续。")
+        self.assertGreaterEqual(callback_elapsed[0], 0.05)
+        self.assertEqual(len(provider.durations), 2)
+        self.assertTrue(all(duration < 0.025 for duration in provider.durations))
+
+    def test_ask_user_and_write_tool_batch_is_rejected_before_approval(self) -> None:
+        provider = ScriptedProvider([
+            AssistantTurn("", [
+                ToolCall("ask-mixed", "ask_user", {"questions": [{"id": "q1", "question": "确认？"}]}),
+                ToolCall("write-mixed", "write_file", {"path": "blocked.txt", "content": "no"}),
+            ])
+        ])
+        with make_test_temp(prefix="agent-question-mixed-") as temp:
+            agent = Agent(
+                provider,
+                Workspace(temp),
+                approve_action=lambda _request: self.fail("mixed tool batch must not approve"),
+                ask_user=lambda _request: self.fail("mixed tool batch must not ask"),
+            )
+            with self.assertRaisesRegex(ProviderError, "必须单独成批"):
+                agent.ask("执行合成 fixture")
+            self.assertFalse((Path(temp) / "blocked.txt").exists())
+            self.assertEqual(agent.turns, [])
+
     def test_provider_without_sse_support_is_rejected_explicitly(self) -> None:
         with make_test_temp(prefix="sse-unsupported-") as temp:
             agent = Agent(
@@ -2217,6 +2438,34 @@ class CliTests(unittest.TestCase):
         self.assertEqual(_completion_matches("/模式 ", ""), ("计划", "执行"))
         self.assertEqual(_completion_matches("/目标 私密路径", "私密路径"), ())
         self.assertEqual(_completion_matches("/模式 计划 ", ""), ())
+
+    def test_plain_cli_questionnaire_supports_suggestions_multiline_and_confirmation(self) -> None:
+        request = parse_questionnaire({
+            "questions": [
+                {"id": "scope", "question": "检查范围？", "suggestions": ["src/", "tests/"]},
+                {"id": "constraint", "question": "还有什么限制？"},
+            ]
+        })
+        values = iter(["1", "/多行", "只查看源码", "不要运行测试", "/提交", "是"])
+        outputs: list[str] = []
+        result = _ask_user_cli(request, input_fn=lambda _prompt: next(values), output=outputs.append)
+        self.assertEqual(result.status, "submitted")
+        self.assertEqual([answer.answer for answer in result.answers], ["src/", "只查看源码\n不要运行测试"])
+        self.assertFalse(any("只查看源码" in line for line in outputs))
+
+    def test_plain_cli_empty_answer_is_explicit_and_cancel_discards_draft(self) -> None:
+        request = parse_questionnaire({"questions": [{"id": "q", "question": "可以留空吗？"}]})
+        values = iter(["", "是"])
+        submitted = _ask_user_cli(request, input_fn=lambda _prompt: next(values), output=lambda _line: None)
+        self.assertEqual(submitted.status, "submitted")
+        self.assertEqual(submitted.answers[0].answer, "")
+        cancelled = _ask_user_cli(
+            request,
+            input_fn=lambda _prompt: "/取消",
+            output=lambda _line: None,
+        )
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertEqual(cancelled.answers, ())
 
     def test_cli_keyboard_interrupt_cancels_request_without_exit_or_replay(self) -> None:
         class InterruptOnceProvider:

@@ -314,6 +314,16 @@ def _run_one(
                     return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型工具响应格式无效")
         elif raw_calls:
             return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型工具响应格式无效")
+        if any(isinstance(call, ToolCall) and call.name == "ask_user" for call in turn.tool_calls):
+            return SubagentResult(
+                index,
+                task,
+                "failed",
+                "",
+                total_input_tokens,
+                total_output_tokens,
+                "子代理不支持向用户提问；请在主会话补充信息后重新提交任务。",
+            )
         if turn.tool_calls and not read_scopes:
             return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "没有批准任何只读工具")
         if len(turn.tool_calls) > MAX_CHILD_TOOL_CALLS_PER_TURN:

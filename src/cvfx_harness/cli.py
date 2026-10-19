@@ -38,6 +38,14 @@ from .providers import (
 )
 from .plans import MAX_PLAN_STEPS, MAX_STEP_CHARS, PlanDraft, PlanError, PlanSnapshot, PlanStore, PlanStatus
 from .profiles import TestProfileError, TestProfileStore
+from .questions import (
+    MAX_ANSWER_BYTES,
+    MAX_TOTAL_ANSWER_BYTES,
+    QuestionnaireRequest,
+    QuestionnaireResult,
+    QuestionRequestError,
+    validate_question_answers,
+)
 from .sessions import (
     SessionError,
     SessionStore,
@@ -518,6 +526,7 @@ def _help_text() -> str:
   /多行              开始多行提问；单独输入 /提交 发送，/取消 丢弃
   /退出              结束会话
 
+模型可在信息不足时使用结构化问卷询问 1–3 个非敏感问题；建议可选，用户可自由作答。TUI 按题编辑并审阅后显式提交，Esc 取消本问卷；Ctrl+C 取消当前模型请求。答案仅作为不可信上下文，不能授权任何操作，不会存入安全会话。疑似密钥、密码或 Token 请求会被阻止。
 文件引用：在提问中写 @相对路径，或用 @{包含空格的相对路径}。
 多行提问以换行符合并，最多 64 KiB UTF-8；Ctrl+C 或 /取消 会丢弃草稿，EOF 会结束会话且不提交。
 TTY 且提供 Python readline 时，Tab 补全命令名和固定选项（如 /模式 计划|执行）；不补路径、自由文本或凭据。输入历史（包括审批回答）不会保存或重放。
@@ -861,6 +870,86 @@ def _confirm_action(
     return True
 
 
+def _ask_user_cli(
+    request: QuestionnaireRequest,
+    *,
+    input_fn: Callable[[str], str],
+    output: Callable[[str], None],
+) -> QuestionnaireResult:
+    """Collect bounded plain-mode answers without echoing them into chat output."""
+    answers: list[str] = []
+    for question_index, question in enumerate(request.questions):
+        while True:
+            output(
+                f"\n模型提问 {question_index + 1}/{len(request.questions)}："
+                f"{_safe_untrusted_terminal_text(question.prompt)}"
+            )
+            if question.suggestions:
+                output("建议答案：\n" + "\n".join(
+                    f"  {index}. {_safe_untrusted_terminal_text(suggestion)}"
+                    for index, suggestion in enumerate(question.suggestions, 1)
+                ))
+            output("输入建议编号或自由回答；输入 /多行 可撰写多行，直接空行表示明确的空回答。")
+            try:
+                raw = input_fn("回答> ")
+            except EOFError:
+                return QuestionnaireResult("cancelled")
+            except KeyboardInterrupt:
+                raise
+            command = raw.strip()
+            if command in {"/取消", "/cancel", "/退出", "/exit"}:
+                return QuestionnaireResult("cancelled")
+            if command in {"/多行", "/multiline"}:
+                state, multiline = _collect_multiline_input(input_fn, output=output)
+                if state in {"cancelled", "eof"}:
+                    return QuestionnaireResult("cancelled")
+                if state == "too_large" or multiline is None:
+                    output(f"回答超过 {MAX_TOTAL_ANSWER_BYTES} bytes；请重新输入。")
+                    continue
+                answer = multiline
+            elif command.isdecimal() and question.suggestions:
+                selected = int(command)
+                if not 1 <= selected <= len(question.suggestions):
+                    output("建议编号无效；请重新回答。")
+                    continue
+                answer = question.suggestions[selected - 1]
+            else:
+                answer = raw
+            candidate = [*answers, answer] + [""] * (
+                len(request.questions) - question_index - 1
+            )
+            try:
+                validated = validate_question_answers(request, candidate)
+            except QuestionRequestError as exc:
+                if exc.code == "credential_request":
+                    output("检测到疑似凭据；回答未提交。请使用 /配置 或受支持的环境变量设置。")
+                else:
+                    output(
+                        f"回答含控制字符，或超过单题 {MAX_ANSWER_BYTES} bytes / "
+                        f"总计 {MAX_TOTAL_ANSWER_BYTES} bytes 限制；请重新输入。"
+                    )
+                continue
+            answers.append(validated[question_index].answer)
+            break
+
+    try:
+        confirmed = input_fn("\n确认将回答交给本轮模型？输入 是 确认，其余取消 > ")
+    except EOFError:
+        return QuestionnaireResult("cancelled")
+    except KeyboardInterrupt:
+        raise
+    if not _is_affirmative_answer(confirmed):
+        return QuestionnaireResult("cancelled")
+    try:
+        validated = validate_question_answers(request, answers)
+    except QuestionRequestError as exc:
+        if exc.code == "credential_request":
+            output("检测到疑似凭据；回答未提交。请使用 /配置 或受支持的环境变量设置。")
+            return QuestionnaireResult("blocked_credential")
+        return QuestionnaireResult("cancelled")
+    return QuestionnaireResult("submitted", validated)
+
+
 def run_console(
     args: argparse.Namespace,
     *,
@@ -868,6 +957,7 @@ def run_console(
     output: Callable[[str], None] = print,
     stream_write: Callable[[str], None] | None = None,
     cancellation_event: threading.Event | None = None,
+    ask_user_fn: Callable[[QuestionnaireRequest], QuestionnaireResult] | None = None,
 ) -> int:
     try:
         workspace = Workspace(args.workspace)
@@ -894,6 +984,9 @@ def run_console(
     approve_action = lambda request: _confirm_action(
         request, input_fn=input_fn, output=output
     )
+    ask_user_callback = ask_user_fn or (
+        lambda request: _ask_user_cli(request, input_fn=input_fn, output=output)
+    )
     test_profile_store = TestProfileStore(workspace)
     agent = Agent(
         provider,
@@ -904,6 +997,7 @@ def run_console(
         max_provider_requests=getattr(args, "max_model_requests", 4),
         test_profile_store=test_profile_store,
         emit_output=output,
+        ask_user=ask_user_callback,
     )
     subagent_manager = SubagentManager(
         provider,
@@ -1825,6 +1919,7 @@ def run_console(
                     lines = [
                         f"{item.task_id} [{item.status}] {_safe_terminal_text(item.task)}（限时 {item.timeout_seconds:g}s）"
                         + (f"（输出 {item.result.output_tokens} tokens）" if item.result else "")
+                        + (f"（{_safe_terminal_text(item.result.failure)}）" if item.result and item.result.failure else "")
                         + ("（已收取）" if item.collected else "")
                         for item in snapshots
                     ]

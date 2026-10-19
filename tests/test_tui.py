@@ -26,6 +26,7 @@ from wcwidth import wcswidth
 from cvfx_harness.cli import _StreamingSecretRedactor, _confirm_action, build_parser, run_console
 from cvfx_harness.profiles import TestProfileStore
 from cvfx_harness.providers import AssistantTurn, MockProvider, ProviderCancelled, ToolCall
+from cvfx_harness.questions import QuestionnaireRequest, QuestionnaireResult, UserQuestion, UserQuestionAnswer
 from cvfx_harness.tools import ActionRequest, Workspace
 from cvfx_harness.tui import CommandCompleter, TerminalUI, terminal_supports_tui
 
@@ -53,8 +54,10 @@ class PromptToolkitTests(unittest.TestCase):
 
             def sender() -> None:
                 try:
-                    if not ui._request_ready.wait(5):
-                        raise AssertionError("worker did not request input")
+                    self._wait_until(
+                        lambda: ui._request_ready.is_set() or ui._question_ready.is_set(),
+                        "worker did not request input or a questionnaire",
+                    )
                     send_keys(pipe, ui)
                 except BaseException as exc:
                     errors.append(exc)
@@ -87,6 +90,7 @@ class PromptToolkitTests(unittest.TestCase):
                 output=ui.output,
                 stream_write=ui.stream_write,
                 cancellation_event=ui.cancellation_event,
+                ask_user_fn=ui.ask_questions,
             )
 
         with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
@@ -218,7 +222,231 @@ class PromptToolkitTests(unittest.TestCase):
             self.assertIsInstance(ui._input_buffer.history, DummyHistory)
             self.assertEqual(list(ui._input_buffer.history.load_history_strings()), [])
             self.assertIsInstance(ui._application.clipboard, DummyClipboard)
+
+    def test_model_questionnaire_review_then_explicit_submit_is_not_transcribed(self) -> None:
+        class QuestionProvider:
+            label = "synthetic questionnaire fixture"
+            model = "offline"
+
+            def __init__(self):
+                self.calls = 0
+                self.requests = []
+
+            def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                del tools, cancellation_event, max_tokens
+                self.requests.append(list(messages))
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantTurn("", [ToolCall("ask-1", "ask_user", {
+                        "questions": [
+                            {"id": "priority", "question": "本次先关注哪一方面？", "suggestions": ["稳定性", "易用性"]},
+                            {"id": "scope", "question": "允许检查哪些目录？"},
+                            {"id": "optional", "question": "还有补充吗？（可以明确留空）"},
+                        ]
+                    })])
+                return AssistantTurn("已按用户本次回答继续。")
+
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-questionnaire-") as workspace:
+            provider = QuestionProvider()
+
+            def drive(pipe, ui: TerminalUI) -> None:
+                self._wait_until(lambda: ui._pending is not None, "initial prompt was not ready")
+                pipe.send_text("请协助安排工作")
+                pipe.send_bytes(b"\r")
+                self._wait_until(lambda: ui._question_pending is not None, "model question was not presented")
+                self.assertFalse(ui._question_reviewing)
+                ui._question_suggestion_buttons[0].handler()
+                self.assertEqual(ui._question_answer_area.text, "稳定性")
+                self.assertIsNotNone(ui._question_pending, "a suggestion click must only fill the draft")
+                ui._question_next_button.handler()
+                pipe.send_text("仅检查 src/")
+                pipe.send_bytes(b"\r\r")
+                pipe.send_bytes("\x1b[200~不要运行测试\x1b[201~".encode("utf-8"))
+                self._wait_until(
+                    lambda: ui._question_answer_area.text == "仅检查 src/\n\n不要运行测试",
+                    "Enter or bracketed paste did not preserve the multiline answer",
+                )
+                self.assertIsNotNone(ui._question_pending, "Enter and pasted text must not submit the questionnaire")
+                ui._question_next_button.handler()
+                self.assertEqual(ui._question_heading_text(), "模型提问 · 3/3")
+                self.assertEqual(ui._question_answer_area.text, "")
+                ui._question_review_button.handler()
+                self.assertTrue(ui._question_reviewing)
+                self.assertIn("稳定性", ui._question_review_area.text)
+                self.assertIn("\n\n不要运行测试", ui._question_review_area.text)
+                self.assertIn("（空回答）", ui._question_review_area.text)
+                self.assertNotIn("稳定性", ui._transcript)
+                self.assertNotIn("不要运行测试", ui._transcript)
+                self.assertNotIn("本次先关注哪一方面", ui._transcript)
+                self.assertTrue(ui._application.layout.has_focus(ui._question_edit_button))
+                pipe.send_bytes(b"\t")
+                self._wait_until(
+                    lambda: ui._application.layout.has_focus(ui._question_submit_button),
+                    "Tab did not focus explicit questionnaire submit",
+                )
+                pipe.send_bytes(b"\r")
+                self._wait_until(
+                    lambda: "已按用户本次回答继续。" in ui._transcript,
+                    "provider did not continue after explicit submit",
+                )
+                self.assertEqual(provider.calls, 2)
+                tool_result = json.loads(provider.requests[1][-1]["content"])
+                self.assertEqual(tool_result["status"], "submitted")
+                self.assertEqual(tool_result["answers"][0]["answer"], "稳定性")
+                self.assertEqual(tool_result["answers"][1]["answer"], "仅检查 src/\n\n不要运行测试")
+                self.assertEqual(tool_result["answers"][2]["answer"], "")
+                self.assertNotIn("稳定性", ui._transcript)
+                self.assertNotIn("不要运行测试", ui._transcript)
+                pipe.send_text("/退出")
+                pipe.send_bytes(b"\r")
+
+            ui, rc = self._run_cli_ui(workspace, provider, drive)
+            from prompt_toolkit.clipboard import DummyClipboard
+            from prompt_toolkit.history import DummyHistory
+
+            self.assertEqual(rc, 0)
+            self.assertIsInstance(ui._question_answer_area.buffer.history, DummyHistory)
+            self.assertIsInstance(ui._application.clipboard, DummyClipboard)
+            self.assertEqual(list(ui._question_answer_area.buffer.history.load_history_strings()), [])
+
+    def test_questionnaire_escape_returns_cancelled_empty_answers_and_resumes_prompt(self) -> None:
+        class CancelQuestionProvider:
+            label = "synthetic cancellation fixture"
+            model = "offline"
+
+            def __init__(self):
+                self.calls = 0
+                self.requests = []
+
+            def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                del tools, cancellation_event, max_tokens
+                self.requests.append(list(messages))
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantTurn("", [ToolCall("ask-cancel", "ask_user", {
+                        "questions": [{"id": "detail", "question": "需要澄清的合成问题是什么？"}]
+                    })])
+                return AssistantTurn("收到取消结果，等待后续输入。")
+
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-question-cancel-") as workspace:
+            provider = CancelQuestionProvider()
+
+            def drive(pipe, ui: TerminalUI) -> None:
+                self._wait_until(lambda: ui._pending is not None, "initial prompt was not ready")
+                pipe.send_text("开始询问")
+                pipe.send_bytes(b"\r")
+                self._wait_until(lambda: ui._question_pending is not None, "question panel was not shown")
+                pipe.send_text("本地草稿不要发送")
+                pipe.send_bytes(b"\x1b")
+                self._wait_until(
+                    lambda: "收到取消结果，等待后续输入。" in ui._transcript
+                    and ui._pending is not None,
+                    "cancellation did not return to regular chat input",
+                )
+                self.assertNotIn("本地草稿不要发送", ui._transcript)
+                self.assertNotIn("需要澄清的合成问题是什么", ui._transcript)
+                tool_result = json.loads(provider.requests[1][-1]["content"])
+                self.assertEqual(tool_result["status"], "cancelled")
+                self.assertEqual(tool_result["answers"], [])
+                self.assertIn("不得推断或伪造答案", tool_result["message"])
+                pipe.send_text("/退出")
+                pipe.send_bytes(b"\r")
+
+            ui, rc = self._run_cli_ui(workspace, provider, drive)
+            self.assertEqual(rc, 0)
+            self.assertEqual(provider.calls, 2)
+
+    def test_ctrl_c_cancels_model_round_and_returns_to_chat_input(self) -> None:
+        class OneQuestionProvider:
+            label = "synthetic ctrl-c fixture"
+            model = "offline"
+            calls = 0
+
+            def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                del messages, tools, cancellation_event, max_tokens
+                self.calls += 1
+                return AssistantTurn("", [ToolCall("ask-c-c", "ask_user", {
+                    "questions": [{"id": "q", "question": "临时合成提问"}]
+                })])
+
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-question-ctrl-c-") as workspace:
+            provider = OneQuestionProvider()
+
+            def drive(pipe, ui: TerminalUI) -> None:
+                self._wait_until(lambda: ui._pending is not None, "initial prompt was not ready")
+                pipe.send_text("开始")
+                pipe.send_bytes(b"\r")
+                self._wait_until(lambda: ui._question_pending is not None, "question panel was not shown")
+                pipe.send_bytes(b"\x03")
+                self._wait_until(
+                    lambda: "已取消当前模型请求" in ui._transcript and ui._pending is not None,
+                    "Ctrl+C did not cancel the model round and resume chat",
+                )
+                self.assertNotIn("临时合成提问", ui._transcript)
+                pipe.send_text("/退出")
+                pipe.send_bytes(b"\r")
+
+            ui, rc = self._run_cli_ui(workspace, provider, drive)
+            self.assertEqual(rc, 0)
+            self.assertEqual(provider.calls, 1)
             self.assertEqual(ui._application.clipboard.get_data().text, "")
+
+    def test_questionnaire_panel_and_status_fit_narrow_terminal(self) -> None:
+        class SizedDummyOutput(DummyOutput):
+            def get_size(self):
+                return Size(rows=14, columns=46)
+
+        request = QuestionnaireRequest(questions=(
+            UserQuestion("scope", "這是一段用來檢查窄終端換行的合成問題？", ("src/", "tests/")),
+        ))
+        results = []
+
+        def worker(ui: TerminalUI) -> int:
+            results.append(ui.ask_questions(request))
+            return 0
+
+        def drive(pipe, ui: TerminalUI) -> None:
+            self._wait_until(lambda: ui._question_pending is not None, "questionnaire panel was not shown")
+            self._wait_until(
+                lambda: ui._application.renderer.last_rendered_screen is not None,
+                "questionnaire did not render",
+            )
+            time.sleep(0.03)
+            screen = ui._application.renderer.last_rendered_screen
+            self.assertIsNotNone(screen)
+            positions = screen.visible_windows_to_write_positions
+            heading = positions.get(ui._question_heading)
+            prompt = positions.get(ui._question_prompt_area.window)
+            answer = positions.get(ui._question_answer_area.window)
+            status = positions.get(ui._status_window)
+            self.assertIsNotNone(heading)
+            self.assertIsNotNone(prompt)
+            self.assertIsNotNone(answer)
+            self.assertIsNotNone(status)
+            self.assertLess(heading.ypos, prompt.ypos)
+            self.assertLess(prompt.ypos, answer.ypos)
+            self.assertLess(answer.ypos, status.ypos)
+            self.assertEqual(status.ypos, 13)
+            suggestion = ui._question_suggestion_buttons[0]
+            self._wait_until(
+                lambda: suggestion.window.render_info is not None,
+                "suggested answer button was not rendered for mouse input",
+            )
+            render_info = suggestion.window.render_info
+            assert render_info is not None
+            click_x = render_info._x_offset + 2
+            click_y = render_info._y_offset + 1
+            pipe.send_bytes(f"\x1b[<0;{click_x};{click_y}M\x1b[<0;{click_x};{click_y}m".encode())
+            self._wait_until(
+                lambda: ui._question_answer_area.text == "src/",
+                "mouse click did not fill the suggested answer",
+            )
+            self.assertIsNotNone(ui._question_pending, "mouse click must not submit an answer")
+            ui._question_cancel()
+
+        ui, rc = self._run_ui(worker, drive, output=SizedDummyOutput())
+        self.assertEqual(rc, 0)
+        self.assertEqual(results, [QuestionnaireResult("cancelled")])
 
     def test_tui_plan_proposal_review_revision_and_acceptance_loop(self) -> None:
         from cvfx_harness.plans import PlanStore

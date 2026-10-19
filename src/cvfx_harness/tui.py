@@ -32,6 +32,13 @@ from prompt_toolkit.widgets import Button, TextArea
 from wcwidth import wcswidth
 
 from .profiles import TestProfileError, TestProfileStore
+from .questions import (
+    MAX_TOTAL_ANSWER_BYTES,
+    QuestionnaireRequest,
+    QuestionnaireResult,
+    QuestionRequestError,
+    validate_question_answers,
+)
 from .sessions import (
     SessionError,
     SessionStore,
@@ -356,6 +363,14 @@ class _InputRequest:
     error: BaseException | None = None
 
 
+@dataclass
+class _QuestionRequest:
+    request: QuestionnaireRequest
+    completed: threading.Event
+    result: QuestionnaireResult | None = None
+    error: BaseException | None = None
+
+
 class TerminalUI:
     """Full-screen prompt_toolkit shell around the existing synchronous CLI loop."""
 
@@ -372,6 +387,11 @@ class TerminalUI:
         self._output = output
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._pending: _InputRequest | None = None
+        self._queued_question: _QuestionRequest | None = None
+        self._question_pending: _QuestionRequest | None = None
+        self._question_index = 0
+        self._question_answers: list[str] = []
+        self._question_reviewing = False
         self._worker_thread: threading.Thread | None = None
         self._worker_started = False
         self._worker_done = False
@@ -379,6 +399,7 @@ class TerminalUI:
         self._cancel_event = threading.Event()
         self._cancel_requested = False
         self._request_ready = threading.Event()
+        self._question_ready = threading.Event()
         self._status = "启动中"
         self._notice = ""
         self._resetting_input = False
@@ -410,7 +431,10 @@ class TerminalUI:
         self._input_buffer.on_text_changed += self._on_input_text_changed
         self._input_area_container = ConditionalContainer(
             self.input_area,
-            Condition(lambda: self._pending is None or not self._pending.approval),
+            Condition(
+                lambda: self._question_pending is None
+                and (self._pending is None or not self._pending.approval)
+            ),
         )
         self._empty_title_window = Window(
             FormattedTextControl("准备就绪"),
@@ -494,6 +518,82 @@ class TerminalUI:
             ),
             Condition(lambda: bool(self._approval_text)),
         )
+        self._question_heading = Window(
+            FormattedTextControl(lambda: self._question_heading_text()),
+            height=1,
+            style="class:approval.heading",
+        )
+        self._question_prompt_area = TextArea(
+            text="",
+            multiline=True,
+            read_only=True,
+            focusable=False,
+            wrap_lines=True,
+            scrollbar=False,
+            height=Dimension(min=2, max=4),
+            style="class:approval",
+        )
+        self._question_answer_area = TextArea(
+            text="",
+            multiline=True,
+            history=DummyHistory(),
+            wrap_lines=True,
+            focus_on_click=True,
+            height=Dimension(min=2, max=4),
+            style="class:input",
+        )
+        self._question_answer_area.buffer.on_text_changed += self._on_question_text_changed
+        self._question_review_area = TextArea(
+            text="",
+            multiline=True,
+            read_only=True,
+            focusable=True,
+            wrap_lines=True,
+            scrollbar=True,
+            height=Dimension(min=3, max=7),
+            style="class:approval",
+        )
+        self._question_review_area.window.right_margins = [
+            ScrollbarMargin(display_arrows=False)
+        ]
+        self._question_suggestion_buttons = [
+            Button("", handler=lambda index=index: self._fill_question_suggestion(index))
+            for index in range(4)
+        ]
+        self._question_prev_button = Button("上一题", handler=self._question_previous, width=12)
+        self._question_next_button = Button("下一题", handler=self._question_next, width=12)
+        self._question_review_button = Button("查看回答", handler=self._question_show_review, width=14)
+        self._question_cancel_button = Button("取消提问", handler=self._question_cancel, width=14)
+        self._question_edit_button = Button("返回修改", handler=self._question_edit, width=14)
+        self._question_submit_button = Button("提交回答", handler=self._question_submit, width=14)
+        self._question_input_container = ConditionalContainer(
+            HSplit(
+                [
+                    self._question_heading,
+                    self._question_prompt_area,
+                    self._question_suggestion_row(),
+                    self._question_answer_area,
+                    VSplit(
+                        [self._question_prev_button, self._question_next_button,
+                         self._question_review_button, self._question_cancel_button],
+                        padding=1,
+                    ),
+                ]
+            ),
+            Condition(lambda: self._question_pending is not None and not self._question_reviewing),
+        )
+        self._question_review_container = ConditionalContainer(
+            HSplit(
+                [
+                    Window(FormattedTextControl("审阅本次回答 · 不会自动提交"), height=1,
+                           style="class:approval.heading"),
+                    self._question_review_area,
+                    VSplit([self._question_edit_button, self._question_submit_button,
+                            self._question_cancel_button], padding=1),
+                ]
+            ),
+            Condition(lambda: self._question_pending is not None and self._question_reviewing),
+        )
         self._completion_menu = CompletionsMenu(max_height=6, scroll_offset=1)
         self._completion_window = self._completion_menu.content
         self._completion_menu_row = ConditionalContainer(
@@ -532,6 +632,9 @@ class TerminalUI:
                 self._input_bottom_separator,
             ]
         )
+        self._input_block_container = ConditionalContainer(
+            input_block, Condition(lambda: self._question_pending is None)
+        )
         content = HSplit(
             [
                 Window(
@@ -542,7 +645,9 @@ class TerminalUI:
                 self._conversation_body,
                 self._completion_menu_row,
                 self._approval_container,
-                input_block,
+                self._question_input_container,
+                self._question_review_container,
+                self._input_block_container,
                 self._status_window,
             ]
         )
@@ -577,6 +682,19 @@ class TerminalUI:
             raise EOFError()
         return request.value
 
+    def ask_questions(self, request: QuestionnaireRequest) -> QuestionnaireResult:
+        pending = _QuestionRequest(request, threading.Event())
+        self._queued_question = pending
+        self._events.put(("questions", pending))
+        cancel_queued = False
+        while not pending.completed.wait(0.05):
+            if self._cancel_event.is_set() and not cancel_queued:
+                self._events.put(("question_cancel", pending))
+                cancel_queued = True
+        if pending.error is not None:
+            raise pending.error
+        return pending.result or QuestionnaireResult("cancelled")
+
     def output(self, text: str) -> None:
         self._events.put(("output", text))
 
@@ -602,6 +720,12 @@ class TerminalUI:
         finally:
             if self._pending is not None:
                 self._resolve_pending(error=KeyboardInterrupt())
+            if self._question_pending is not None:
+                self._finish_questionnaire(error=KeyboardInterrupt())
+            elif self._queued_question is not None:
+                self._queued_question.error = KeyboardInterrupt()
+                self._queued_question.completed.set()
+                self._queued_question = None
             self._cancel_event.set()
             if self._worker_thread.is_alive():
                 self._worker_thread.join(timeout=2)
@@ -677,6 +801,23 @@ class TerminalUI:
                     )
                     self._pending = value
                     self._request_ready.set()
+                elif kind == "questions" and isinstance(value, _QuestionRequest):
+                    if self._queued_question is value:
+                        self._queued_question = None
+                    self._question_pending = value
+                    self._question_index = 0
+                    self._question_answers = [""] * len(value.request.questions)
+                    self._question_reviewing = False
+                    self._question_answer_area.text = ""
+                    self._question_review_area.text = ""
+                    self._question_set_current()
+                    self._status = "等待回答"
+                    self._notice = "建议答案只会填入草稿；查看回答后还需明确提交。"
+                    self._application.layout.focus(self._question_answer_area)
+                    self._question_ready.set()
+                elif kind == "question_cancel" and isinstance(value, _QuestionRequest):
+                    if self._question_pending is value:
+                        self._finish_questionnaire(error=KeyboardInterrupt())
                 elif kind == "done":
                     self._worker_result = value if type(value) is int else 2
                     self._worker_done = True
@@ -693,6 +834,12 @@ class TerminalUI:
 
         @bindings.add("enter", eager=True)
         def submit(event) -> None:
+            if self._question_pending is not None:
+                if event.app.layout.has_focus(self._question_answer_area):
+                    self._question_answer_area.buffer.insert_text("\n")
+                else:
+                    self._activate_question_focused_button()
+                return
             if self._pending is not None and (
                 event.app.layout.has_focus(self.input_area)
                 or event.app.layout.has_focus(self._approval_no_button)
@@ -708,6 +855,9 @@ class TerminalUI:
 
         @bindings.add("tab", eager=True)
         def accept_completion(event) -> None:
+            if self._question_pending is not None:
+                self._focus_question_control(forward=True)
+                return
             if self._pending is None:
                 return
             if self._pending is not None and self._pending.approval:
@@ -726,8 +876,25 @@ class TerminalUI:
                 if completion_state is not None and completion_state.current_completion is not None:
                     buffer.apply_completion(completion_state.current_completion)
 
+        @bindings.add("s-tab", eager=True)
+        def previous_question_control(event) -> None:
+            if self._question_pending is not None:
+                self._focus_question_control(forward=False)
+                return
+
         @bindings.add("up", eager=True)
         def previous_completion(event) -> None:
+            if self._question_pending is not None:
+                if event.app.layout.has_focus(self._question_answer_area):
+                    self._question_answer_area.buffer.cursor_up()
+                elif (
+                    self._question_reviewing
+                    and event.app.layout.has_focus(self._question_review_area)
+                ):
+                    self._question_review_area.buffer.cursor_up()
+                else:
+                    self._focus_question_control(forward=False)
+                return
             if self._pending is None:
                 return
             if self._pending is not None and self._pending.approval:
@@ -743,6 +910,17 @@ class TerminalUI:
 
         @bindings.add("down", eager=True)
         def next_completion(event) -> None:
+            if self._question_pending is not None:
+                if event.app.layout.has_focus(self._question_answer_area):
+                    self._question_answer_area.buffer.cursor_down()
+                elif (
+                    self._question_reviewing
+                    and event.app.layout.has_focus(self._question_review_area)
+                ):
+                    self._question_review_area.buffer.cursor_down()
+                else:
+                    self._focus_question_control(forward=True)
+                return
             if self._pending is None:
                 return
             if self._pending is not None and self._pending.approval:
@@ -758,6 +936,9 @@ class TerminalUI:
 
         @bindings.add("escape", eager=True)
         def escape(event) -> None:
+            if self._question_pending is not None:
+                self._question_cancel()
+                return
             buffer = self._input_buffer
             if buffer.complete_state is not None:
                 buffer.cancel_completion()
@@ -769,6 +950,11 @@ class TerminalUI:
 
         @bindings.add("c-c", eager=True)
         def clear_or_cancel(event) -> None:
+            if self._question_pending is not None:
+                self._cancel_requested = True
+                self._cancel_event.set()
+                self._finish_questionnaire(error=KeyboardInterrupt())
+                return
             buffer = self._input_buffer
             if buffer.text:
                 buffer.text = ""
@@ -781,6 +967,10 @@ class TerminalUI:
 
         @bindings.add("c-j", eager=True)
         def insert_newline(event) -> None:
+            if self._question_pending is not None:
+                if not self._question_reviewing:
+                    self._question_answer_area.buffer.insert_text("\n")
+                return
             if self._pending is None:
                 self._notice = "后台生成期间已暂停输入。"
                 return
@@ -796,11 +986,25 @@ class TerminalUI:
 
         @bindings.add("pageup", eager=True)
         def scroll_output_up(event) -> None:
+            if (
+                self._question_pending is not None
+                and self._question_reviewing
+                and event.app.layout.has_focus(self._question_review_area)
+            ):
+                self._question_review_area.buffer.cursor_up(count=4)
+                return
             if self._input_buffer.complete_state is None:
                 self._move_output_cursor(-max(2, self.output_area.window.height.preferred or 10))
 
         @bindings.add("pagedown", eager=True)
         def scroll_output_down(event) -> None:
+            if (
+                self._question_pending is not None
+                and self._question_reviewing
+                and event.app.layout.has_focus(self._question_review_area)
+            ):
+                self._question_review_area.buffer.cursor_down(count=4)
+                return
             if self._input_buffer.complete_state is None:
                 self._move_output_cursor(max(2, self.output_area.window.height.preferred or 10))
 
@@ -814,6 +1018,10 @@ class TerminalUI:
 
     def _on_input_text_changed(self, buffer) -> None:
         if buffer.text:
+            self._notice = ""
+
+    def _on_question_text_changed(self, buffer) -> None:
+        if buffer.text and self._question_pending is not None:
             self._notice = ""
 
     def _accept_completion_or_submit(self) -> bool:
@@ -1052,13 +1260,229 @@ class TerminalUI:
             "批准（当前）" if self._approval_choice_yes else "批准本次"
         )
 
+    def _question_suggestion_row(self):
+        rows = []
+        for start in (0, 2):
+            buttons = []
+            for index in range(start, start + 2):
+                buttons.append(
+                    ConditionalContainer(
+                        self._question_suggestion_buttons[index],
+                        Condition(
+                            lambda index=index: self._question_has_suggestion(index)
+                        ),
+                    )
+                )
+            rows.append(VSplit(buttons, padding=1))
+        return HSplit(rows)
+
+    def _question_has_suggestion(self, index: int) -> bool:
+        pending = self._question_pending
+        if pending is None or not 0 <= self._question_index < len(pending.request.questions):
+            return False
+        return index < len(pending.request.questions[self._question_index].suggestions)
+
+    def _question_heading_text(self) -> str:
+        pending = self._question_pending
+        if pending is None:
+            return ""
+        return f"模型提问 · {self._question_index + 1}/{len(pending.request.questions)}"
+
+    def _focus_question_control(self, *, forward: bool) -> None:
+        pending = self._question_pending
+        if pending is None:
+            return
+        if self._question_reviewing:
+            controls = [
+                self._question_review_area,
+                self._question_edit_button,
+                self._question_submit_button,
+                self._question_cancel_button,
+            ]
+        else:
+            suggestions = pending.request.questions[self._question_index].suggestions
+            controls = [self._question_answer_area]
+            controls.extend(self._question_suggestion_buttons[: len(suggestions)])
+            controls.extend(
+                [
+                    self._question_prev_button,
+                    self._question_next_button,
+                    self._question_review_button,
+                    self._question_cancel_button,
+                ]
+            )
+        current = next(
+            (index for index, control in enumerate(controls)
+             if self._application.layout.has_focus(control)),
+            -1 if forward else 0,
+        )
+        next_index = (current + (1 if forward else -1)) % len(controls)
+        self._application.layout.focus(controls[next_index])
+
+    def _question_set_current(self) -> None:
+        pending = self._question_pending
+        if pending is None:
+            return
+        question = pending.request.questions[self._question_index]
+        self._question_prompt_area.text = _safe_text(question.prompt)
+        try:
+            columns = self._application.output.get_size().columns
+        except (AttributeError, NotImplementedError, OSError):
+            columns = 80
+        suggestion_width = max(8, min(30, (columns - 4) // 2 - 4))
+        for index, button in enumerate(self._question_suggestion_buttons):
+            if index < len(question.suggestions):
+                button.text = (
+                    f"{index + 1}. "
+                    f"{_truncate_cells(_safe_text(question.suggestions[index]), suggestion_width)}"
+                )
+            else:
+                button.text = ""
+        self._question_answer_area.text = self._question_answers[self._question_index]
+        self._question_answer_area.buffer.cursor_position = len(self._question_answer_area.text)
+
+    def _question_save_current(self) -> None:
+        if self._question_pending is not None and not self._question_reviewing:
+            self._question_answers[self._question_index] = self._question_answer_area.text
+
+    def _fill_question_suggestion(self, index: int) -> None:
+        pending = self._question_pending
+        if pending is None or not self._question_has_suggestion(index):
+            return
+        self._question_answer_area.text = pending.request.questions[
+            self._question_index
+        ].suggestions[index]
+        self._question_answer_area.buffer.cursor_position = len(self._question_answer_area.text)
+        self._question_answers[self._question_index] = self._question_answer_area.text
+        self._application.layout.focus(self._question_answer_area)
+        self._notice = "建议已填入草稿；检查后再审阅和提交。"
+
+    def _question_previous(self) -> None:
+        if self._question_pending is None:
+            return
+        self._question_save_current()
+        if self._question_index > 0:
+            self._question_index -= 1
+            self._question_set_current()
+        self._application.layout.focus(self._question_answer_area)
+
+    def _question_next(self) -> None:
+        pending = self._question_pending
+        if pending is None:
+            return
+        self._question_save_current()
+        if self._question_index + 1 < len(pending.request.questions):
+            self._question_index += 1
+            self._question_set_current()
+        else:
+            self._question_show_review()
+
+    def _question_show_review(self) -> None:
+        if self._question_pending is None:
+            return
+        self._question_save_current()
+        self._question_reviewing = True
+        entries = []
+        for question, answer in zip(
+            self._question_pending.request.questions, self._question_answers
+        ):
+            display_answer = _safe_text(answer) if answer else "（空回答）"
+            entries.append(
+                f"{question.question_id} · {_safe_text(question.prompt)}\n回答：{display_answer}"
+            )
+        self._question_review_area.text = "\n\n".join(entries)
+        self._application.layout.focus(self._question_edit_button)
+        self._notice = "检查全部回答；只有按“提交回答”才会发送给本轮模型。"
+
+    def _question_edit(self) -> None:
+        if self._question_pending is None:
+            return
+        self._question_reviewing = False
+        self._question_set_current()
+        self._application.layout.focus(self._question_answer_area)
+
+    def _question_submit(self) -> None:
+        if self._question_pending is None:
+            return
+        self._question_save_current()
+        try:
+            answers = validate_question_answers(
+                self._question_pending.request, self._question_answers
+            )
+        except QuestionRequestError as exc:
+            if exc.code == "credential_request":
+                self._notice = "检测到疑似凭据；回答未提交，请使用 /配置 或受支持的环境变量。"
+                self._finish_questionnaire(
+                    QuestionnaireResult("blocked_credential")
+                )
+            else:
+                self._notice = f"回答无效或超过 {MAX_TOTAL_ANSWER_BYTES} bytes 上限；请返回修改。"
+            return
+        self._finish_questionnaire(QuestionnaireResult("submitted", answers))
+
+    def _question_cancel(self) -> None:
+        if self._question_pending is not None:
+            self._finish_questionnaire(QuestionnaireResult("cancelled"))
+
+    def _finish_questionnaire(
+        self,
+        result: QuestionnaireResult | None = None,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        pending = self._question_pending
+        if pending is None:
+            return
+        pending.result = result
+        pending.error = error
+        self._question_pending = None
+        self._question_answers = []
+        self._question_index = 0
+        self._question_reviewing = False
+        self._question_answer_area.text = ""
+        self._question_prompt_area.text = ""
+        self._question_review_area.text = ""
+        self._question_ready.clear()
+        self._queued_question = None
+        self._question_reviewing = False
+        if error is not None:
+            self._notice = "提问已取消；本轮模型请求已中止。"
+        elif result is not None and result.status == "cancelled":
+            self._notice = "已取消提问；没有提交回答。"
+        elif result is not None and result.status == "blocked_credential":
+            self._notice = "检测到疑似凭据；回答未提交，请使用 /配置 或受支持的环境变量。"
+        else:
+            self._notice = "回答已提交给本轮模型，作为不可信上下文。"
+        self._status = "运行中"
+        self._application.layout.focus(self.input_area)
+        pending.completed.set()
+
+    def _activate_question_focused_button(self) -> None:
+        buttons = [*self._question_suggestion_buttons,
+                   self._question_prev_button, self._question_next_button,
+                   self._question_review_button, self._question_cancel_button,
+                   self._question_edit_button, self._question_submit_button]
+        for button in buttons:
+            if self._application.layout.has_focus(button):
+                button.handler()
+                return
+
     def _status_line(self) -> str:
         try:
             columns = self._application.output.get_size().columns
         except (AttributeError, NotImplementedError, OSError):
             columns = 80
 
-        if self._notice:
+        if self._question_pending is not None:
+            if self._question_reviewing:
+                line = "回答审阅 · ↑↓查看 · Tab切换 · Enter激活 · Esc取消"
+            elif columns >= 48:
+                line = "回答问题 · Enter换行 · Tab切换 · 查看回答后提交 · Esc取消"
+            else:
+                line = "回答 · Enter换行 · Esc取消"
+            if self._notice:
+                line = self._notice
+        elif self._notice:
             line = f"{self._status}  ·  {self._notice}"
         elif self._pending is None and not self._worker_done:
             line = "生成中  ·  Ctrl+C 取消"
@@ -1104,6 +1528,7 @@ def run_tui_console(args) -> int | None:
             output=ui.output,
             stream_write=ui.stream_write,
             cancellation_event=ui.cancellation_event,
+            ask_user_fn=ui.ask_questions,
         )
 
     try:
