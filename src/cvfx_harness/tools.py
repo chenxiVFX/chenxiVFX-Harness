@@ -637,12 +637,15 @@ def run_tool(
             raise WorkspaceError("审批后目录路径发生变化；列表读取已取消。")
         entries: list[dict[str, str]] = []
         scanned = 0
+        scan_truncated = False
         try:
             with os.scandir(target) as iterator:
                 for entry in iterator:
-                    scanned += 1
-                    if scanned > DIRECTORY_SCAN_LIMIT:
+                    _raise_if_cancelled(cancellation_event)
+                    if scanned >= DIRECTORY_SCAN_LIMIT:
+                        scan_truncated = True
                         break
+                    scanned += 1
                     name = entry.name
                     if name in {".", ".."} or any(
                         unicodedata.category(char).startswith("C") for char in name
@@ -656,12 +659,19 @@ def run_tool(
                         workspace.resolve(relative)
                     except (WorkspaceError, ValueError):
                         continue
-                    kind = "directory" if entry.is_dir(follow_symlinks=False) else "file"
+                    if entry.is_dir(follow_symlinks=False):
+                        kind = "directory"
+                    elif entry.is_file(follow_symlinks=False):
+                        kind = "file"
+                    else:
+                        continue
                     entries.append({"name": name, "type": kind})
+                    _raise_if_cancelled(cancellation_event)
         except OSError as exc:
             raise WorkspaceError(f"无法列出目录：{type(exc).__name__}") from None
+        _raise_if_cancelled(cancellation_event)
         entries.sort(key=lambda item: (item["name"].casefold(), item["name"]))
-        truncated = len(entries) > DIRECTORY_ENTRY_LIMIT or scanned > DIRECTORY_SCAN_LIMIT
+        truncated = len(entries) > DIRECTORY_ENTRY_LIMIT or scan_truncated
         result = {
             "path": "." if target == workspace.root else target.relative_to(workspace.root).as_posix(),
             "entries": entries[:DIRECTORY_ENTRY_LIMIT],

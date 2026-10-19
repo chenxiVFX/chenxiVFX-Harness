@@ -235,7 +235,12 @@ class CompressionTests(unittest.TestCase):
                 ),
                 AssistantTurn("读取完成。", assistant_message={"role": "assistant", "content": "读取完成。"}),
             ])
-            agent = Agent(provider, Workspace(temp), approve_action=lambda _request: True)
+            agent = Agent(
+                provider,
+                Workspace(temp),
+                approve_action=lambda _request: True,
+                max_output_tokens=8192,
+            )
             agent.ask("第一轮：" + "长中文" * 300)
             agent.ask("第二轮：" + "更多中文" * 300)
             agent.ask("第三轮工具调用")
@@ -271,7 +276,12 @@ class CompressionTests(unittest.TestCase):
                 AssistantTurn("tool result sentinel" * 30, assistant_message={"role": "assistant", "content": "tool result sentinel" * 30}),
                 AssistantTurn("最近答复" * 200, assistant_message={"role": "assistant", "content": "最近答复" * 200}),
             ])
-            agent = Agent(provider, Workspace(temp), approve_action=lambda _request: True)
+            agent = Agent(
+                provider,
+                Workspace(temp),
+                approve_action=lambda _request: True,
+                max_output_tokens=8192,
+            )
             agent.ask("旧轮次" * 300)
             agent.ask("旧工具轮次")
             agent.ask("新轮次" * 300)
@@ -287,7 +297,12 @@ class CompressionTests(unittest.TestCase):
                 AssistantTurn("回答" * 400, assistant_message={"role": "assistant", "content": "回答" * 400}),
                 AssistantTurn("回答" * 400, assistant_message={"role": "assistant", "content": "回答" * 400}),
             ])
-            agent = Agent(provider, Workspace(temp), approve_action=lambda _request: True)
+            agent = Agent(
+                provider,
+                Workspace(temp),
+                approve_action=lambda _request: True,
+                max_output_tokens=8192,
+            )
             agent.ask("第一个问题" * 250)
             agent.ask("第二个问题" * 250)
             preview = agent.preview_compression(keep_recent_turns=1)
@@ -308,7 +323,7 @@ class CompressionTests(unittest.TestCase):
             ])
             inputs = iter(["问题甲" * 300, "问题乙" * 300, "问题丙" * 300, "/压缩 1", "n", "问题丁", "/退出"])
             outputs: list[str] = []
-            args = SimpleNamespace(workspace=temp, provider="mock", model=None)
+            args = SimpleNamespace(workspace=temp, provider="mock", model=None, max_output_tokens=8192)
             with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
                 rc = run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append)
             self.assertEqual(rc, 0)

@@ -246,7 +246,14 @@ class WorkspaceTests(unittest.TestCase):
         (self.root / "资料").mkdir()
         (self.root / "资料" / "文档.txt").write_text("正文不能出现在列表", encoding="utf-8")
         (self.root / "资料" / ".env").write_text("SECRET_SENTINEL", encoding="utf-8")
+        (self.root / "资料" / ".aws").mkdir()
+        (self.root / "资料" / ".git").mkdir()
+        (self.root / "资料" / "credentials").mkdir()
+        (self.root / "资料" / "api_key.txt").write_text("ANOTHER_SECRET_SENTINEL", encoding="utf-8")
         (self.root / "资料" / ".harness").mkdir()
+        (self.root / "资料" / "普通目录").mkdir()
+        if hasattr(os, "mkfifo"):
+            os.mkfifo(self.root / "资料" / "pipe-node")
         approvals: list[ActionRequest] = []
         result = run_tool(
             self.workspace,
@@ -256,9 +263,15 @@ class WorkspaceTests(unittest.TestCase):
         parsed = json.loads(result)
         self.assertEqual(approvals[0].operation, "list")
         self.assertEqual(parsed["path"], "资料")
-        self.assertEqual(parsed["entries"], [{"name": "文档.txt", "type": "file"}])
+        self.assertEqual(parsed["entries"], [
+            {"name": "文档.txt", "type": "file"},
+            {"name": "普通目录", "type": "directory"},
+        ])
         self.assertNotIn("正文不能出现在列表", result)
         self.assertNotIn("SECRET_SENTINEL", result)
+        self.assertNotIn("ANOTHER_SECRET_SENTINEL", result)
+        for hidden_name in (".aws", ".git", "credentials", "api_key.txt", "pipe-node"):
+            self.assertNotIn(hidden_name, result)
         self.assertFalse((self.root / ".harness").exists())
 
         denied = run_tool(
@@ -280,6 +293,54 @@ class WorkspaceTests(unittest.TestCase):
         ))
         self.assertEqual(len(bounded["entries"]), 100)
         self.assertTrue(bounded["truncated"])
+
+    def test_directory_listing_scans_at_most_one_thousand_entries(self) -> None:
+        many = self.root / "many"
+        many.mkdir()
+        for index in range(1005):
+            (many / f"file-{index:04d}.txt").touch()
+
+        checked: list[Path] = []
+        original = Workspace._is_reparse_point
+
+        def count_children(path: Path) -> bool:
+            if path.parent == many:
+                checked.append(path)
+            return original(path)
+
+        with patch.object(Workspace, "_is_reparse_point", side_effect=count_children):
+            result = json.loads(run_tool(
+                self.workspace,
+                ToolCall("list-cap", "list_directory", {"path": "many"}),
+                approve_action=self.approve(),
+            ))
+
+        self.assertEqual(len(checked), 1000)
+        self.assertEqual(len(result["entries"]), 100)
+        self.assertTrue(result["truncated"])
+
+    def test_cancel_during_directory_scan_stops_before_return(self) -> None:
+        folder = self.root / "during-scan"
+        folder.mkdir()
+        child = folder / "item.txt"
+        child.touch()
+        event = threading.Event()
+        original = Workspace._is_reparse_point
+
+        def cancel_after_child_check(path: Path) -> bool:
+            result = original(path)
+            if path == child:
+                event.set()
+            return result
+
+        with patch.object(Workspace, "_is_reparse_point", side_effect=cancel_after_child_check):
+            with self.assertRaises(ProviderCancelled):
+                run_tool(
+                    self.workspace,
+                    ToolCall("list-cancel", "list_directory", {"path": "during-scan"}),
+                    approve_action=self.approve(),
+                    cancellation_event=event,
+                )
 
     def test_directory_listing_blocks_traversal_sensitive_paths_and_malicious_args(self) -> None:
         approvals: list[ActionRequest] = []
@@ -557,6 +618,7 @@ class AgentTests(unittest.TestCase):
                 Workspace(temp),
                 approve_action=self._approval(approvals),
                 max_output_tokens=512,
+                max_provider_requests=2,
             )
             self.assertEqual(agent.ask("读取 a.txt"), "分析完成")
             self.assertEqual(approvals[0].operation, "read")
@@ -564,8 +626,73 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(provider.requests[1][-1]["role"], "tool")
             self.assertEqual(provider.requests[1][-1]["tool_call_id"], "call-1")
             self.assertEqual(provider.requests[1][-1]["content"], "approved body")
-            self.assertEqual(provider.max_token_history[0], 512)
-            self.assertLess(provider.max_token_history[1], 512)
+            self.assertEqual(provider.max_token_history, [256, 256])
+
+    def test_missing_usage_reserves_request_budget_and_caps_request_count(self) -> None:
+        with make_test_temp() as temp:
+            provider = ScriptedProvider([
+                AssistantTurn("", [ToolCall("list-1", "list_directory", {"path": "."})]),
+                AssistantTurn("已列出合成目录。"),
+            ])
+            agent = Agent(
+                provider,
+                Workspace(temp),
+                approve_action=self._approval([]),
+                max_output_tokens=512,
+                max_provider_requests=2,
+            )
+
+            answer = agent.ask("列出目录并总结")
+
+        self.assertEqual(answer, "已列出合成目录。")
+        self.assertEqual(provider.max_token_history, [256, 256])
+        self.assertEqual(len(provider.requests), 2)
+        self.assertEqual(agent.usage.provider_usage_reports, 0)
+        self.assertEqual(agent.usage.estimated_output_tokens, 512)
+
+    def test_missing_usage_overlong_response_fails_before_tool_approval(self) -> None:
+        with make_test_temp() as temp:
+            provider = ScriptedProvider([
+                AssistantTurn(
+                    "x" * 2000,
+                    [ToolCall("list-too-long", "list_directory", {"path": "."})],
+                )
+            ])
+            agent = Agent(
+                provider,
+                Workspace(temp),
+                approve_action=lambda _request: self.fail("over-budget response must not prompt"),
+                max_output_tokens=512,
+                max_provider_requests=2,
+            )
+
+            with self.assertRaisesRegex(ProviderError, "超过本地输出预算"):
+                agent.ask("列出目录")
+
+        self.assertEqual(provider.max_token_history, [256])
+        self.assertEqual(agent.turns, [])
+
+    def test_malformed_provider_usage_fails_closed_before_tool_approval(self) -> None:
+        with make_test_temp() as temp:
+            provider = ScriptedProvider([
+                AssistantTurn(
+                    "",
+                    [ToolCall("list-bad-usage", "list_directory", {"path": "."})],
+                    usage="not-a-usage-object",  # type: ignore[arg-type]
+                )
+            ])
+            agent = Agent(
+                provider,
+                Workspace(temp),
+                approve_action=lambda _request: self.fail("invalid usage must fail before approval"),
+                max_output_tokens=512,
+                max_provider_requests=2,
+            )
+
+            with self.assertRaisesRegex(ProviderError, "用量报告格式无效"):
+                agent.ask("列出目录")
+
+        self.assertEqual(agent.turns, [])
 
     def test_duplicate_or_malformed_tool_calls_stop_before_any_approval(self) -> None:
         cases = [
@@ -608,7 +735,7 @@ class AgentTests(unittest.TestCase):
             with self.assertRaisesRegex(ProviderError, "超过本地输出预算"):
                 agent.ask("寫入文件")
             self.assertFalse(target.exists())
-            self.assertEqual(too_large.max_token_history, [20])
+            self.assertEqual(too_large.max_token_history, [5])
             self.assertEqual(agent.turns, [])
 
         with make_test_temp() as temp:
@@ -621,6 +748,7 @@ class AgentTests(unittest.TestCase):
                 Workspace(temp),
                 approve_action=lambda _request: self.fail("no output budget remains for tool execution"),
                 max_output_tokens=exact_budget,
+                max_provider_requests=1,
             )
             answer = agent.ask("寫入文件")
             self.assertIn("输出上限", answer)

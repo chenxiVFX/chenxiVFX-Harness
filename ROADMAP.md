@@ -6,9 +6,10 @@
 | --- | --- | --- |
 | Windows 中文 CLI、帮助与 UTF-8 | 已实现 / 离线可测 | PowerShell 启动脚本、中文命令、UTF-8 I/O；Windows Python 3.13 本机运行 |
 | Mock provider | 已实现 / 离线可测 | 默认离线，不发请求、不读密钥 |
-| OpenAI 兼容 Chat Completions | 已实现 / 离线可测 | stdlib HTTP、`reasoning_content` 工具往返、usage、`max_tokens` 上限、429 不重试、脱敏错误和边界取消；真实 API 仅完成无工具的基本 smoke，工具往返未测 |
-| DeepSeek API key 读取 | 已实现 / 离线可测 | OpenAI 模式读取 `DEEPSEEK_API_KEY`，只允许 HTTPS `api.deepseek.com:443`；Mock 不查询该值，配置页不显示。独立 smoke 已有限验证 Network secret 的基本认证对话通路；工具请求仍未在线验证 |
+| OpenAI 兼容 Chat Completions | 已实现 / 离线可测 | stdlib HTTP、`reasoning_content` 工具往返、usage、`max_tokens` 上限、429 不重试、脱敏错误和边界取消；无工具基础 smoke 与合成只读目录工具闭环已有限在线验证；其他产品路径仍未验收 |
+| DeepSeek API key 读取 | 已实现 / 离线可测 | OpenAI 模式读取 `DEEPSEEK_API_KEY`，只允许 HTTPS `api.deepseek.com:443`；Mock 不查询该值，配置页不显示。Network secret 的基本对话与合成目录只读工具闭环均已有限在线验证；其他工具与完整产品流程仍未验收 |
 | 受限真实 DeepSeek smoke | 已完成（有限验收） | 独立新环境通过 `api.deepseek.com:443` 的网络 secret 代理，以 `deepseek-flash` 发起一次、128-token 上限、无工具的合成请求；HTTP 200，答复“连接成功”，usage 输入 36 / 输出 43 / 总计 79。只证明认证与基本对话通路，不证明多轮工具闭环 |
+| 受限真实目录工具闭环 | 已完成（有限验收） | 两次 `api.deepseek.com:443` / `deepseek-flash` 请求，单次 `max_tokens=256`、合计上限 512；仅批准合成 `synthetic/hello.txt` 的只读列表，HTTP 200×2，usage 输入 1022 / 输出 82 / 总计 1104；不代表完整产品通过 |
 | Anthropic provider / 更多供应商 | 待实现 | 尚无独立协议适配；当前用户要求的 `deepseek-flash` 只配置了兼容接口 |
 | 多轮工具循环 | 已实现 / 离线可测 | 最多 4 轮、每轮最多执行 4 项，回填工具结果；重复调用编号、格式错误或超预算时关闭当前轮次 |
 | 工作区文件引用、目录列表与读写 | 已实现 / 离线可测 | 目录只返回名称/类型且逐次批准；文件读取与写入逐次批准；路径和敏感路径检查、写入差异预览与撤销备份 |
@@ -17,7 +18,7 @@
 | 目标模式 | 已实现（有限） | 目标仅作为不可信上下文；没有计划编排或权限变化 |
 | 安全会话保存/恢复 | 已实现 / 离线可测 | `.harness/sessions/`；默认存安全完整轮次；`/检查点` 另存用户手写脱敏摘要，预览确认后才保存；不复制工具结果 |
 | 可审核上下文压缩 | 已实现 / 离线可测 | 本地确定性摘要，用户确认后应用；不可信 `user` 消息，工具/引用/敏感轮次不概括 |
-| Token / 预算统计 | 已实现 / 离线可测 | 上下文预算只提示；每次提问的输出预算按轮次累计并传入 provider `max_tokens`，同时用估算与可选 provider usage 报告检查 |
+| Token / 预算统计 | 已实现 / 离线可测 | 上下文预算只提示；每次提问的输出预算按请求槽预留并传入 provider `max_tokens`，usage 缺失时仍保证各请求上限之和不超过预算 |
 | Cache-friendly 稳定前缀 | 部分实现 | 静态 system prompt 和固定工具 schema；没有缓存命中率承诺，也未测远端缓存 |
 | 子代理 | 已实现 / 离线可测（Mock 限定） | 最多 3 项、逐项工具层批准；独立输入、一次调用、输入/输出预算、5 秒超时和取消；无工具/递归；结果标为不可信 |
 | PTC（Programmatic Tool Calling） | 待实现 / 术语假设 | 暂按“模型组合调用工具/程序化工具调用”记录；未实现脚本或工具执行链 |

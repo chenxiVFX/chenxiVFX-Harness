@@ -51,7 +51,7 @@ python -m pip install -e .
 
 `/压缩` 会展示旧对话摘要和估算变化，用户确认后才修改上下文。最近轮次作为完整消息组保留，工具调用和对应结果不会被拆开；较旧工具轮次可以在预览确认后丢弃，但不会被概括。摘要始终作为带不可信标记的 `user` 消息，不能提升为系统指令。系统提示和工具 schema 的顺序保持固定，便于缓存友好的稳定前缀；程序不声称或保证任何缓存命中率。
 
-Token 数由本地字符启发式估算，不是提供商 tokenizer 的精确数值。`--token-budget`（默认 16384）和 `/预算` 只是上下文提示；`--max-output-tokens`（默认 2048）为单次提问的所有模型回复共享输出预算，兼容 provider 每轮收到尚余的 `max_tokens`，本地也会用估算值和 provider usage 报告值阻止超额响应继续触发工具。字符估算不是 provider tokenizer，不能保证远端计量精确。提供商若返回 usage，统计会同时显示这些报告值；当前不计算金额或推测动态价格。启动参数示例：`.\run.ps1 --token-budget 32000 --max-output-tokens 2048`。
+Token 数由本地字符启发式估算，不是提供商 tokenizer 的精确数值。`--token-budget`（默认 16384）和 `/预算` 只是上下文提示；`--max-output-tokens`（默认 2048）为单次提问的所有模型回复共享输出预算，默认最多 4 次模型请求；每次请求按剩余预算和剩余请求数分配 `max_tokens`。如果 provider 没有返回 usage，会保守扣除该请求的完整分配额度，避免字符估算低估累计输出。每次请求的完整 `max_tokens` 额度都会预留，保证各请求上限之和不超过总预算；usage 用于统计和检查单次上限。超出单次请求上限的响应不会继续触发工具。字符估算不是 provider tokenizer，不能保证远端计量精确。提供商若返回 usage，统计会同时显示这些报告值；当前不计算金额或推测动态价格。启动参数示例：`.\run.ps1 --token-budget 32000 --max-output-tokens 2048`。
 
 委派计划最多列 3 项，每项在工具审批层分别展示并确认；子代理只收到对应任务文字，不继承主会话或文件/工具结果。每个子代理有独立消息、输入/输出预算、超时和取消事件，只运行一次无工具调用的 Mock provider；深度为 0，Shell 关闭。失败、超时、取消和预算耗尽分别汇总，结果带不可信标记。OpenAI provider 当前不支持子代理执行。目标模式目前也只是把用户目标作为上下文，不授予模型额外权限。
 
@@ -61,14 +61,14 @@ Token 数由本地字符启发式估算，不是提供商 tokenizer 的精确数
 
 本地 CLI 尚无隐藏输入界面；若直接使用普通环境变量，原值会进入 Harness 进程。若以后要在 Codex Cloud 使用 DeepSeek，用户可自行在该环境的 **Network secrets** 中添加变量 `DEEPSEEK_API_KEY`，Allowed domains 设为 `api.deepseek.com`。[Codex Cloud 官方说明](https://learn.chatgpt.com/docs/environments/cloud-environments)指出，Network secret 会以 placeholder 交给程序，并由代理在允许目标的 HTTPS 443 请求中替换原值，不把原始值放入本地进程或文件；普通 Environment variable 的值对 task 可见。保存环境改动后需要 Republish 并新建 task。网络密钥须使用自己的 Key，不能与同名直接环境变量冲突。
 
-此前离线回归只用合成值和本机回环 HTTP 服务测试协议行为，没有读取或配置密钥。独立新环境已由用户确认完成一次受限 DeepSeek smoke：`api.deepseek.com:443`、`deepseek-flash`、`max_tokens=128`、无工具的合成短文本；HTTP 200，返回“连接成功”，usage 输入 36、输出 43、合计 79。该结果只证明网络 secret 代理下的认证和基本对话可用，不代表工具调用往返已在线验收；本轮没有重复请求或接触凭据。HTTP 429 不自动重试；适配器只统计 provider 返回的 Token usage，不核算费用。取消信号会在发送前和收到响应后检查；标准库阻塞中的 HTTP 请求只能由配置的超时结束，不能保证即时中断。
+离线回归使用合成数据和本机 HTTP fixture。另一次无工具 DeepSeek smoke 返回 HTTP 200 和“连接成功”（usage 输入 36、输出 43、总计 79）。本轮在全新临时目录完成了有限真实工具闭环：向 `api.deepseek.com:443` 的 `deepseek-flash` 发出 2 次请求，单次 `max_tokens` 为 256、合计上限 512；模型仅获 `list_directory` schema，并获准列出 `synthetic/hello.txt`，两次 HTTP 均为 200，usage 输入 1022、输出 82、合计 1104。只传了合成提示和列表结果，没有发送仓库或用户文件；这只验证了该受限路径，不代表完整产品或其他工具已通过。HTTP 429 不自动重试；适配器只统计 provider 返回的 Token usage，不核算费用。取消信号会在发送前和收到响应后检查；标准库阻塞中的 HTTP 请求只能由配置的超时结束，不能保证即时中断。
 
 ## 权限与边界
 
 - 文件工具只接受工作区内相对路径；拒绝绝对路径、UNC、ADS、父目录遍历、敏感路径、reparse point 和可识别的硬链接逃逸。只读目录工具逐次审批、限制扫描量和返回条目数、不跟随目录链接。
 - 文件读取、引用、目录列表、写入和撤销均由本地执行代码逐次检查；每次都要人工确认。写入前显示差异，确认后写入 Harness 撤销备份。
 - 模型输出、文件内容、工具结果、目标文本和历史摘要都是不可信数据，不能修改权限规则。未知工具一律拒绝。
-- 单次提问最多 4 轮模型回复、每轮最多执行 4 个工具调用、每个模型响应最多接收 16 个调用；输出预算默认 2048 个估算/报告 tokens，由兼容 provider 的 `max_tokens` 和本地响应检查共同约束。重复调用编号、格式错误参数或超过预算的响应会在任何工具执行前终止当前轮次。
+- 单次提问最多 4 轮模型回复、每轮最多执行 4 个工具调用、每个模型响应最多接收 16 个调用；输出预算默认 2048 个 provider completion tokens。按剩余请求槽分配每次 `max_tokens`；缺少 usage 时完整扣除该请求额度。重复调用编号、格式错误参数或超过单次额度的响应会在任何工具执行前终止当前轮次。
 - 当前没有 shell、通用命令执行、隔离 worktree、PTC 执行、可调用文件工具的子代理或 Anthropic provider；子代理只支持隔离的一次性 Mock 请求。
 - Windows 路径/中文文件的普通读写测试在本机通过。受当前系统策略限制，junction、symlink、hard link 逃逸集成测试未实际创建链接验证；不因测试而更改系统安全设置。
 
