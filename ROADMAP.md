@@ -11,8 +11,8 @@
 | 有界 SSE 中文流式交互 | 已实现 / 离线可测 | UTF-8 跨块、CRLF/LF 与多行 data；最多 4 MiB 响应、2 MiB 助手文本、512 KiB 行/事件、16,384 个事件、120 秒；固定安全分类/阶段/HTTP 状态/字节数/耗时；loopback CONNECT/TLS 代理路径有合成 fixture；工具调用累积并完整校验后沿用 Agent 审批循环；未完成流不执行工具 |
 | DeepSeek Anthropic 兼容 Messages API | 已实现 / 离线可测 | 独立 `deepseek-anthropic` provider，固定 `https://api.deepseek.com/anthropic/v1/messages`、仅 DeepSeek 模型与 `DEEPSEEK_API_KEY`；有界 Anthropic SSE、签名 thinking 保留、工具往返沿用 Agent 审批；远端事件与 usage 未在线验证，不接官方 Claude |
 | DeepSeek API key 读取 | 已实现 / 离线可测 | 两种 DeepSeek provider 在所选模式下读取 `DEEPSEEK_API_KEY`，只允许 HTTPS `api.deepseek.com:443`；Anthropic 兼容模式另限 `/anthropic` 并拒绝重定向。Mock 不查询密钥，配置页不显示；既有 OpenAI 通路曾有限在线验证，Anthropic 兼容通路只做离线 fixture |
-| 受限真实 DeepSeek smoke | 已完成（有限验收） | 独立新环境通过 `api.deepseek.com:443` 的网络 secret 代理，以 `deepseek-flash` 发起一次、128-token 上限、无工具的合成请求；HTTP 200，答复“连接成功”，usage 输入 36 / 输出 43 / 总计 79。只证明认证与基本对话通路，不证明多轮工具闭环 |
-| 受限真实目录工具闭环 | 已完成（有限验收） | 两次 `api.deepseek.com:443` / `deepseek-flash` 请求，单次 `max_tokens=256`、合计上限 512；仅批准合成 `synthetic/hello.txt` 的只读列表，HTTP 200×2，usage 输入 1022 / 输出 82 / 总计 1104；不代表完整产品通过 |
+| 受限真实 DeepSeek smoke | 已完成（有限验收） | 合成提示的无工具连接测试成功；只证明认证与基本对话通路，不证明多轮工具闭环。真实调用用量单独跟踪 |
+| 受限真实目录工具闭环 | 已完成（有限验收） | 只读目录工具在合成工作区的受限路径测试成功；仅验证该授权路径，不代表完整产品通过。真实调用用量单独跟踪 |
 | 多轮工具循环 | 已实现 / 离线可测 | 最多 4 轮、每轮最多执行 4 项，回填工具结果；重复调用编号、格式错误或超预算时关闭当前轮次 |
 | 工作区文件引用、目录列表与读写 | 已实现 / 离线可测 | 模型写入复用现有预览/审批/备份/撤销；新建/覆盖分别标识，每项独立确认；UTF-8 文本≤64 KiB，拒绝清空/删除、控制字符二进制、敏感/链接/越界路径；批准后再次核对并原子替换 |
 | junction / symlink / hard link 逃逸 | 部分实现 / 跨平台 CI 通过 | Linux 默认运行 symlink / hard link 集成用例；Windows 运行 junction 与可创建的 symlink / hard link 用例；Windows 系统策略拒绝 fixture 时会明确跳过 |
@@ -55,7 +55,7 @@
 - 工具结果按调用编号回填；DeepSeek `reasoning_content` 在下一轮请求中保留。末轮工具请求不执行，并回填未执行状态。
 - 使用本地模拟 provider、stub HTTP 与临时工作区完成离线覆盖；未调用真实模型、未读取或配置任何密钥。
 - Debian / Python 3 环境：`compileall` 通过；`python3 -m unittest discover -s tests -v` 共 60 项，57 项通过，3 项 Windows 链接集成测试跳过，无失败。Windows Python 3.13 未运行。
-- 真实 DeepSeek smoke 在独立新环境已由用户确认完成：一次 128-token 上限、无工具的合成短请求成功返回固定中文答复；本轮没有再次调用真实 API，也没有接触凭据。工具调用往返仍只有离线 fixture 覆盖。
+- 真实 DeepSeek smoke 在独立新环境已由用户确认完成：无工具的合成短请求成功返回固定中文答复；本轮没有再次调用真实 API，也没有接触凭据。工具调用往返仍只有离线 fixture 覆盖。
 
 ## 当前恢复点
 
@@ -92,7 +92,7 @@
 - Ctrl+C 取消当前输入/多行草稿/模型请求并回到提示符；EOF 结束会话，多行未提交时丢弃，审批输入 EOF 默认拒绝。非 TTY 可逐行脚本化，不会等待额外终端交互。
 - 文件引用继续支持 `@{含空格的相对路径}`，多行内容中同样适用；读取和写入仍逐项审批。
 - 回归覆盖真实 CLI subprocess（脚本化 Unicode、多行、带空格文件路径、取消、EOF）和 POSIX PTY（Tab、Ctrl+C、无输入历史）；Windows 的 PTY 功能不适用，跨平台 subprocess 用例由 CI 执行。测试不等同于完整产品验收。
-- 本地 Debian / Python 3.12：136 项，135 通过、1 项 Windows-only junction 跳过；editable install 自检、`compileall`、UTF-8 Mock CLI 与 `git diff --check` 通过。此次真实 API 请求为 0，未读取凭据；使用已知 1222 + 未知预留 629 账本，未作调整。
+- 本地 Debian / Python 3.12：136 项，135 通过、1 项 Windows-only junction 跳过；editable install 自检、`compileall`、UTF-8 Mock CLI 与 `git diff --check` 通过。此次真实 API 请求为 0，未读取凭据；真实调用用量单独跟踪。
 
 ## 跨平台安装与离线 CI（2026-10-19）
 
@@ -122,7 +122,7 @@
 - 新增 loopback HTTP fixture 与纯解析器用例，涵盖跨字节中文、工具往返、截断不审批、错误脱敏、大小/时间上限和取消；fixture 不含 Authorization 头。未访问真实模型或读取配置凭据。
 - Debian / Python 3.12：`python -m unittest discover -s tests -v` 共 90 项，89 通过、1 项 Windows-only junction 跳过；`compileall`、editable install、安装自检及 `git diff --check` 通过。
 - 当前工作树未调用真实模型 API、未读取环境凭据；SSE HTTP 用例只访问本机 loopback，且不发送 Authorization 头。代码提交 `cf6d4401e26c0ba988b7551a69c52656f2ce0030` 的四矩阵 GitHub Actions 均以 `completed / success` 结束（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39206980429)）。
-- 真实 API 用量账本（父任务累计）：历史已用 1,222 tokens（79 + 1,104 + 39）；本轮预分配上限 20,000，实际请求 0 次、失败 0 次、用量 0；累计仍为 1,222 / 2,000,000，余 1,998,778。未读取凭据或 Network secret。
+- 本轮离线工作没有真实 API 请求，未读取凭据或 Network secret；真实调用用量单独跟踪。
 
 ## 用户自编计划步骤（2026-10-19）
 
@@ -150,7 +150,7 @@
 
 - 旧 5 秒是 provider 校验与 manager 默认共同构成的硬上限，不是单纯测试设置。现改为默认 60 秒、用户可设 5–120 秒；每任务总 deadline 从首个 provider 请求开始，逐项审批和执行前队列不计入。单个 SSE 请求默认 45 秒总时限，可设 5–120 秒；`--max-model-requests` 限定每次提问最多 1–4 次，无自动重试。CLI 和审批预览显示实际时限与计时边界；已提交任务不随新设置改变。
 - 子代理共享输入预算实际按本地 token 估算在每次发送前预留，跨任务上限 3072；失败调用仍保留输入预留。输出上限在获批时每项预留 256、总计 768；provider 有 usage 时用其 completion 数校验，usage 缺失时按完整输出额度保守保留。它不是精确的 provider tokenizer 计费。
-- 受限真实验收只尝试了 1 个 `deepseek-flash` SSE 请求，`api.deepseek.com:443`、`max_tokens=128`、单请求总时限 45 秒。CLI 收到“SSE 网络读取失败”，没有获得 usage；按本地输入估算 501 加 128 输出上限，保守记账 629 / 20,000，剩余 19,371。按 usage 缺失即停止的规则，没有重试或继续发出文件/子代理请求；因此中文流式答复、合成文件写回与字节读回、真实 provider 子代理均未通过验收。此次无法判定远端实际扣费或故障根因；临时工作区已清理。未读取或输出密钥值。
+- 受限服务诊断曾返回“SSE 网络读取失败”，没有获得 usage；按未完成响应即停止规则，没有重试或继续发出文件/子代理请求。因此中文流式答复、合成文件写回与字节读回、真实 provider 子代理均未通过该项验收，故障原因未确认。临时工作区已清理；真实调用用量单独跟踪。未读取或输出密钥值。
 - Linux / Python 3.12 本地离线回归：121 项，120 通过、1 项 Windows-only junction 跳过，另有 70 个子测试通过；包括时限、审批不计时、失败输出额度预留、取消与 SSE 超时 fixture。安装自检、UTF-8 CLI Mock、自测与 `git diff --check` 通过。结果不等同完整产品验收。
 
 ## SSE 网络诊断与 CONNECT/TLS 离线回归（2026-10-19）
@@ -161,7 +161,7 @@
 - fixture 找到并修复一处可复现的分类 bug：解析分块后进入下一次读取时，阶段标签未从 `sse_parse` 复位，因而总时限耗尽会被误报为解析错误。此前那次真实 SSE 失败没有阶段诊断，本轮未重放，所以它的根因仍未知。
 - 工具兼容范围：流完整校验后继续走现有 Agent 工具审批循环；未完成/错误 SSE 不会把部分工具调用交给 Agent。Mock、无流式接口 provider、多候选、多模态、logprobs 和未知增量仍明确拒绝。单元测试和本机代理 fixture 不等同完整产品验收。
 - Debian / Python 3.12 本地离线回归：125 项，124 通过、1 项 Windows-only junction 跳过；editable install、安装自检、`compileall` 与 `git diff --check` 通过。Windows/Linux × Python 3.11/3.12 四格 CI 均通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39217266384)）。本机与 CI 单元测试不等同完整产品验收。
-- 本轮及后续离线开发没有真实 API 请求。沿用用户提供的账本：已知实际用量 1,222，未明失败请求保留 629 预留，预算占用 1,851 / 2,000,000；失败请求的真实费用仍未知，本分配余量 19,371。
+- 本轮及后续离线开发没有真实 API 请求；真实调用用量单独跟踪。
 
 ## DeepSeek Anthropic 兼容 Messages API（2026-10-19）
 
@@ -170,7 +170,7 @@
 - 有界 SSE 使用既有 UTF-8/SSE 解析器，接受 Anthropic `message_start`、content block、`message_delta` 与 `message_stop` 序列；支持 text、`tool_use` 和带签名 `thinking`。请求默认关闭 thinking；若端点仍返回 thinking，不显示且在内存工具上下文保留签名。多模态、redacted/document/search/MCP 内容与未知事件明确拒绝。终端控制字符和疑似凭据沿用既有显示脱敏。
 - DeepSeek 兼容指南未列出 SSE 事件细节或响应 usage 字段；实现按 Anthropic Messages 协议解释事件序列，并仅在返回标准 `input_tokens` / `output_tokens` 时记 usage。该两项均为协议推断，尚未用真实 DeepSeek Anthropic endpoint 验证；缺失/无效 usage 时按请求完整 `max_tokens` 保守预留，不报告缓存命中。远端兼容性仍是未实现验收项。
 - 回归只使用 loopback HTTP fixture 与合成消息，覆盖跨字节中文、固定 URL 路径和无凭据请求、签名 thinking/工具往返、现有文件审批、缺 usage 预留、重定向拒绝、不完整工具流不审批、未知内容/事件、响应大小限制、总时限和取消。未访问真实模型或读取/设置/输出凭据；测试不等于完整产品验收。
-- Linux / Python 3.12 本地离线回归：150 项，149 通过、1 项 Windows-only junction 跳过；loopback fixture 不发送 API 密钥或 Authorization。`compileall`、editable install、安装自检与 `git diff --check` 均通过。Windows/Linux × Python 3.11/3.12 四矩阵 CI 全部成功（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39225734297)）；全程保持父任务账本 `1222 known + 629 unknown reserve` 不变，没有产生真实模型 usage。CI 和本地回归均不等同完整产品验收。
+- Linux / Python 3.12 本地离线回归：150 项，149 通过、1 项 Windows-only junction 跳过；loopback fixture 不发送 API 密钥或 Authorization。`compileall`、editable install、安装自检与 `git diff --check` 均通过。Windows/Linux × Python 3.11/3.12 四矩阵 CI 全部成功（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39225734297)）；本轮使用合成数据且没有真实模型 usage，真实调用用量单独跟踪。CI 和本地回归均不等同完整产品验收。
 
 ## 参考项目复用边界
 

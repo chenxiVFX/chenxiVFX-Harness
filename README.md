@@ -111,7 +111,7 @@ Token 数由本地字符启发式估算，不是提供商 tokenizer 的精确数
 
 本地 CLI 尚无隐藏输入界面；若直接使用普通环境变量，原值会进入 Harness 进程。若以后要在 Codex Cloud 使用 DeepSeek，用户可自行在该环境的 **Network secrets** 中添加变量 `DEEPSEEK_API_KEY`，Allowed domains 设为 `api.deepseek.com`。[Codex Cloud 官方说明](https://learn.chatgpt.com/docs/environments/cloud-environments)指出，Network secret 会以 placeholder 交给程序，并由代理在允许目标的 HTTPS 443 请求中替换原值，不把原始值放入本地进程或文件；普通 Environment variable 的值对 task 可见。保存环境改动后需要 Republish 并新建 task。网络密钥须使用自己的 Key，不能与同名直接环境变量冲突。
 
-离线回归使用合成数据和本机 HTTP fixture。另一次无工具 DeepSeek smoke 返回 HTTP 200 和“连接成功”（usage 输入 36、输出 43、总计 79）。本轮在全新临时目录完成了有限真实工具闭环：向 `api.deepseek.com:443` 的 `deepseek-flash` 发出 2 次请求，单次 `max_tokens` 为 256、合计上限 512；模型仅获 `list_directory` schema，并获准列出 `synthetic/hello.txt`，两次 HTTP 均为 200，usage 输入 1022、输出 82、合计 1104。只传了合成提示和列表结果，没有发送仓库或用户文件；这只验证了该受限路径，不代表完整产品或其他工具已通过。HTTP 429 不自动重试；适配器只统计 provider 返回的 Token usage，不核算费用。直接调用保留的非流式 JSON `complete()` 时，取消信号只在发送前和收到响应后检查；CLI SSE 流在响应体读取期间每 250 ms 检查一次，建连/响应头仍受 provider 超时限制。
+离线回归使用合成数据和本机 HTTP fixture。曾完成无工具连接 smoke 和受限只读目录闭环，只验证当时的认证与授权路径；测试只使用合成提示和合成目录信息，不代表完整产品或其他工具已通过。真实调用用量单独跟踪。HTTP 429 不自动重试；适配器只统计 provider 返回的 Token usage，不核算费用。直接调用保留的非流式 JSON `complete()` 时，取消信号只在发送前和收到响应后检查；CLI SSE 流在响应体读取期间每 250 ms 检查一次，建连/响应头仍受 provider 超时限制。
 
 ## DeepSeek Anthropic 兼容模式
 
