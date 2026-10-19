@@ -30,7 +30,7 @@ if (-not (Test-Path -LiteralPath $workspace -PathType Container)) { throw '工�
 
 ## 配置模型并审阅一次修改
 
-在 Mock 会话中运行 `/配置 编辑`，选择 `openai`、模型 `deepseek-flash`，Base URL 输入 `默认`，预算与输出上限可按需保留默认值；确认保存后 `/退出`。`openai` 在此表示 **DeepSeek 的 OpenAI 兼容接口**，不是任意 OpenAI 服务。也可选择 `deepseek-anthropic`，它连接 DeepSeek 的兼容接口，不连接官方 Claude 服务。设置保存在项目工作区 `.harness/config/settings.json`，其中不含密钥；Harness 不会替你的项目修改 `.gitignore`，请在提交前确认 `.harness/` 已被项目忽略。
+在 Mock 会话中运行 `/配置 编辑`，选择 `openai`、模型 `deepseek-flash`，Base URL 输入 `默认`，预算与输出上限可按需保留默认值；快捷键字段可留空，或设置如 `F2=帮助,F4=状态`，随后审阅并确认保存。设置保存在项目工作区 `.harness/config/settings.json`，其中不含密钥；Harness 不会替你的项目修改 `.gitignore`，请在提交前确认 `.harness/` 已被项目忽略。`/快捷键` 可查看映射；自定义 F2–F8 只在下次 TUI 启动时填入本地只读命令草稿，仍需按 Enter。纯文本 CLI 直接输入命令，不捕获 function keys。
 
 提供商、模型和端点的改动在下次启动生效。若要发起真实 DeepSeek 请求，启动前必须已通过你所在环境认可的安全方式向进程提供 `DEEPSEEK_API_KEY`；`/配置 编辑` 不接受或保存密钥。本地 Harness 没有 Windows Credential Manager 集成，普通环境变量会进入进程并对该进程可见。不要把密钥输入聊天、命令行或 `.harness/config`；如果当前环境没有可用的安全密钥注入方式，就继续使用 Mock。启动真实模式时不要带 `--provider mock`，否则命令行覆盖会让本次仍使用 Mock：
 

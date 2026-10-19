@@ -269,6 +269,7 @@ def _child(workspace: str, log_path: str, source_sha256: str) -> int:
 
     original_input = TerminalUI.input
     original_output = TerminalUI.output
+    original_submit = TerminalUI._submit_input
     original_resolve = TerminalUI._resolve_pending
     original_question_review = TerminalUI._question_show_review
     original_question_save_toggle = TerminalUI._question_toggle_session_save
@@ -285,6 +286,13 @@ def _child(workspace: str, log_path: str, source_sha256: str) -> int:
         if "已取消压缩；当前上下文未改变。" in value:
             _audit("compression_cancelled")
         original_output(self, value)
+
+    def audited_submit(self) -> None:
+        if self._pending is not None and not self._pending.approval:
+            value = self._input_buffer.text
+            if value in {"/帮助", "/命令", "/状态", "/配置"}:
+                _audit("local_command_submission", command=value)
+        original_submit(self)
 
     def audited_resolve(self, **kwargs: Any) -> None:
         if (
@@ -347,6 +355,7 @@ def _child(workspace: str, log_path: str, source_sha256: str) -> int:
 
     TerminalUI.input = audited_input
     TerminalUI.output = audited_output
+    TerminalUI._submit_input = audited_submit
     TerminalUI._resolve_pending = audited_resolve
     TerminalUI._question_show_review = audited_question_review
     TerminalUI._question_toggle_session_save = audited_question_save_toggle
@@ -577,6 +586,8 @@ def _exercise(walk: PtyWalkthrough, workspace: Path) -> None:
     walk.send("12000\r")
     walk.wait("输出 Token 上限 [")
     walk.send("\r")
+    walk.wait("TUI 快捷键 [")
+    walk.send("F2=帮助，F4=状态\r")
     walk.wait("确认保存这些非敏感设置")
     walk.send("是\r")
     walk.wait("已保存到 .harness/config/settings.json")
@@ -899,6 +910,11 @@ def main() -> int:
                 raise RuntimeError("synthetic workspace did not retain the approved patch")
             if not (workspace / ".harness" / "sessions" / "qa-walkthrough.json").is_file():
                 raise RuntimeError("session archive was not created")
+            settings = json.loads(
+                (workspace / ".harness" / "config" / "settings.json").read_text(encoding="utf-8")
+            )
+            if settings.get("tui_shortcuts") != {"F2": "help", "F4": "status"}:
+                raise RuntimeError("reviewed TUI shortcuts were not persisted in the synthetic workspace")
             profiles = json.loads(
                 (workspace / ".harness" / "config" / "test_profiles.json").read_text(encoding="utf-8")
             )
@@ -972,8 +988,82 @@ def main() -> int:
                 raise RuntimeError("the trusted patch fingerprint was redacted in the PTY display")
             if no_color and _has_sgr_color(recorded_output):
                 raise RuntimeError("NO_COLOR PTY output contained an ANSI color attribute")
+
+            # Start a fresh application process to verify the reviewed mappings
+            # are loaded only on restart and still require explicit Enter.
+            child_pid, master_fd = pty.fork()
+            if child_pid == 0:
+                os._exit(_child(str(workspace), str(log_path), source_sha256))
+            walk.child_pid = child_pid
+            walk.master_fd = master_fd
+            walk._ready = False
+            restart_start = len(walk.raw)
+            walk._input_ready_from = restart_start
+            walk.resize(46, 14)
+            walk.ready(start=restart_start)
+            walk.command(
+                "/快捷键",
+                expect="已保存的工作区 TUI 快捷键：F2=帮助",
+            )
+            walk.mark("shortcuts-loaded-after-restart")
+            help_start = len(walk.raw)
+            submissions_before_shortcut = [
+                item for item in (json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines())
+                if item.get("kind") == "local_command_submission"
+            ]
+            walk.send(b"\x1bOQ")  # xterm F2, parsed by prompt_toolkit as a function key
+            walk.wait("/帮助", start=help_start)
+            if "命令：" in _ANSI.sub(
+                "", bytes(walk.raw[help_start:]).decode("utf-8", errors="replace")
+            ):
+                raise RuntimeError("function-key shortcut submitted the local command without Enter")
+            submissions_after_key = [
+                item for item in (json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines())
+                if item.get("kind") == "local_command_submission"
+            ]
+            if submissions_after_key != submissions_before_shortcut:
+                raise RuntimeError("function-key shortcut submitted a command without Enter")
+            requests_before_shortcut = sum(
+                item.get("kind") == "user_turn"
+                for item in (json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines())
+            )
+            walk.send("\r")
+            walk.ready(start=help_start)
+            submissions_after_enter = [
+                item for item in (json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines())
+                if item.get("kind") == "local_command_submission"
+            ]
+            if submissions_after_enter != submissions_before_shortcut + [
+                {"kind": "local_command_submission", "command": "/帮助"}
+            ]:
+                raise RuntimeError("explicit Enter did not submit exactly the mapped local help command")
+            log_after_shortcut = [
+                json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            if sum(item.get("kind") == "user_turn" for item in log_after_shortcut) != requests_before_shortcut:
+                raise RuntimeError("local help shortcut unexpectedly made a provider request")
+            walk.mark("shortcuts-explicit-submit")
+            walk.send("/退出\r")
+            deadline = time.monotonic() + 8
+            second_status = None
+            while time.monotonic() < deadline:
+                walk._collect(0.1)
+                child, second_status = os.waitpid(child_pid, os.WNOHANG)
+                if child:
+                    break
+            if second_status is None:
+                os.kill(child_pid, signal.SIGTERM)
+                _, second_status = os.waitpid(child_pid, 0)
+                raise RuntimeError("restarted TUI child did not exit after /退出")
+            if not os.WIFEXITED(second_status) or os.WEXITSTATUS(second_status) != 0:
+                raise RuntimeError(f"restarted TUI child exited with status {second_status}")
+
+            walk.save_cast()
+            recorded_output = "".join(event[2] for event in walk.events if event[1] == "o")
+            if no_color and _has_sgr_color(recorded_output):
+                raise RuntimeError("NO_COLOR PTY output contained an ANSI color attribute")
             print(f"Recorded {len(walk.events)} PTY events to {output}")
-            print("Synthetic offline flow passed: config, question edit/cancel/submit/privacy, plan confirmation, two-file approval, compensated conflict, save/restore, compression, narrow resize.")
+            print("Synthetic offline flow passed: config review/save/restart and F2 shortcut, question edit/cancel/submit/privacy, plan confirmation, two-file approval, compensated conflict, save/restore, compression, narrow resize.")
             return 0
         except BaseException:
             if walk.raw:

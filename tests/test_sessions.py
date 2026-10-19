@@ -1029,7 +1029,7 @@ class CompressionTests(unittest.TestCase):
 
             provider = MockProvider()
             inputs = iter([
-                "/帮助", "/配置", "/统计", "/预算 22000",
+                "/帮助", "/配置", "/按键", "/统计", "/预算 22000",
                 "/子代理 提交 检查\x1b[31m会话 | 检查预算", "是", "是",
                 "/子代理 列表", "/子代理 收取 全部", "/目标 仅供上下文", "/状态", "/退出",
             ])
@@ -1060,6 +1060,7 @@ class CompressionTests(unittest.TestCase):
             self.assertIn("不是缓存命中量", combined)
             self.assertIn("没有有效缓存命中字段；命中量未知", combined)
             self.assertIn("Shell：禁用", combined)
+            self.assertIn("纯文本 CLI 不捕获这些 function keys", combined)
             self.assertIn("已将本地估算上下文阈值设为 22000", combined)
             self.assertIn("/子代理 提交", combined)
             self.assertIn("S01", combined)

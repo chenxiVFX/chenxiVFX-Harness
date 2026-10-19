@@ -90,7 +90,7 @@ def _process_error_signature(result: subprocess.CompletedProcess[str]) -> str:
         if codec:
             signature += f" (codec {codec.group(1)})"
         return signature
-    marker_present = "TUI 合成输入、命令补全和退出自检通过。" in output
+    marker_present = "TUI 合成输入、命令补全、F2 映射和退出自检通过。" in output
     return f"return code {result.returncode}; success marker {'present' if marker_present else 'absent'}"
 
 
@@ -193,6 +193,8 @@ def _write_artifact_readme(path: Path) -> None:
 Mock 完全离线，不读取密钥或连接模型。输入“你好”试用中文，再用 /状态核对工作区，/退出结束。
 在 Mock 会话中可用 /配置 编辑 保存非敏感的提供商、模型与端点；选择 openai 表示 DeepSeek OpenAI
 兼容接口。设置保存在工作区 .harness/config/settings.json，不包含密钥；Harness 不会修改项目 .gitignore。
+TUI 可在 /配置 编辑 中审阅设置有限的 F2–F8 中文命令快捷键；映射只填入本地只读命令草稿，仍需按 Enter；
+纯文本 CLI 直接输入命令。快捷键在下次 TUI 启动生效，/快捷键可查看当前映射。
 提供商/模型/端点在下次启动生效。真实 DeepSeek 请求需要在启动前
 由你信任的安全密钥注入方式向进程提供 DEEPSEEK_API_KEY；不要把密钥粘贴到聊天、命令行或配置。
 本地包没有 Windows Credential Manager 集成，普通环境变量会进入进程并对该进程可见。没有安全

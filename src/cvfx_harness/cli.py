@@ -20,6 +20,8 @@ from .config import (
     DEFAULT_DEEPSEEK_BASE_URL,
     WorkspaceConfig,
     WorkspaceConfigStore,
+    format_tui_shortcuts,
+    parse_tui_shortcuts,
     resolve_config,
     validate_workspace_config,
 )
@@ -63,7 +65,7 @@ MAX_MULTILINE_INPUT_BYTES = 64 * 1024
 _CLI_COMMANDS = (
     "/帮助", "/命令", "/状态", "/模式", "/目标", "/计划", "/保存", "/检查点",
     "/恢复", "/会话", "/多行", "/压缩", "/统计", "/预算", "/配置", "/测试", "/子代理",
-    "/变更集", "/撤销", "/退出",
+    "/变更集", "/撤销", "/快捷键", "/按键", "/退出",
 )
 _CLI_ENUM_ARGUMENTS = {
     "/模式": ("计划", "执行"),
@@ -507,12 +509,13 @@ def _help_text() -> str:
   /统计              分开展示本地估算、提供商 usage 与缓存命中字段
   /预算 [tokens]     查看或临时设置本地估算阈值（1024–1000000；不是账户额度）
   /配置              显示本轮和下次启动的非敏感设置；密钥值不会显示或保存
-  /配置 编辑         交互暂存、审阅并确认非敏感设置
+  /配置 编辑         交互暂存、审阅并确认非敏感设置与有限 TUI 快捷键映射
   /配置 提供商 mock|openai|deepseek-anthropic
   /配置 模型 <名称>|默认
   /配置 端点 <DeepSeek HTTPS URL>|默认
   /配置 预算 <1024–1000000>
   /配置 输出上限 <1–65536>
+  /快捷键|/按键     查看已保存的 TUI function-key 映射；纯文本 CLI 仍使用命令
   /测试 列表        列出用户保存的 Python unittest/pytest 配置
   /测试 添加 [ID]   交互式保存固定测试配置和外部 Python 路径
   /测试 运行 <ID>   审批后运行用户测试；输出只在本地显示
@@ -590,7 +593,8 @@ def _config_source_summary(config) -> str:
         f"模型：{_safe_terminal_text(config.model)}（{config.sources['model']}）\n"
         f"Base URL：{_safe_terminal_text(config.base_url or '无（mock）')}（{config.sources['base_url']}）\n"
         f"本地估算上下文阈值：{config.token_budget}（{config.sources['token_budget']}）\n"
-        f"输出上限：{config.max_output_tokens}（{config.sources['max_output_tokens']}）"
+        f"输出上限：{config.max_output_tokens}（{config.sources['max_output_tokens']}）\n"
+        f"TUI 快捷键：{format_tui_shortcuts(config.tui_shortcuts)}（{config.sources['tui_shortcuts']}）"
     )
 
 
@@ -687,6 +691,21 @@ def _interactive_config_edit(
                 ),
             )
 
+        shortcut_value = ask(
+            "TUI 快捷键 "
+            f"[{format_tui_shortcuts(draft.tui_shortcuts)}] "
+            "（仅 F2–F8；帮助/命令/状态/配置；例如 F2=帮助,F4=状态；默认清空）> "
+        )
+        if shortcut_value:
+            draft = replace(
+                draft,
+                tui_shortcuts=(
+                    {}
+                    if shortcut_value.casefold() in {"默认", "default", "清空"}
+                    else parse_tui_shortcuts(shortcut_value)
+                ),
+            )
+
         draft = validate_workspace_config(draft)
         if draft == stored:
             output("配置没有变化；未写入文件。")
@@ -700,6 +719,7 @@ def _interactive_config_edit(
             + f"Base URL：{_safe_terminal_text(draft.base_url or _config_provider_defaults(draft.provider)[1] or '无（mock）')}\n"
             + f"本地估算上下文阈值：{draft.token_budget}\n"
             + f"输出上限：{draft.max_output_tokens}\n"
+            + f"TUI 快捷键：{format_tui_shortcuts(draft.tui_shortcuts)}（仅在下次 TUI 启动时生效）\n"
             + "确认保存后的生效值（高优先级来源可能覆盖）：\n"
             + _config_source_summary(after)
         )
@@ -1146,6 +1166,14 @@ def run_console(
             output("可用命令：\n" + "  " + "\n  ".join(_CLI_COMMANDS))
             output("输入 /帮助 查看参数；TTY 可用时，Tab 补全命令名和固定选项，不补路径或自由文本。")
             continue
+        if command in {"/快捷键", "/按键", "/keys", "/shortcuts"}:
+            output(
+                f"已保存的工作区 TUI 快捷键：{format_tui_shortcuts(startup_config.tui_shortcuts)}\n"
+                "只支持 F2–F8 映射到 帮助、命令、状态、配置；按键只填入本地只读命令草稿，"
+                "仍需按 Enter 提交。纯文本 CLI 不捕获这些 function keys；请直接输入中文命令。\n"
+                "用 /配置 编辑 暂存、审阅并确认；保存后重启 TUI 生效。"
+            )
+            continue
         if command in {"/提交", "/cancel", "/取消"}:
             output("/提交 和 /取消 只在 /多行 输入期间使用。")
             continue
@@ -1210,6 +1238,7 @@ def run_console(
                     f"Base URL：{_safe_terminal_text(startup_config.base_url or '无（mock）')}（{source['base_url']}）\n"
                     f"本地估算上下文阈值：{startup_config.token_budget}（{source['token_budget']}）\n"
                     f"输出上限：{startup_config.max_output_tokens}（{source['max_output_tokens']}）\n"
+                    f"TUI 快捷键：{format_tui_shortcuts(startup_config.tui_shortcuts)}（{source['tui_shortcuts']}；下次 TUI 启动生效）\n"
                     f"本轮本地估算阈值：{agent.token_budget}；本轮输出上限：{agent.max_output_tokens} tokens\n"
                     f"每次提问最多模型请求：{agent.max_provider_requests}；请求总时限：{getattr(provider, 'stream_timeout', DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS):g} 秒\n"
                     f"新子任务运行时限：{subagent_manager.timeout_seconds:g} 秒（审批与执行前排队不计）\n"

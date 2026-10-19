@@ -19,7 +19,10 @@ from cvfx_harness.config import (
     ConfigError,
     WorkspaceConfig,
     WorkspaceConfigStore,
+    format_tui_shortcuts,
+    parse_tui_shortcuts,
     resolve_config,
+    validate_tui_shortcuts,
     validate_workspace_config,
 )
 from cvfx_harness.providers import MockProvider, ProviderError, validate_base_url
@@ -53,8 +56,53 @@ class WorkspaceConfigTests(unittest.TestCase):
         self.assertNotIn("api_key", serialized.casefold())
         self.assertNotIn("DEEPSEEK_API_KEY", serialized)
         self.assertFalse(self.path.is_symlink())
+        self.assertEqual(loaded.tui_shortcuts, {})
         if os.name != "nt":
             self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+    def test_tui_shortcut_map_is_bounded_canonical_and_round_trips(self) -> None:
+        shortcuts = parse_tui_shortcuts("f4=状态，F2=/帮助,F6=commands")
+        self.assertEqual(
+            shortcuts,
+            {"F2": "help", "F4": "status", "F6": "commands"},
+        )
+        self.assertEqual(
+            format_tui_shortcuts(shortcuts), "F2=帮助，F4=状态，F6=命令"
+        )
+        saved = WorkspaceConfig(tui_shortcuts=shortcuts)
+        self.store.save(saved)
+        loaded, exists = self.store.load()
+        self.assertTrue(exists)
+        self.assertEqual(loaded.tui_shortcuts, shortcuts)
+        self.assertEqual(
+            json.loads(self.path.read_text(encoding="utf-8"))["tui_shortcuts"],
+            shortcuts,
+        )
+
+    def test_tui_shortcuts_reject_duplicates_reserved_keys_actions_and_macros(self) -> None:
+        invalid = (
+            "F2=帮助,F2=状态",
+            "Ctrl+F2=帮助",
+            "F1=帮助",
+            "Enter=帮助",
+            "F2=退出",
+            "F2=帮助,F3=/help",
+            "F2=帮助,F3=命令,F4=状态,F5=配置,F6=帮助",
+            "F2=帮助; /退出",
+        )
+        for value in invalid:
+            with self.subTest(value=value):
+                with self.assertRaises(ConfigError):
+                    parse_tui_shortcuts(value)
+        for value in (
+            {"F2": "help", "f2": "status"},
+            {"F2": "quit"},
+            {"Ctrl+C": "help"},
+            {"F2": "/退出"},
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ConfigError):
+                    validate_tui_shortcuts(value)
 
     def test_optimistic_save_preserves_a_concurrent_configuration_change(self) -> None:
         self.store.save(WorkspaceConfig(provider="openai", model="deepseek-flash"))
@@ -355,7 +403,7 @@ class WorkspaceConfigTests(unittest.TestCase):
             )
         )
         answers = iter(
-            ["/配置 编辑", "deepseek-anthropic", "", "", "", "", "是", "/退出"]
+            ["/配置 编辑", "deepseek-anthropic", "", "", "", "", "F2=帮助，F4=状态", "是", "/退出"]
         )
         outputs: list[str] = []
         args = build_parser().parse_args(["--workspace", self.temp.name])
@@ -380,6 +428,7 @@ class WorkspaceConfigTests(unittest.TestCase):
         self.assertIsNone(saved.model)
         self.assertIsNone(saved.base_url)
         self.assertEqual(saved.token_budget, 24000)
+        self.assertEqual(saved.tui_shortcuts, {"F2": "help", "F4": "status"})
         effective = resolve_config(
             saved,
             exists,
@@ -433,7 +482,7 @@ class WorkspaceConfigTests(unittest.TestCase):
 
         for answers in (
             ["/配置 编辑", "/取消", "/退出"],
-            ["/配置 编辑", "deepseek-anthropic", "", "https://api.deepseek.com/v1", "", "", "/退出"],
+            ["/配置 编辑", "deepseek-anthropic", "", "https://api.deepseek.com/v1", "", "", "", "/退出"],
         ):
             outputs: list[str] = []
             answer_iter = iter(answers)
@@ -455,10 +504,38 @@ class WorkspaceConfigTests(unittest.TestCase):
 
         self.assertTrue(any("仅允许 HTTPS api.deepseek.com:443/anthropic" in line for line in outputs))
 
+    def test_shortcut_editor_conflict_and_late_cancel_leave_existing_file_unchanged(self) -> None:
+        original = WorkspaceConfig(tui_shortcuts={"F2": "help"})
+        self.store.save(original)
+        original_bytes = self.path.read_bytes()
+        args = build_parser().parse_args(["--workspace", self.temp.name])
+
+        for answers in (
+            ["/配置 编辑", "", "", "", "", "", "F2=帮助,F2=状态", "/退出"],
+            ["/配置 编辑", "", "", "", "", "", "/取消", "/退出"],
+        ):
+            answer_iter = iter(answers)
+            outputs: list[str] = []
+            with patch.dict(os.environ, {}, clear=False):
+                for name in (
+                    "HARNESS_PROVIDER", "HARNESS_MODEL", "HARNESS_BASE_URL",
+                    "HARNESS_TOKEN_BUDGET", "HARNESS_MAX_OUTPUT_TOKENS",
+                ):
+                    os.environ.pop(name, None)
+                with patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()):
+                    result = run_console(
+                        args,
+                        input_fn=lambda _prompt: next(answer_iter),
+                        output=outputs.append,
+                    )
+            self.assertEqual(result, 0)
+            self.assertEqual(self.path.read_bytes(), original_bytes)
+            self.assertEqual(self.store.load()[0], original)
+
     def test_interactive_editor_does_not_overwrite_changes_made_while_prompting(self) -> None:
         args = build_parser().parse_args(["--workspace", self.temp.name])
         external = WorkspaceConfig(model="external-edit")
-        answers = iter(["/配置 编辑", "openai", "", "", "", "", "/退出"])
+        answers = iter(["/配置 编辑", "openai", "", "", "", "", "", "/退出"])
         outputs: list[str] = []
 
         def input_with_competing_edit(prompt: str) -> str:
@@ -535,6 +612,8 @@ class WorkspaceConfigTests(unittest.TestCase):
 class ConfigParserTests(unittest.TestCase):
     def test_config_completer_offers_editor_and_only_supported_providers(self) -> None:
         self.assertIn("编辑", _completion_matches("/配置 编辑", "编辑"))
+        self.assertEqual(_completion_matches("/快", "/快"), ("/快捷键",))
+        self.assertEqual(_completion_matches("/按", "/按"), ("/按键",))
         self.assertEqual(
             _completion_matches("/配置 提供商 deepseek-a", "deepseek-a"),
             ("deepseek-anthropic",),

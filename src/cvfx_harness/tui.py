@@ -32,6 +32,7 @@ from prompt_toolkit.widgets import Button, TextArea
 from wcwidth import wcswidth
 
 from .profiles import TestProfileError, TestProfileStore
+from .config import ConfigError, WorkspaceConfigStore, validate_tui_shortcuts
 from .questions import (
     MAX_TOTAL_ANSWER_BYTES,
     QuestionnaireRequest,
@@ -60,7 +61,9 @@ COMMANDS = (
     ("/配置", "查看或交互审阅非敏感配置"), ("/测试", "管理固定 Python 测试配置"),
     ("/子代理", "管理隔离子任务"),
     ("/变更集", "查看批次证据或安全恢复"),
-    ("/撤销", "预览并撤销写入"), ("/退出", "结束会话"),
+    ("/撤销", "预览并撤销写入"), ("/快捷键", "查看当前 TUI 按键映射"),
+    ("/按键", "查看快捷键（/快捷键 的中文别名）"),
+    ("/退出", "结束会话"),
 )
 ENUM_COMPLETIONS = {
     "/模式": ("计划", "执行"),
@@ -383,10 +386,12 @@ class TerminalUI:
         input: Any = None,
         output: Any = None,
         reference_workspace: Workspace | None = None,
+        shortcuts: Mapping[str, str] | None = None,
     ) -> None:
         self._worker_callable = worker
         self._input = input
         self._output = output
+        self.tui_shortcuts = validate_tui_shortcuts(shortcuts or {})
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._pending: _InputRequest | None = None
         self._queued_question: _QuestionRequest | None = None
@@ -1056,6 +1061,33 @@ class TerminalUI:
                 self._follow_output = True
                 self.output_area.buffer.cursor_position = len(self.output_area.text)
 
+        shortcut_commands = {
+            "help": "/帮助",
+            "commands": "/命令",
+            "status": "/状态",
+            "config": "/配置",
+        }
+        for key, action in self.tui_shortcuts.items():
+            command = shortcut_commands[action]
+
+            def fill_safe_command(event, *, command=command, key=key) -> None:
+                if (
+                    self._question_pending is not None
+                    or self._pending is None
+                    or self._pending.approval
+                    or not event.app.layout.has_focus(self.input_area)
+                ):
+                    self._notice = f"{key} 仅在普通输入提示中可用；当前状态未改变。"
+                    return
+                if self._input_buffer.text:
+                    self._notice = f"{key} 未覆盖现有草稿；请先清空输入或自行编辑。"
+                    return
+                self._input_buffer.text = command
+                self._input_buffer.cursor_position = len(command)
+                self._notice = f"{key} 已填入 {command}；按 Enter 提交，尚未执行。"
+
+            bindings.add(key.casefold(), eager=True)(fill_safe_command)
+
         return bindings
 
     def _on_input_text_changed(self, buffer) -> None:
@@ -1626,7 +1658,15 @@ def run_tui_console(args) -> int | None:
         reference_workspace = Workspace(args.workspace)
     except (WorkspaceError, OSError, RuntimeError):
         reference_workspace = None
-    ui = TerminalUI(worker, reference_workspace=reference_workspace)
+    shortcuts: Mapping[str, str] = {}
+    if reference_workspace is not None and not getattr(args, "ignore_config", False):
+        try:
+            stored, _exists = WorkspaceConfigStore(reference_workspace).load()
+            shortcuts = stored.tui_shortcuts
+        except ConfigError:
+            # The worker reports the same safe configuration error before accepting input.
+            pass
+    ui = TerminalUI(worker, reference_workspace=reference_workspace, shortcuts=shortcuts)
     try:
         return ui.run()
     except (EOFError, NotImplementedError, OSError):

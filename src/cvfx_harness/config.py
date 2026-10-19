@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -32,8 +32,80 @@ _CONFIG_KEYS = {
     "base_url",
     "token_budget",
     "max_output_tokens",
+    "tui_shortcuts",
 }
 _SAVE_WITHOUT_REVISION_CHECK = object()
+
+TUI_SHORTCUT_ACTIONS = {
+    "help": "帮助",
+    "commands": "命令",
+    "status": "状态",
+    "config": "配置",
+}
+_TUI_SHORTCUT_ACTION_ALIASES = {
+    alias: action
+    for action, aliases in {
+        "help": ("帮助", "help"),
+        "commands": ("命令", "commands"),
+        "status": ("状态", "status"),
+        "config": ("配置", "config"),
+    }.items()
+    for alias in aliases
+}
+_TUI_SHORTCUT_KEY = re.compile(r"^F([2-8])$", re.IGNORECASE)
+
+
+def validate_tui_shortcuts(value: Any) -> dict[str, str]:
+    """Accept only a small map of function keys to local read-only commands."""
+    if not isinstance(value, Mapping) or len(value) > len(TUI_SHORTCUT_ACTIONS):
+        raise ConfigError("快捷键配置无效；最多可设置 4 个受支持的 TUI 快捷键。")
+    normalized: dict[str, str] = {}
+    used_actions: set[str] = set()
+    for raw_key, raw_action in value.items():
+        if not isinstance(raw_key, str) or _TUI_SHORTCUT_KEY.fullmatch(raw_key) is None:
+            raise ConfigError("快捷键仅支持 F2–F8；Enter、Esc、Ctrl+C、Tab 与导航键不可映射。")
+        key = raw_key.upper()
+        if key in normalized:
+            raise ConfigError("快捷键重复；每个按键只能绑定一个动作。")
+        if not isinstance(raw_action, str):
+            raise ConfigError("快捷键动作无效；仅支持 帮助、命令、状态、配置。")
+        action_name = raw_action.strip().removeprefix("/").casefold()
+        action = _TUI_SHORTCUT_ACTION_ALIASES.get(action_name)
+        if action is None:
+            raise ConfigError("快捷键动作无效；仅支持 帮助、命令、状态、配置。")
+        if action in used_actions:
+            raise ConfigError("快捷键动作重复；帮助、命令、状态、配置各只能绑定一次。")
+        normalized[key] = action
+        used_actions.add(action)
+    return dict(sorted(normalized.items(), key=lambda item: int(item[0][1:])))
+
+
+def parse_tui_shortcuts(value: str) -> dict[str, str]:
+    """Parse the reviewed editor's compact F-key=Chinese-action syntax."""
+    if not isinstance(value, str):
+        raise ConfigError("快捷键格式无效；示例：F2=帮助,F4=状态。")
+    if not value.strip():
+        return {}
+    mappings: dict[str, str] = {}
+    for item in re.split(r"[,，]", value):
+        key, separator, action = item.partition("=")
+        if not separator or not key.strip() or not action.strip():
+            raise ConfigError("快捷键格式无效；请使用 F2=帮助,F4=状态 这样的逗号分隔映射。")
+        normalized_key = key.strip().upper()
+        if normalized_key in mappings:
+            raise ConfigError("快捷键重复；每个按键只能绑定一个动作。")
+        mappings[normalized_key] = action.strip()
+    return validate_tui_shortcuts(mappings)
+
+
+def format_tui_shortcuts(value: Any) -> str:
+    shortcuts = validate_tui_shortcuts(value)
+    if not shortcuts:
+        return "未设置"
+    return "，".join(
+        f"{key}={TUI_SHORTCUT_ACTIONS[action]}"
+        for key, action in shortcuts.items()
+    )
 
 
 class ConfigError(RuntimeError):
@@ -47,6 +119,7 @@ class WorkspaceConfig:
     base_url: str | None = None
     token_budget: int = DEFAULT_TOKEN_BUDGET
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
+    tui_shortcuts: Mapping[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +129,7 @@ class WorkspaceConfig:
             "base_url": self.base_url,
             "token_budget": self.token_budget,
             "max_output_tokens": self.max_output_tokens,
+            "tui_shortcuts": validate_tui_shortcuts(self.tui_shortcuts),
         }
 
 
@@ -66,6 +140,7 @@ class ResolvedConfig:
     base_url: str | None
     token_budget: int
     max_output_tokens: int
+    tui_shortcuts: dict[str, str]
     sources: dict[str, str]
 
 
@@ -123,7 +198,14 @@ def validate_workspace_config(config: WorkspaceConfig) -> WorkspaceConfig:
         raise ConfigError("Token 预算必须在 1024 到 1000000 之间。")
     if type(config.max_output_tokens) is not int or not 1 <= config.max_output_tokens <= 65536:
         raise ConfigError("输出 Token 上限必须在 1 到 65536 之间。")
-    return WorkspaceConfig(provider, model, base_url, config.token_budget, config.max_output_tokens)
+    return WorkspaceConfig(
+        provider,
+        model,
+        base_url,
+        config.token_budget,
+        config.max_output_tokens,
+        validate_tui_shortcuts(config.tui_shortcuts),
+    )
 
 
 class WorkspaceConfigStore:
@@ -223,6 +305,7 @@ class WorkspaceConfigStore:
                 base_url=payload.get("base_url"),
                 token_budget=payload.get("token_budget", DEFAULT_TOKEN_BUDGET),
                 max_output_tokens=payload.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS),
+                tui_shortcuts=payload.get("tui_shortcuts", {}),
             )
             return validate_workspace_config(config), True, revision
         except ConfigError:
@@ -329,11 +412,15 @@ def resolve_config(
     if type(output_value) is not int or not 1 <= output_value <= 65536:
         raise ConfigError("输出 Token 上限必须在 1 到 65536 之间。")
 
+    shortcuts = validate_tui_shortcuts(stored.tui_shortcuts)
+    sources["tui_shortcuts"] = "工作区配置" if config_exists else "默认"
+
     return ResolvedConfig(
         provider=provider,
         model=model,
         base_url=base_url,
         token_budget=token_budget_value,
         max_output_tokens=output_value,
+        tui_shortcuts=shortcuts,
         sources=sources,
     )

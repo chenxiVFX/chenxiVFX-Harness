@@ -39,6 +39,7 @@ class PromptToolkitTests(unittest.TestCase):
         *,
         output=None,
         workspace_root: str | Path | None = None,
+        shortcuts=None,
     ) -> tuple[TerminalUI, int]:
         with create_pipe_input() as pipe:
             reference_workspace = (
@@ -49,6 +50,7 @@ class PromptToolkitTests(unittest.TestCase):
                 input=pipe,
                 output=DummyOutput() if output is None else output,
                 reference_workspace=reference_workspace,
+                shortcuts=shortcuts,
             )
             errors: list[BaseException] = []
 
@@ -115,6 +117,8 @@ class PromptToolkitTests(unittest.TestCase):
         path_values = list(completer.get_completions(Document("@资料/"), CompleteEvent()))
         self.assertEqual([item.text for item in command_items], ["/帮助"])
         self.assertEqual(command_items[0].display_meta_text, "显示完整说明")
+        alias_items = list(completer.get_completions(Document("/按"), CompleteEvent()))
+        self.assertEqual([item.text for item in alias_items], ["/按键"])
         self.assertEqual(values, ["计划"])
         self.assertEqual(path_values, [])
         plan_values = [
@@ -162,8 +166,11 @@ class PromptToolkitTests(unittest.TestCase):
                 pipe.send_text("\r")
                 self._wait_until(lambda: ui._prompt.startswith("输出 Token 上限 ["), "config output prompt missing")
                 pipe.send_text("\r")
+                self._wait_until(lambda: ui._prompt.startswith("TUI 快捷键 ["), "config shortcut prompt missing")
+                pipe.send_text("F2=帮助，F4=状态\r")
                 self._wait_until(lambda: ui._prompt.startswith("确认保存这些非敏感设置"), "config review prompt missing")
                 self._wait_until(lambda: "待保存工作区设置（尚未写入）" in ui._transcript, "review summary missing")
+                self.assertIn("TUI 快捷键：F2=帮助，F4=状态", ui._transcript)
                 pipe.send_text("是\r")
                 self._wait_until(lambda: "已保存到 .harness/config/settings.json" in ui._transcript, "config save confirmation missing")
                 pipe.send_text("/退出\r")
@@ -175,9 +182,61 @@ class PromptToolkitTests(unittest.TestCase):
             self.assertEqual(saved.provider, "deepseek-anthropic")
             self.assertEqual(saved.model, "deepseek-v4-pro")
             self.assertIsNone(saved.base_url)
+            self.assertEqual(saved.tui_shortcuts, {"F2": "help", "F4": "status"})
             self.assertIn("提供商：deepseek-anthropic", ui._transcript)
             self.assertIn("提供商 的工作区值已保存", ui._transcript)
             self.assertNotIn("provider 的工作区值已保存", ui._transcript)
+
+    def test_custom_fkey_fills_read_only_local_command_without_submitting(self) -> None:
+        received: list[str] = []
+
+        def worker(ui: TerminalUI) -> int:
+            received.append(ui.input("你 [执行]> "))
+            return 0
+
+        def send(pipe, ui: TerminalUI) -> None:
+            self._wait_until(lambda: ui._pending is not None, "TUI did not request input")
+            pipe.send_text("现有草稿")
+            pipe.send_bytes(b"\x1bOQ")  # xterm F2
+            time.sleep(0.08)
+            self.assertEqual(ui._input_buffer.text, "现有草稿")
+            self.assertEqual(received, [])
+            pipe.send_bytes(b"\x03")
+            self._wait_until(lambda: not ui._input_buffer.text, "Ctrl+C did not clear the draft")
+            pipe.send_bytes(b"\x1bOQ")
+            self._wait_until(
+                lambda: ui._input_buffer.text == "/帮助",
+                "F2 did not fill the configured Chinese help command",
+            )
+            self.assertEqual(received, [], "a shortcut must never submit or execute by itself")
+            pipe.send_text("\r")
+
+        ui, result = self._run_ui(worker, send, shortcuts={"F2": "help"})
+        self.assertEqual(result, 0)
+        self.assertEqual(received, ["/帮助"])
+        self.assertIn("按 Enter 提交，尚未执行", ui._notice)
+
+    def test_custom_fkey_cannot_change_or_accept_an_approval(self) -> None:
+        received: list[str] = []
+
+        def worker(ui: TerminalUI) -> int:
+            received.append(ui.input("确认读取合成文件？ [y/N]"))
+            return 0
+
+        def send(pipe, ui: TerminalUI) -> None:
+            self._wait_until(lambda: ui._pending is not None, "approval prompt did not appear")
+            self.assertTrue(ui._pending.approval)
+            pipe.send_bytes(b"\x1bOQ")
+            time.sleep(0.08)
+            self.assertTrue(ui._pending.approval)
+            self.assertFalse(ui._approval_choice_yes)
+            self.assertEqual(received, [])
+            pipe.send_text("\r")
+
+        ui, result = self._run_ui(worker, send, shortcuts={"F2": "help"})
+        self.assertEqual(result, 0)
+        self.assertEqual(received, [""])
+        self.assertFalse(ui._approval_choice_yes)
 
     def test_tui_escape_cancels_config_draft_without_persisting(self) -> None:
         with tempfile.TemporaryDirectory(prefix="cvfx-tui-config-cancel-") as workspace:
@@ -2002,7 +2061,9 @@ class PromptToolkitTests(unittest.TestCase):
                 read_until("/帮助".encode("utf-8"), start=menu_start)
                 read_until("显示完整说明".encode("utf-8"), start=menu_start)
                 os.write(master_fd, b"\x1b[B\x1b[B\t\r")
-                read_until("命令：".encode("utf-8"), start=menu_start)
+                # The longer command list can scroll its heading off a 30-row
+                # PTY; confirm the visible tail of /命令 instead.
+                read_until("Tab 补全命令名".encode("utf-8"), start=menu_start)
                 self.assertIn("/命令".encode("utf-8"), transcript[menu_start:])
 
                 path_start = len(transcript)
