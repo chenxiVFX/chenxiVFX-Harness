@@ -64,14 +64,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          python -m unittest discover -s tests -v 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\offline-tests.log"
-          exit $LASTEXITCODE
-
-      - name: Preserve offline test output after failure
-        if: failure()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: offline-test-output-${{ matrix.os }}-py${{ matrix.python-version }}
-          path: ${{ runner.temp }}/offline-tests.log
-          if-no-files-found: ignore
-          retention-days: 1
+          $testLog = Join-Path $env:RUNNER_TEMP "offline-tests.log"
+          python -m unittest discover -s tests -v 2>&1 | Tee-Object -FilePath $testLog
+          $testExitCode = $LASTEXITCODE
+          if ($testExitCode -ne 0) {
+            $summary = ((Get-Content $testLog -Tail 25) -join "`n")
+            $summary = $summary.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Output "::error title=Offline test failure::$summary"
+          }
+          exit $testExitCode
