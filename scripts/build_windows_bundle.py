@@ -86,6 +86,9 @@ def _process_error_signature(result: subprocess.CompletedProcess[str]) -> str:
         dll = re.search(r"while importing ([A-Za-z0-9_.]+)", candidate, re.IGNORECASE)
         if dll:
             signature += f" (module {dll.group(1)})"
+        codec = re.search(r"'([A-Za-z0-9._-]+)' codec can't encode", candidate)
+        if codec:
+            signature += f" (codec {codec.group(1)})"
         return signature
     marker_present = "TUI 合成输入、命令补全和退出自检通过。" in output
     return f"return code {result.returncode}; success marker {'present' if marker_present else 'absent'}"

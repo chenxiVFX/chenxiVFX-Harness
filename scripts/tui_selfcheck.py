@@ -6,10 +6,12 @@ import time
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
+from cvfx_harness.cli import configure_console_encoding
 from cvfx_harness.tui import TerminalUI
 
 
 def main() -> int:
+    configure_console_encoding()
     received: list[str] = []
 
     def worker(ui: TerminalUI) -> int:
