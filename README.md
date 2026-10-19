@@ -1,6 +1,6 @@
 # chenxiVFX Harness（最小原型）
 
-Windows 优先、中文交互的 AI 编程命令行工具。当前版本包含离线模拟模型、OpenAI 兼容 Chat Completions 适配、受限多轮工具调用、工作区文件读取与目录列表、经逐次批准的文件写入、差异预览和撤销、文件引用、计划模式、目标上下文、本地会话存档、可审核的上下文压缩、Token 估算和受限只读 Mock 子代理。
+Windows 优先、中文交互的 AI 编程命令行工具。当前版本包含离线模拟模型、工作区持久化运行配置、DeepSeek OpenAI 兼容 Chat Completions 适配、受限多轮工具调用、工作区文件读取与目录列表、经逐次批准的文件写入、差异预览和撤销、文件引用、计划模式、目标上下文、本地会话存档、可审核的上下文压缩、Token 估算和受限只读 Mock 子代理。
 
 这不是 Claude Code 或 Codex CLI 的完整复制品。功能状态和后续清单见[功能矩阵与可恢复任务清单](ROADMAP.md)，架构边界见[架构说明](ARCHITECTURE.md)。
 
@@ -36,18 +36,43 @@ python -m venv .venv
 
 | 命令 | 用途 |
 | --- | --- |
-| `/状态`、`/配置` | 查看模型、工作区、端点、预算提示与安全设置；密钥值不显示 |
+| `/状态`、`/配置` | 查看运行配置；`/配置` 还可设置提供商、模型、端点和持久预算；密钥值不显示 |
 | `/模式 计划`、`/模式 执行` | 计划模式会阻止工具写入；执行模式仍逐次询问 |
 | `/目标 <内容>`、`/目标 清空` | 设置或清除仅作为上下文的会话目标 |
 | `/保存 [名称]`、`/恢复 <名称>`、`/会话` | 保存安全对话、确认后恢复、列出工作区会话 |
 | `/检查点 <名称>` | 手写进度摘要，经脱敏预览和确认后保存；不自动收集工具结果 |
 | `/压缩 [保留轮数]` | 先预览本地摘要和将丢弃的旧轮次，确认后再应用 |
-| `/统计`、`/预算 [tokens]` | 查看当前估算上下文、累计用量和提供商报告；设置预算提示 |
+| `/统计`、`/预算 [tokens]` | 查看当前估算上下文、累计用量和提供商报告；`/预算` 临时设置本轮预算 |
 | `/子代理 任务甲 \| 任务乙` | 每项单独批准后执行最多 3 个隔离的一次性 Mock 子任务 |
 | `/撤销` | 预览并确认恢复最近一次 Harness 文件写入 |
 | `/退出` | 结束会话 |
 
 在提问里用 `@相对路径` 引用文件；路径含空格时写 `@{资料/需求 文档.txt}`。每次引用读取都要确认；内容随后会发送给所选提供商。模型也可请求逐次确认的目录列表，列表只包含名称与类型，不读取条目正文。敏感路径、工作区外路径、链接逃逸和非 UTF-8 文本默认拒绝。当前没有 shell 执行工具，PowerShell/cmd 命令不会执行。
+
+## 工作区配置
+
+运行设置保存在工作区 `.harness/config/settings.json`，该目录由 `.gitignore` 排除且模型文件工具无法读取。配置只接收非敏感字段，不接受 API Key 或其他凭据。优先级从低到高为：内置默认值、工作区配置、`HARNESS_*` 环境变量、命令行参数。支持的环境变量为 `HARNESS_PROVIDER`、`HARNESS_MODEL`、`HARNESS_BASE_URL`、`HARNESS_TOKEN_BUDGET` 和 `HARNESS_MAX_OUTPUT_TOKENS`。
+
+交互配置示例：
+
+```text
+/配置 提供商 openai
+/配置 模型 deepseek-flash
+/配置 端点 https://api.deepseek.com
+/配置 预算 32768
+/配置 输出上限 2048
+/配置
+```
+
+`提供商`、`模型`和`端点`保存后需重启才会切换本轮 provider；预算配置在没有更高优先级覆盖时立即应用。`/预算 16384` 只改当前会话。用 `/配置 模型 默认` 或 `/配置 端点 默认` 清除相应工作区覆盖；`/配置 重置` 写回默认值，但环境变量和命令行仍优先。若配置文件损坏，可用 `--ignore-config` 忽略它启动，再通过 `/配置` 保存新设置。
+
+当前只支持离线 `mock` 和 DeepSeek 的 OpenAI 兼容模式；Anthropic 和其他服务尚未实现。Base URL 必须是 HTTPS `api.deepseek.com:443`，不得包含 userinfo、查询参数、片段或看起来像凭据的文本；只允许配置服务地址，不要把密钥放入 URL。`DEEPSEEK_API_KEY` 只从环境读取，绝不写进配置文件；使用 Network secret 时目标主机限制仍为 `api.deepseek.com:443`。
+
+同样的非敏感设置也可在启动时用 `--provider`、`--model`、`--base-url`、`--token-budget` 和 `--max-output-tokens` 覆盖。超长或格式错误的输入不会被错误消息回显。配置文件损坏时可这样绕过并继续使用 Mock：
+
+```powershell
+.\.venv\Scripts\cvfx-harness.exe --workspace . --ignore-config --provider mock
+```
 
 ## 会话、压缩和 Token 统计
 
@@ -63,7 +88,7 @@ Token 数由本地字符启发式估算，不是提供商 tokenizer 的精确数
 
 ## DeepSeek OpenAI 兼容模式
 
-适配器默认端点为 `https://api.deepseek.com/chat/completions`，模型默认为 `deepseek-flash`；可用 `HARNESS_BASE_URL` 和 `HARNESS_MODEL` 覆盖端点与模型。选择 OpenAI 模式后，程序只读取 `DEEPSEEK_API_KEY`；Mock 模式不会查询这个变量。环境密钥只允许发往 `https://api.deepseek.com:443`。`/配置` 会显示变量名，不显示值；认证头不会进入模型消息、会话或 Harness 日志。请勿把密钥放进命令行、项目文件、聊天或 Git。
+适配器默认端点为 `https://api.deepseek.com/chat/completions`，模型默认为 `deepseek-flash`；工作区配置、环境变量和 CLI 参数可设置非敏感字段。选择 OpenAI 模式后，程序只读取 `DEEPSEEK_API_KEY`；Mock 模式不会查询这个变量。环境密钥只允许发往 `https://api.deepseek.com:443`。`/配置` 会显示变量名，不显示值；认证头不会进入模型消息、会话或 Harness 日志。请勿把密钥放进 URL、命令行、项目文件、聊天或 Git。
 
 本地 CLI 尚无隐藏输入界面；若直接使用普通环境变量，原值会进入 Harness 进程。若以后要在 Codex Cloud 使用 DeepSeek，用户可自行在该环境的 **Network secrets** 中添加变量 `DEEPSEEK_API_KEY`，Allowed domains 设为 `api.deepseek.com`。[Codex Cloud 官方说明](https://learn.chatgpt.com/docs/environments/cloud-environments)指出，Network secret 会以 placeholder 交给程序，并由代理在允许目标的 HTTPS 443 请求中替换原值，不把原始值放入本地进程或文件；普通 Environment variable 的值对 task 可见。保存环境改动后需要 Republish 并新建 task。网络密钥须使用自己的 Key，不能与同名直接环境变量冲突。
 

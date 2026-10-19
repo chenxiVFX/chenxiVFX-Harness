@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
+import unicodedata
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
@@ -15,6 +17,9 @@ from .usage import ProviderUsage, estimate_tokens
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 MAX_PROVIDER_TOOL_CALLS = 16
 MAX_PROVIDER_TOOL_ARGUMENT_BYTES = 128 * 1024
+_URL_CREDENTIAL_MARKER = re.compile(
+    r"(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|authorization)(?:=|%3d)"
+)
 
 
 class ProviderError(RuntimeError):
@@ -23,6 +28,65 @@ class ProviderError(RuntimeError):
 
 class ProviderCancelled(RuntimeError):
     """Raised when a caller cancels a provider operation at a safe boundary."""
+
+
+def validate_base_url(base_url: str) -> str:
+    """Validate an endpoint without echoing user-supplied URL text in errors."""
+    if (
+        not isinstance(base_url, str)
+        or not base_url
+        or len(base_url) > 2048
+        or base_url != base_url.strip()
+        or "\\" in base_url
+        or "?" in base_url
+        or "#" in base_url
+        or _URL_CREDENTIAL_MARKER.search(base_url) is not None
+        or any(char.isspace() or unicodedata.category(char).startswith("C") for char in base_url)
+    ):
+        raise ProviderError("Base URL 格式无效；不得包含凭据、查询参数、片段或控制字符。")
+    from .sessions import contains_likely_secret
+
+    if contains_likely_secret(base_url):
+        raise ProviderError("Base URL 疑似包含凭据；请只填写服务地址，不要填写任何密钥。")
+    try:
+        parsed = urlsplit(base_url)
+        _ = parsed.port  # Reject malformed ports before any request is constructed.
+        hostname = parsed.hostname
+    except ValueError:
+        raise ProviderError("Base URL 格式无效；请使用安全的 HTTPS 服务地址。") from None
+    if (
+        parsed.scheme not in {"https", "http"}
+        or not parsed.netloc
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ProviderError("Base URL 格式无效；不得包含凭据、查询参数或片段。")
+    if parsed.scheme != "https" and hostname.casefold() not in {"localhost", "127.0.0.1", "::1"}:
+        raise ProviderError("仅允许 HTTPS；HTTP 只对本机回环地址开放。")
+    return base_url
+
+
+def validate_deepseek_base_url(base_url: str) -> str:
+    """Restrict the configured DeepSeek key target to HTTPS on api.deepseek.com:443."""
+    if not isinstance(base_url, str) or len(base_url) > 2048:
+        raise ProviderError("Base URL 格式无效。")
+    try:
+        parsed = urlsplit(base_url)
+        port = parsed.port
+    except ValueError:
+        raise ProviderError("Base URL 格式无效。") from None
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").casefold() != "api.deepseek.com"
+        or port not in {None, 443}
+    ):
+        raise ProviderError(
+            f"使用 {DEEPSEEK_API_KEY_ENV} 时仅允许 HTTPS api.deepseek.com 的 443 端口。"
+        )
+    return validate_base_url(base_url)
 
 
 @dataclass
@@ -127,19 +191,7 @@ class OpenAICompatibleProvider:
     ) -> None:
         if not api_key:
             raise ProviderError("未提供 API 密钥。")
-        parsed = urlsplit(base_url)
-        if (
-            parsed.scheme not in {"https", "http"}
-            or not parsed.netloc
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ProviderError("Base URL 格式无效；请使用 HTTPS 服务地址。")
-        if parsed.scheme != "https" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
-            raise ProviderError("仅允许 HTTPS；HTTP 只对本机回环地址开放。")
-
+        base_url = validate_base_url(base_url)
         self.endpoint = self._chat_endpoint(base_url)
         self._api_key = api_key
         self.model = model
@@ -314,21 +366,9 @@ def provider_from_environment(
             else settings.get(DEEPSEEK_API_KEY_ENV, "")
         )
         if api_key_override is None and api_key:
-            try:
-                parsed = urlsplit(base_url)
-                port = parsed.port
-            except ValueError:
-                parsed = None
-                port = None
-            if (
-                parsed is None
-                or parsed.scheme != "https"
-                or (parsed.hostname or "").casefold() != "api.deepseek.com"
-                or port not in {None, 443}
-            ):
-                raise ProviderError(
-                    f"使用 {DEEPSEEK_API_KEY_ENV} 时仅允许 HTTPS api.deepseek.com 的 443 端口。"
-                )
+            base_url = validate_deepseek_base_url(base_url)
+        else:
+            base_url = validate_base_url(base_url)
         return OpenAICompatibleProvider(
             base_url=base_url,
             api_key=api_key,

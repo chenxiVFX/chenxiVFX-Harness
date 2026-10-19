@@ -128,6 +128,7 @@ class WorkspaceTests(unittest.TestCase):
             "private-secrets/archive.txt",
             ".git/config",
             ".harness/backups/sample.json",
+            ".harness/config/settings.json",
         )
         approvals: list[ActionRequest] = []
         for relative in blocked:

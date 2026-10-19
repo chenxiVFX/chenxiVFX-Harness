@@ -233,7 +233,7 @@ class Workspace:
     def _reject_internal_state_path(self, candidate: Path) -> None:
         parts = self._relative_parts(candidate)
         if _CONTROL_DIR.casefold() in parts:
-            raise WorkspaceError("Harness 备份目录是内部状态，工具不能读取或修改。")
+            raise WorkspaceError("Harness 内部状态目录不能由模型文件工具读取或修改。")
 
     def _reject_sensitive_path(self, candidate: Path, raw_path: str) -> None:
         parts = list(self._relative_parts(candidate))
@@ -356,7 +356,7 @@ class Workspace:
         )
 
     def internal_storage_dir(self, name: str, *, create: bool) -> Path | None:
-        if name not in {_BACKUP_DIR, "sessions"}:
+        if name not in {_BACKUP_DIR, "sessions", "config"}:
             raise WorkspaceError("未授权的 Harness 内部存储目录。")
         control = self.root / _CONTROL_DIR
         storage_dir = control / name
@@ -369,16 +369,16 @@ class Workspace:
                 except FileExistsError:
                     pass
                 except OSError as exc:
-                    raise WorkspaceError(f"无法创建撤销备份目录：{type(exc).__name__}") from None
+                    raise WorkspaceError(f"无法创建 Harness 内部目录：{type(exc).__name__}") from None
             if self._is_reparse_point(directory):
-                raise WorkspaceError("拒绝使用 junction/symlink 作为 Harness 备份目录。")
+                raise WorkspaceError("拒绝使用 junction/symlink 作为 Harness 内部目录。")
             try:
                 resolved = directory.resolve(strict=True)
                 resolved.relative_to(self.root)
             except (OSError, RuntimeError, ValueError):
-                raise WorkspaceError("Harness 备份目录必须位于工作区内且不能链接到外部。") from None
+                raise WorkspaceError("Harness 内部目录必须位于工作区内且不能链接到外部。") from None
             if not directory.is_dir():
-                raise WorkspaceError("Harness 备份路径不是目录。")
+                raise WorkspaceError("Harness 内部路径不是目录。")
         return storage_dir
 
     def _backup_dir(self, *, create: bool) -> Path | None:

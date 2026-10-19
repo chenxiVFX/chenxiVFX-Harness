@@ -1,8 +1,8 @@
-# 架构说明（v0.4）
+# 架构说明（v0.5）
 
 ## 运行边界
 
-项目使用 Python 3.11+ 标准库，提供 Windows PowerShell 启动脚本。默认 Mock provider；Mock 不查询 DeepSeek 密钥变量。真实 HTTP 只会在用户显式选择 OpenAI 兼容 provider 并提供凭据时调用。没有 shell 执行工具、自动文件写权限或常驻后台服务。
+项目使用 Python 3.11+ 标准库，提供 Windows PowerShell 启动脚本。默认 Mock provider；Mock 不查询 DeepSeek 密钥变量。工作区非敏感设置位于 `.harness/config/settings.json`，按默认值、工作区配置、环境变量、CLI 参数的顺序覆盖。真实 HTTP 只会在用户显式选择 DeepSeek OpenAI 兼容 provider 并提供凭据时调用。没有 shell 执行工具、自动文件写权限或常驻后台服务。
 
 ```text
 终端 UTF-8 输入
@@ -47,6 +47,7 @@ Agent 的 system message 在每个请求、恢复和压缩后保持固定文本�
 - 模型循环上限为 4 轮、每轮执行上限为 4 项；超出的工具调用仍回填“未执行”结果，末轮工具调用全部不执行。每次提问共享 2048 默认输出预算，CLI 可用 `--max-output-tokens` 调整（1–65536）。
 - 读操作每次单独批准；写操作先预览差异，再单独批准并备份；撤销也预览并再次确认。
 - `.harness/backups` 与 `.harness/sessions` 是 Harness 私有状态，不能通过模型工具访问。
+- `.harness/config/settings.json` 只存 provider/model/Base URL/预算等非敏感设置，拒绝重复键、未识别字段和疑似凭据，不包含 API Key；仅支持 Mock 与 DeepSeek OpenAI 兼容模式。`--ignore-config` 只跳过此文件以便修复损坏配置。
 - 目录 symlink 与硬链接逃逸通过实际链接 fixture 集成测试覆盖；junction 仅适用于 Windows。当前 Linux/Windows 与 Python 3.11/3.12 跨平台 CI 矩阵全部通过；若 Windows 系统拒绝创建测试 fixture，对应 Windows 用例会明确跳过。
 - 普通 Python 进程不能提供 OS 级沙箱。若未来加入 shell，须先设计并实测工作区隔离，不能把路径检查误称为进程沙箱。
 - 子代理仅从 CLI 明确列出的任务创建；工具层逐项展示确切任务文本并要求审批。每个 child 新建独立的 system/user 消息列表，不继承父会话、文件引用、工具结果、目标或工具 schema。仅有 `MockProvider.complete_subagent` 被开放；每项一次调用、输入最多 512 估算 tokens、输出最多 256 估算 tokens、超时 5 秒、最多 3 项、深度 0。

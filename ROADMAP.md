@@ -5,6 +5,7 @@
 | 能力 | 状态 | 当前边界 |
 | --- | --- | --- |
 | Windows 中文 CLI、帮助与 UTF-8 | 已实现 / 离线可测 | PowerShell 启动脚本、中文命令、UTF-8 I/O；Windows Python 3.13 本机运行 |
+| 工作区模型配置与启动优先级 | 已实现 / 离线可测 | `.harness/config/settings.json` 仅存非敏感设置；默认 < 工作区配置 < 环境变量 < CLI；DeepSeek 凭据仍只从环境读取 |
 | Mock provider | 已实现 / 离线可测 | 默认离线，不发请求、不读密钥 |
 | OpenAI 兼容 Chat Completions | 已实现 / 离线可测 | stdlib HTTP、`reasoning_content` 工具往返、usage、`max_tokens` 上限、429 不重试、脱敏错误和边界取消；无工具基础 smoke 与合成只读目录工具闭环已有限在线验证；其他产品路径仍未验收 |
 | DeepSeek API key 读取 | 已实现 / 离线可测 | OpenAI 模式读取 `DEEPSEEK_API_KEY`，只允许 HTTPS `api.deepseek.com:443`；Mock 不查询该值，配置页不显示。Network secret 的基本对话与合成目录只读工具闭环均已有限在线验证；其他工具与完整产品流程仍未验收 |
@@ -83,6 +84,15 @@
 - Debian 13 / Python 3.12：editable install、自检、compileall 和 65 项 unittest 通过（64 通过，1 项 Windows-only junction 用例跳过）；symlink 与 hard link 集成用例均执行通过。
 - GitHub Actions 的 `checkout` / `setup-python` tag 均固定到已核对的官方 commit SHA。运行 [39203303235](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39203303235) 的 Ubuntu/Windows、Python 3.11/3.12 四项 job 均以 `completed / success` 结束。
 - 安装自检与 CI 的实现提交为 `3f2f67009ec95e74cff8482f69e3110e597d3ba4`；记录 CI 结果的后续提交号见 Git 历史。
+
+## 工作区模型配置（2026-10-19）
+
+- 补齐 provider/model/Base URL/上下文预算/输出上限的工作区持久配置；支持中文 `/配置` 子命令、启动来源展示、环境变量与 CLI 高优先级覆盖、损坏配置的 `--ignore-config` 恢复入口。
+- 配置路径为 `.harness/config/settings.json`，严格 schema，不保存 API key；拒绝未知/凭据字段、userinfo、query、fragment、危险 scheme、非 DeepSeek host 和非 443 端口，错误不回显输入值。
+- 目前仅支持 Mock 和 DeepSeek OpenAI 兼容模式；Anthropic/其他服务明确未实现。DeepSeek 网络密钥的 HTTPS `api.deepseek.com:443` 目标限制保持强制。
+- 配置测试仅使用临时工作区、合成数据和 patched provider；不读取或写入密钥、不发真实请求。
+- 测试统计审计：`c6dab6e`、`3f2f670`、`cacfb7c` 均有 65 个测试方法，比较中没有删除或合并；旧版三个链接用例受 opt-in gate 跳过，因此“65 通过、3 跳过”措辞错误，按代码口径应是 65 总、62 通过、3 跳过。当前添加 14 个配置测试后共 79 项。
+- Debian 13 / Python 3.12 当前本地结果：79 总、78 通过、1 跳过（Windows-only junction）；symlink 与 hardlink 集成测试均执行通过。远端 Windows/Linux 矩阵将在推送后记录；未调用真实 API。
 
 ## 参考项目复用边界
 
