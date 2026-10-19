@@ -232,7 +232,8 @@
 - 写入、补丁和撤销在临时文件准备后再次按工作区目标核对内容、权限位与文件状态。若检查发现编辑冲突，不覆盖目标；原始备份和读取到的竞争版本快照（包括非 UTF-8 字节）保留在 Harness 私有撤销记录中。撤销遇到审批前外部修改时，在请求审批前保存原始字节快照并记录 `undo_conflict`，随后拒绝恢复。
 - 最后一次比较与文件系统 rename/replace 之间仍有不可移植的竞态；不声称通用 CAS，也不把 advisory lock 当作约束非协作编辑器的保证。Windows 仍使用 reparse 检查和路径式替换，存在相同的最后检查窗口。
 - Windows DACL 复制按存在/空状态、保护位和有序 ACE 全部内容（包括继承标志）核验，允许 Windows 对普通文件重算自动继承/默认来源标记与有效 ACL 格式/容量；并发检查和既有备份摘要仍使用原始快照。原生夹具同时覆盖未经预处理的默认 DACL、受保护/允许继承 DACL、stat 未变化但 DACL 变化的最后写入拒绝，以及撤销前/审批中 DACL 变化；UTF-8/二进制撤销冲突同时覆盖原文件恢复与新文件删除路径。Windows 夹具只修改测试自己的临时文件。
-- Debian / Python 3.12 本地离线回归：234 项，229 通过、5 项平台限定跳过（Windows junction 1 项、Windows DACL 4 项）；Windows 原生夹具须由 Windows CI 执行。`compileall`、安装自检、TUI 合成键盘自检、unittest/pytest 合成 profile 自检和 `git diff --check` 通过。只用临时合成文件与 Mock；结果不等同完整产品验收。
+- 新备份另存权限语义摘要，避免 Harness 自身写入/撤销引发的 Windows ACL 元数据转换误阻止连续撤销；原始快照仍用于审批、最后版本检查和冲突证据。旧记录保守沿用原始摘要，新记录缺少可核验 ACL 时拒绝撤销。
+- Debian / Python 3.12 本地离线回归：235 项，230 通过、5 项平台限定跳过（Windows junction 1 项、Windows DACL 4 项）；Windows 原生夹具须由 Windows CI 执行。`compileall`、安装自检、TUI 合成键盘自检、unittest/pytest 合成 profile 自检和 `git diff --check` 通过。只用临时合成文件与 Mock；结果不等同完整产品验收。
 
 ## 参考项目复用边界
 

@@ -570,6 +570,28 @@ class WorkspaceTests(unittest.TestCase):
                     Workspace._acl_sha256(Workspace._windows_dacl_token(target)),
                 )
 
+        with self.subTest(unverified_new_acl=True):
+            target = self.root / "windows-unverified-undo.txt"
+            run_tool(
+                self.workspace,
+                self.write_call(target.name, "harness write"),
+                approve_action=self.approve(),
+            )
+            backup_path, record = self.workspace._load_backups()[-1]
+            record["after_acl_permissions_sha256"] = None
+            backup_path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaises(WorkspaceConflictError):
+                self.workspace.undo_last(
+                    approve_action=lambda _request: self.fail("unverified ACL must not prompt")
+                )
+            self.assertEqual(target.read_bytes(), b"harness write")
+            record = self.workspace._load_backups()[-1][1]
+            self.assertTrue(record["undo_conflict"])
+            self.assertEqual(
+                base64.b64decode(record["conflict_snapshot"]["bytes_base64"]),
+                b"harness write",
+            )
+
     def test_commit_detects_last_moment_editor_change_and_keeps_recovery_snapshot(self) -> None:
         target = self.root / "last-moment-race.txt"
         target.write_bytes(b"before")
@@ -1145,6 +1167,22 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("--- a/新文件.txt", requests[0].diff)
         self.assertIn("+++ /dev/null", requests[0].diff)
 
+    def test_undo_accepts_legacy_backup_without_permissions_digest(self) -> None:
+        target = self.root / "legacy-backup.txt"
+        target.write_bytes(b"original")
+        run_tool(
+            self.workspace,
+            self.write_call(target.name, "harness write"),
+            approve_action=self.approve(),
+        )
+        backup_path, record = self.workspace._load_backups()[-1]
+        record.pop("after_acl_permissions_sha256")
+        backup_path.write_text(json.dumps(record), encoding="utf-8")
+
+        self.workspace.undo_last(approve_action=self.approve())
+
+        self.assertEqual(target.read_bytes(), b"original")
+
     def test_repeated_writes_undo_in_reverse_and_noop_creates_no_backup(self) -> None:
         call_a = self.write_call("repeat.txt", "A")
         first = run_tool(self.workspace, call_a, approve_action=self.approve())
@@ -1421,6 +1459,13 @@ class WorkspaceTests(unittest.TestCase):
         )
         corrupt = self.root / ".harness" / "backups" / "corrupt.json"
         corrupt.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(WorkspaceError, "备份格式无效"):
+            self.workspace.undo_last(approve_action=self.approve())
+        self.assertEqual((self.root / "safe.txt").read_text(encoding="utf-8"), "current")
+        corrupt.unlink()
+        backup_path, record = self.workspace._load_backups()[-1]
+        record["after_acl_permissions_sha256"] = "invalid-digest"
+        backup_path.write_text(json.dumps(record), encoding="utf-8")
         with self.assertRaisesRegex(WorkspaceError, "备份格式无效"):
             self.workspace.undo_last(approve_action=self.approve())
         self.assertEqual((self.root / "safe.txt").read_text(encoding="utf-8"), "current")

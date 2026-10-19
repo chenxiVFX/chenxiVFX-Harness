@@ -1364,6 +1364,12 @@ class Workspace:
     def _acl_sha256(token: bytes | None) -> str | None:
         return hashlib.sha256(token).hexdigest() if token is not None else None
 
+    @staticmethod
+    def _acl_permissions_sha256(token: bytes | None) -> str | None:
+        if token is None:
+            return None
+        return hashlib.sha256(Workspace._windows_dacl_copy_token(token)).hexdigest()
+
     def _persist_conflict_snapshot(
         self,
         backup_path: Path,
@@ -1479,6 +1485,7 @@ class Workspace:
             "after_acl_sha256": (
                 self._acl_sha256(preview.before_acl_token) if preview.existed else None
             ),
+            "after_acl_permissions_sha256": self._acl_permissions_sha256(preview.before_acl_token),
             "before_base64": (
                 base64.b64encode(preview.before_bytes).decode("ascii")
                 if preview.before_bytes is not None
@@ -1527,15 +1534,16 @@ class Workspace:
         record["state"] = "committed"
         if os.name == "nt":
             try:
-                record["after_acl_sha256"] = self._acl_sha256(
-                    self._windows_dacl_token(current_target)
-                )
+                after_acl_token = self._windows_dacl_token(current_target)
+                record["after_acl_sha256"] = self._acl_sha256(after_acl_token)
+                record["after_acl_permissions_sha256"] = self._acl_permissions_sha256(after_acl_token)
             except WorkspaceError:
-                # Permissions/inheritance were verified before replacement.
-                # Keep the original digest on failed readback: if Windows
-                # normalized ACL allocation, undo may conservatively reject.
+                # Existing-file copy already verified these access semantics.
+                # New files without readable ACL readback stay unverified and
+                # undo rejects them rather than assuming their permissions.
                 if not preview.existed:
                     record["after_acl_sha256"] = None
+                    record["after_acl_permissions_sha256"] = None
         try:
             self._atomic_write_json(backup_path, record)
         except (OSError, WorkspaceError):
@@ -1615,7 +1623,7 @@ class Workspace:
                             not isinstance(data.get(key), str)
                             or re.fullmatch(r"[0-9a-f]{64}", data.get(key, "")) is None
                         )
-                        for key in ("before_acl_sha256", "after_acl_sha256")
+                        for key in ("before_acl_sha256", "after_acl_sha256", "after_acl_permissions_sha256")
                     )
                     or (
                         "before_mode" in data
@@ -1768,10 +1776,26 @@ class Workspace:
             or not isinstance(expected_hash, str)
             or hashlib.sha256(current_bytes).hexdigest() != expected_hash
         )
-        acl_mismatch = (
-            isinstance(expected_acl_hash, str)
-            and self._acl_sha256(current_acl_token) != expected_acl_hash
-        )
+        if os.name == "nt" and "after_acl_permissions_sha256" in record:
+            expected_permissions_hash = record.get("after_acl_permissions_sha256")
+            try:
+                current_permissions_hash = self._acl_permissions_sha256(current_acl_token)
+            except WorkspaceError:
+                current_permissions_hash = None
+            # Harness write/undo can normalize ACL bookkeeping between byte
+            # versions. Compare persistent access semantics here, then retain
+            # raw snapshots for every approval/final race check below.
+            acl_mismatch = (
+                not isinstance(expected_permissions_hash, str)
+                or current_permissions_hash != expected_permissions_hash
+            )
+        else:
+            # Old records contain only a raw digest. Keep their conservative
+            # behavior; never infer permissions from an unavailable old ACL.
+            acl_mismatch = (
+                isinstance(expected_acl_hash, str)
+                and self._acl_sha256(current_acl_token) != expected_acl_hash
+            )
         if content_mismatch or acl_mismatch:
             conflict = WorkspaceConflictError(
                 "当前文件内容或权限状态与 Harness 最近一次写入不匹配，检测到版本发生变化。",
