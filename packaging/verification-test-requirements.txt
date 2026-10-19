@@ -1,4 +1,6 @@
 # Verification-only, pure-Python wheels from official PyPI.
+colorama==0.4.6 \
+    --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6
 iniconfig==2.1.0 \
     --hash=sha256:9deba5723312380e77435581c6bf4935c94cbfab9b1ed33ef8d238ea168eb760
 packaging==25.0 \
