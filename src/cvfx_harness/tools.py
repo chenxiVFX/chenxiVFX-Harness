@@ -216,6 +216,7 @@ class ActionRequest:
     backup_id: str | None = None
     source: str = "tool"
     file_existed: bool | None = None
+    trusted_file_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2816,12 +2817,13 @@ def run_tool(
         )
         if not preview.changed:
             return "补丁结果与当前文件相同，没有写入，也未创建撤销备份。"
-        approval_diff = (
-            f"目标：{preview.canonical_path}\n"
-            f"预期原文件 SHA-256：{actual_sha256}\n"
-            f"{preview.diff}"
+        approval_diff = preview.diff
+        approval_display = (
+            f"目标文件：{preview.canonical_path}\n"
+            f"工作区原文件指纹（SHA-256 前 16 位）：{actual_sha256[:16]}…\n"
+            f"变化（+ 新增，- 删除）：\n{approval_diff}"
         )
-        if _safe_terminal_display_length(approval_diff) > PATCH_APPROVAL_DISPLAY_LIMIT:
+        if _safe_terminal_display_length(approval_display) > PATCH_APPROVAL_DISPLAY_LIMIT:
             raise WorkspaceError("补丁审批预览超过终端显示上限；请缩小本次修改范围。")
         request = ActionRequest(
             operation="patch",
@@ -2829,6 +2831,7 @@ def run_tool(
             diff=approval_diff,
             source="tool",
             file_existed=True,
+            trusted_file_sha256=actual_sha256,
         )
         if not approve_action(request):
             return "用户拒绝本次补丁；文件未修改，也未创建撤销备份。"

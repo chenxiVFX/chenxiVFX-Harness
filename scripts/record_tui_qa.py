@@ -152,6 +152,7 @@ def _child(workspace: str, log_path: str, source_sha256: str) -> int:
 
     original_input = TerminalUI.input
     original_output = TerminalUI.output
+    original_resolve = TerminalUI._resolve_pending
 
     def audited_input(self, prompt: str) -> str:
         value = original_input(self, prompt)
@@ -164,8 +165,22 @@ def _child(workspace: str, log_path: str, source_sha256: str) -> int:
             _audit("compression_cancelled")
         original_output(self, value)
 
+    def audited_resolve(self, **kwargs: Any) -> None:
+        if (
+            self._pending is not None
+            and self._pending.approval
+            and self._prompt.startswith("确认应用这个精确补丁？")
+        ):
+            _audit(
+                "patch_approval_view",
+                prompt=self._prompt,
+                context=self._approval_text,
+            )
+        original_resolve(self, **kwargs)
+
     TerminalUI.input = audited_input
     TerminalUI.output = audited_output
+    TerminalUI._resolve_pending = audited_resolve
     return cli.main(["--workspace", workspace, "--provider", "mock"])
 
 
@@ -306,6 +321,11 @@ def _prepare_workspace(workspace: Path) -> str:
 def _exercise(walk: PtyWalkthrough, workspace: Path) -> None:
     walk.ready()
     walk.mark("main")
+    initial_fingerprint = hashlib.sha256(
+        (workspace / "src" / "配置.py").read_bytes()
+    ).hexdigest()[:16]
+    walk.command("/状态", expect=f"工作区：{workspace.resolve()}")
+    walk.mark("status-full-info")
 
     # A first-time user can leave the staged editor without creating settings.
     walk.command("/配置 编辑", expect="提供商 [", wait_ready=False)
@@ -355,7 +375,11 @@ def _exercise(walk: PtyWalkthrough, workspace: Path) -> None:
     patch_deny_start = len(walk.raw)
     walk.send("\t\r")
     walk.wait("BUDGET_THRESHOLD = 24000", start=patch_deny_start)
-    walk.wait("确认应用这一个精确补丁？", start=patch_deny_start)
+    walk.wait(
+        f"工作区原文件指纹（SHA-256 前 16 位）：{initial_fingerprint}…",
+        start=patch_deny_start,
+    )
+    walk.wait("确认应用这个精确补丁？", start=patch_deny_start)
     walk.mark("patch-deny")
     walk.send("\r")
     walk.wait("补丁被拒绝；文件未改动。")
@@ -369,7 +393,7 @@ def _exercise(walk: PtyWalkthrough, workspace: Path) -> None:
     patch_accept_start = len(walk.raw)
     walk.send("\t\r")
     walk.wait("BUDGET_THRESHOLD = 32768", start=patch_accept_start)
-    walk.wait("确认应用这一个精确补丁？", start=patch_accept_start)
+    walk.wait("确认应用这个精确补丁？", start=patch_accept_start)
     walk.mark("patch-approval")
     walk.send("\t\r\r")
     walk.wait("精确补丁已获批准并应用一次。")
@@ -514,9 +538,27 @@ def main() -> int:
             ]
             if [item.get("denied") for item in patch_results] != [True, False]:
                 raise RuntimeError("patch deny/accept outcomes did not match the walkthrough")
+            patch_views = [item for item in log if item.get("kind") == "patch_approval_view"]
+            if len(patch_views) != 2:
+                raise RuntimeError("expected two reviewed patch approval panels")
+            for view in patch_views:
+                context = view.get("context", "")
+                if (
+                    view.get("prompt") != "确认应用这个精确补丁？"
+                    or "目标文件：src/配置.py" not in context
+                    or f"工作区原文件指纹（SHA-256 前 16 位）：{source_sha256[:16]}…" not in context
+                    or "确认应用" in context
+                    or "补丁差异" in context
+                ):
+                    raise RuntimeError("patch target/fingerprint review panel was malformed or repeated its question")
             if not any(item.get("kind") == "plan" for item in log):
                 raise RuntimeError("offline provider did not receive a plan proposal request")
             walk.save_cast()
+            recorded_output = "".join(
+                event[2] for event in walk.events if event[1] == "o"
+            )
+            if "预期原文件 SHA-256：[已脱敏]" in recorded_output:
+                raise RuntimeError("the trusted patch fingerprint was redacted in the PTY display")
             print(f"Recorded {len(walk.events)} PTY events to {output}")
             print("Synthetic offline flow passed: config, search, patch deny/accept, test approval, session, plan, compression, narrow resize.")
             return 0

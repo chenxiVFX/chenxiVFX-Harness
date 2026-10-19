@@ -320,8 +320,8 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), expected)
         self.assertEqual(len(approvals), 1)
         self.assertEqual(approvals[0].operation, "patch")
-        self.assertIn("目标：说明.txt", approvals[0].diff)
-        self.assertIn(hashlib.sha256(source).hexdigest(), approvals[0].diff)
+        self.assertEqual(approvals[0].path, "说明.txt")
+        self.assertEqual(approvals[0].trusted_file_sha256, hashlib.sha256(source).hexdigest())
         self.assertIn("-旧值", approvals[0].diff)
         self.assertIn("+新值", approvals[0].diff)
 

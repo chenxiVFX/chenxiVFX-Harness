@@ -110,6 +110,18 @@ def _format_turn_indexes(indexes: tuple[int, ...]) -> str:
     return "、".join(formatted)
 
 
+def _safe_untrusted_terminal_text(text: str) -> str:
+    redacted, _count = redact_likely_secrets(text)
+    return _safe_terminal_text(redacted)
+
+
+def _short_file_fingerprint(fingerprint: str | None) -> str | None:
+    """Show a short prefix only for a separately supplied, canonical SHA-256."""
+    if not isinstance(fingerprint, str) or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
+        return None
+    return f"{fingerprint[:16]}…"
+
+
 def _terminal_cell_width(text: str) -> int:
     return sum(
         2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
@@ -464,7 +476,7 @@ def _help_text() -> str:
     return """命令：
   /帮助              显示帮助
   /命令              列出可用的中文命令
-  /状态              显示当前模型、目标和模式
+  /状态              显示完整提供商、模型、工作区、目标和模式（顶栏会随宽度省略）
   /模式 计划|执行    切换计划或执行模式（计划模式会拦截写入与撤销）
   /目标 <内容>       设置本会话目标；/目标 清空 可清除
   /计划              查看计划及状态
@@ -772,22 +784,22 @@ def _confirm_action(
     input_fn: Callable[[str], str],
     output: Callable[[str], None],
 ) -> bool:
-    safe_path = _safe_terminal_text(request.path)
+    safe_path = _safe_untrusted_terminal_text(request.path)
     if request.operation == "read":
         source = "你引用的文件" if request.source == "reference" else "模型请求读取的文件"
         prompt = f"\n{source} {safe_path!r} 会发送给模型。确认读取？[y/N] "
     elif request.operation == "list":
         prompt = f"\n模型请求查看目录 {safe_path!r} 的名称和类型。确认列出？[y/N] "
     elif request.operation == "search":
-        preview = _safe_terminal_text(request.diff) or "（没有搜索范围详情）"
+        preview = _safe_untrusted_terminal_text(request.diff) or "（没有搜索范围详情）"
         output(f"\n工作区文本搜索审批范围 {safe_path!r}：\n{preview}")
         prompt = "确认搜索该范围并将脱敏匹配片段发送给模型？[y/N] "
     elif request.operation == "undo":
-        diff = _safe_terminal_text(request.diff) or "（内容无差异）"
-        output(f"\n撤销差异（备份 {_safe_terminal_text(request.backup_id or '')}）：\n{diff}")
+        diff = _safe_untrusted_terminal_text(request.diff) or "（内容无差异）"
+        output(f"\n撤销差异（备份 {_safe_untrusted_terminal_text(request.backup_id or '')}）：\n{diff}")
         prompt = f"确认恢复写入前内容 {safe_path!r}？[y/N] "
     elif request.operation == "delegate":
-        scope = _safe_terminal_text(request.diff) or "（没有任务内容）"
+        scope = _safe_untrusted_terminal_text(request.diff) or "（没有任务内容）"
         output(
             "\n子代理审批范围：每个子代理只接收所列任务及明确列出的只读路径；"
             "不包含主会话、父代理文件引用或父代理工具结果。\n"
@@ -795,27 +807,44 @@ def _confirm_action(
         )
         prompt = "确认授权这些隔离子任务？[y/N] "
     elif request.operation == "run_test":
-        preview = _safe_terminal_text(request.diff) or "（没有测试运行详情）"
+        preview = _safe_untrusted_terminal_text(request.diff) or "（没有测试运行详情）"
         output(
             f"\n测试运行审批 {safe_path!r}：\n{preview}\n"
             "测试代码会以当前用户权限运行，不是沙箱；网络访问没有被屏蔽。"
         )
         prompt = "确认启动这一次用户配置测试？[y/N] "
     elif request.operation == "share_test_output":
-        preview = _safe_terminal_text(request.diff) or "（没有测试输出）"
+        preview = _safe_untrusted_terminal_text(request.diff) or "（没有测试输出）"
         output(f"\n向模型分享测试输出审批 {safe_path!r}：\n{preview}")
         prompt = "确认把以上已脱敏输出发送给当前模型？[y/N] "
     elif request.operation == "patch":
-        diff = _safe_terminal_text(request.diff) or "（内容无差异）"
-        output(f"\n局部补丁审批 {safe_path!r}：\n{diff}")
-        prompt = "确认应用这一个精确补丁？[y/N] "
+        fingerprint = _short_file_fingerprint(request.trusted_file_sha256)
+        if fingerprint is None:
+            output("补丁没有可验证的工作区原文件指纹；本次补丁默认拒绝。")
+            return False
+        raw_lines = request.diff.splitlines()
+        if (
+            len(raw_lines) >= 2
+            and raw_lines[0].startswith("--- ")
+            and raw_lines[1].startswith("+++ ")
+        ):
+            raw_lines = raw_lines[2:]
+        diff = _safe_untrusted_terminal_text("\n".join(raw_lines)) or "（内容无差异）"
+        output(
+            "\n补丁差异\n"
+            f"目标文件：{safe_path}\n"
+            f"工作区原文件指纹（SHA-256 前 16 位）：{fingerprint}\n"
+            "变化（+ 新增，- 删除）：\n"
+            f"{diff}"
+        )
+        prompt = "确认应用这个精确补丁？[y/N] "
     elif request.operation == "write":
         change_kind = (
             "新建文件" if request.file_existed is False
             else "覆盖已有文件" if request.file_existed is True
             else "工作区文件"
         )
-        diff = _safe_terminal_text(request.diff) or "（内容无差异）"
+        diff = _safe_untrusted_terminal_text(request.diff) or "（内容无差异）"
         output(f"\n{change_kind}差异 {safe_path!r}：\n{diff}")
         prompt = f"确认写入（{change_kind}）此工作区文件？[y/N] "
     else:

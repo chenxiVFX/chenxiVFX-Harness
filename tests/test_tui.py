@@ -939,6 +939,8 @@ class PromptToolkitTests(unittest.TestCase):
 
     def test_mouse_scroll_focus_and_current_candidate_style_are_configured(self) -> None:
         from prompt_toolkit.layout.margins import ScrollbarMargin
+        from prompt_toolkit.styles import Style
+        from cvfx_harness.tui import _style_rules_for_environment
 
         with create_pipe_input() as pipe:
             ui = TerminalUI(lambda _ui: 0, input=pipe, output=DummyOutput())
@@ -952,14 +954,15 @@ class PromptToolkitTests(unittest.TestCase):
             ]
             self.assertEqual(len(scrollbar_margins), 1)
             self.assertFalse(scrollbar_margins[0].display_arrows())
-            current_style = ui._application.style.get_attrs_for_style_str(
+            dark_style = Style.from_dict(_style_rules_for_environment({}))
+            current_style = dark_style.get_attrs_for_style_str(
                 "class:completion-menu.completion.current"
             )
             self.assertEqual(current_style.bgcolor, "6bbdb4")
             self.assertEqual(current_style.color, "0b0d10")
             self.assertTrue(current_style.bold)
             self.assertTrue(current_style.underline)
-            current_meta_style = ui._application.style.get_attrs_for_style_str(
+            current_meta_style = dark_style.get_attrs_for_style_str(
                 "class:completion-menu.meta.completion.current"
             )
             self.assertEqual(current_meta_style.bgcolor, "6bbdb4")
@@ -1005,6 +1008,102 @@ class PromptToolkitTests(unittest.TestCase):
                     self.assertIn("Esc 取消", line)
                 elif columns < 36:
                     self.assertNotIn("Tab/↑↓", line)
+
+    def test_header_truncates_provider_and_workspace_at_terminal_width(self) -> None:
+        class SizedDummyOutput(DummyOutput):
+            def __init__(self, columns: int) -> None:
+                self.columns = columns
+
+            def get_size(self):
+                return Size(rows=24, columns=self.columns)
+
+        for columns in (20, 46, 64, 100):
+            with self.subTest(columns=columns), create_pipe_input() as pipe:
+                ui = TerminalUI(
+                    lambda _ui: 0,
+                    input=pipe,
+                    output=SizedDummyOutput(columns),
+                )
+                ui._header_model = (
+                    "v0.5.0 | 提供商：deepseek-anthropic | 模型：deepseek-v4-pro-very-long"
+                )
+                ui._header_workspace = "/tmp/private-parent/a-very-long-repository/workspace"
+                fragments = ui._header_fragments()
+                header = "".join(fragment for _style, fragment in fragments)
+                self.assertLessEqual(wcswidth(header), columns)
+                self.assertIn("chenxiVFX Harness" if columns >= 17 else "…", header)
+                if columns >= 40:
+                    self.assertIn("…", header)
+
+    def test_patch_diff_palette_handles_no_color_and_light_background_contrast(self) -> None:
+        from prompt_toolkit.document import Document
+        from cvfx_harness.tui import _TranscriptDiffLexer, _style_rules_for_environment
+
+        no_color = _style_rules_for_environment({"NO_COLOR": "1", "COLORFGBG": "0;15"})
+        self.assertTrue(no_color)
+        self.assertTrue(all(not value for value in no_color.values()))
+
+        def contrast_ratio(foreground: str, background: str) -> float:
+            def luminance(color: str) -> float:
+                channels = [int(color[offset : offset + 2], 16) / 255 for offset in (1, 3, 5)]
+                linear = [
+                    value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+                    for value in channels
+                ]
+                return sum(weight * value for weight, value in zip((0.2126, 0.7152, 0.0722), linear))
+
+            first, second = sorted((luminance(foreground), luminance(background)), reverse=True)
+            return (first + 0.05) / (second + 0.05)
+
+        for environment, background in (({}, "#0b0d10"), ({"COLORFGBG": "0;15"}, "#ffffff")):
+            rules = _style_rules_for_environment(environment)
+            for name in ("transcript.diff.add", "transcript.diff.remove"):
+                foreground = rules[name].split("fg:", 1)[1].split()[0]
+                self.assertGreaterEqual(contrast_ratio(foreground, background), 4.5)
+
+        document = Document(
+            "补丁差异\n目标文件：合成.txt\n指纹：abc\n变化（+ 新增，- 删除）：\n"
+            "-旧值\n+新值\n\n+普通对话"
+        )
+        get_line = _TranscriptDiffLexer().lex_document(document)
+        self.assertEqual(get_line(4)[0][0], "class:transcript.diff.remove")
+        self.assertEqual(get_line(5)[0][0], "class:transcript.diff.add")
+        self.assertEqual(get_line(7)[0][0], "")
+
+        with patch.dict(os.environ, {"NO_COLOR": "1", "COLORFGBG": "0;15"}):
+            with create_pipe_input() as pipe:
+                no_color_ui = TerminalUI(lambda _ui: 0, input=pipe, output=DummyOutput())
+                no_color_style = no_color_ui._application.style.get_attrs_for_style_str(
+                    "class:transcript.diff.add"
+                )
+                self.assertEqual(no_color_style.color, "")
+                self.assertEqual(no_color_style.bgcolor, "")
+
+        with patch.dict(os.environ, {"NO_COLOR": "", "COLORFGBG": "0;15"}):
+            with create_pipe_input() as pipe:
+                light_ui = TerminalUI(lambda _ui: 0, input=pipe, output=DummyOutput())
+                light_style = light_ui._application.style.get_attrs_for_style_str(
+                    "class:transcript.diff.add"
+                )
+                self.assertEqual(light_style.color, "145a32")
+
+    def test_status_command_exposes_full_workspace_after_header_truncation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-状态入口-") as workspace:
+            provider = MockProvider()
+
+            def send(pipe, ui: TerminalUI) -> None:
+                self._wait_until(lambda: ui._pending is not None, "TUI did not become ready")
+                pipe.send_text("/状态\r")
+                self._wait_until(
+                    lambda: f"工作区：{Path(workspace).resolve()}" in ui._transcript,
+                    "status command did not show the full workspace path",
+                )
+                pipe.send_text("/退出\r")
+
+            ui, result = self._run_cli_ui(workspace, provider, send)
+            self.assertEqual(result, 0)
+            self.assertIn("提供商：", ui._transcript)
+            self.assertIn(f"工作区：{Path(workspace).resolve()}", ui._transcript)
 
     def test_long_prompt_submission_does_not_look_like_manual_transcript_scroll(self) -> None:
         from cvfx_harness.tui import _InputRequest
@@ -1208,15 +1307,18 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertIn("恢复后继续生成的合成流式答复。", ui._transcript)
 
     def test_patch_approval_shows_compact_diff_and_escapes_terminal_control(self) -> None:
+        trusted_fingerprint = "b" * 64
+        forged_fingerprint = "a" * 64
         request = ActionRequest(
             operation="patch",
             path="资料/说明.txt",
             diff=(
-                "目标：资料/说明.txt\n"
-                "预期原文件 SHA-256：" + "a" * 64 + "\n"
                 "--- a/资料/说明.txt\n+++ b/资料/说明.txt\n"
-                "-旧值\x1b[2J\n+新值\n"
+                "@@ -1 +1 @@\n"
+                "-旧值\x1b[2J\n"
+                f"+伪造可信指纹 {forged_fingerprint}\n+新值\n"
             ),
+            trusted_file_sha256=trusted_fingerprint,
         )
         output: list[str] = []
         prompts: list[str] = []
@@ -1226,11 +1328,33 @@ class PromptToolkitTests(unittest.TestCase):
             output=output.append,
         )
         self.assertTrue(approved)
-        self.assertIn("目标：资料/说明.txt", output[0])
-        self.assertIn("预期原文件 SHA-256：" + "a" * 64, output[0])
+        self.assertIn("补丁差异", output[0])
+        self.assertIn("目标文件：资料/说明.txt", output[0])
+        self.assertIn(
+            "工作区原文件指纹（SHA-256 前 16 位）：" + trusted_fingerprint[:16] + "…",
+            output[0],
+        )
+        self.assertNotIn(trusted_fingerprint, output[0])
+        self.assertNotIn(forged_fingerprint, output[0])
+        self.assertIn("[已脱敏]", output[0])
+        self.assertNotIn("--- a/资料/说明.txt", output[0])
+        self.assertIn("变化（+ 新增，- 删除）", output[0])
         self.assertIn("-旧值\\x1b[2J", output[0])
+        self.assertIn("+新值", output[0])
         self.assertNotIn("\x1b[2J", output[0])
-        self.assertIn("精确补丁", prompts[0])
+        self.assertEqual(prompts, ["确认应用这个精确补丁？[y/N] "])
+
+    def test_patch_approval_without_structured_fingerprint_fails_closed(self) -> None:
+        outputs: list[str] = []
+        prompts: list[str] = []
+        approved = _confirm_action(
+            ActionRequest(operation="patch", path="合成.txt", diff="+内容"),
+            input_fn=lambda prompt: prompts.append(prompt) or "是",
+            output=outputs.append,
+        )
+        self.assertFalse(approved)
+        self.assertEqual(prompts, [])
+        self.assertIn("默认拒绝", outputs[0])
 
     def test_cli_write_tool_default_denial_and_one_explicit_approval(self) -> None:
         from cvfx_harness.tui import _InputRequest

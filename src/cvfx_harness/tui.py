@@ -6,7 +6,7 @@ import queue
 import re
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from prompt_toolkit import Application
 from prompt_toolkit.clipboard import DummyClipboard
@@ -26,6 +26,7 @@ from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.margins import ScrollbarMargin
 from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Button, TextArea
 from wcwidth import wcswidth
@@ -62,6 +63,149 @@ ENUM_COMPLETIONS = {
     "/压缩": ("撤销",),
 }
 _APPROVAL_PROMPT = re.compile(r"\[y/N\]\s*$", re.IGNORECASE)
+
+
+def _terminal_background_is_light(environment: Mapping[str, str]) -> bool:
+    """Recognize the common COLORFGBG light-background palette indices."""
+    colorfgbg = environment.get("COLORFGBG", "")
+    if not colorfgbg:
+        return False
+    background = colorfgbg.rsplit(";", 1)[-1].strip().casefold()
+    if background in {"white", "light", "lightgray", "lightgrey"}:
+        return True
+    try:
+        return int(background, 10) in {7, 15}
+    except ValueError:
+        return False
+
+
+def _style_rules_for_environment(
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    env = os.environ if environment is None else environment
+    dark = {
+        "": "fg:#d8dee6 bg:#0b0d10",
+        "header": "bg:#0b0d10",
+        "header.brand": "fg:#6bbdb4 bold",
+        "header.muted": "fg:#84909b",
+        "header.workspace": "fg:#c1c9d2",
+        "status": "fg:#aab4bf bg:#11151a",
+        "prompt": "fg:#6bbdb4 bold",
+        "input": "fg:#e1e6ec",
+        "input.separator": "fg:#303942",
+        "transcript": "fg:#d1d7df",
+        "transcript.diff.add": "fg:#8bd49c",
+        "transcript.diff.remove": "fg:#f09ca5",
+        "transcript.diff.meta": "fg:#89939f",
+        "empty.background": "bg:#0b0d10",
+        "empty.title": "fg:#6bbdb4 bg:#0b0d10 bold",
+        "empty.hint": "fg:#8b96a1 bg:#0b0d10",
+        "approval": "fg:#d8dee6",
+        "approval.heading": "fg:#6bbdb4 bold",
+        "button": "fg:#adb7c1 bg:#0b0d10",
+        "button.focused": "fg:#0b0d10 bg:#6bbdb4 bold underline",
+        "completion-menu": "bg:#0b0d10",
+        "completion-menu.completion": "fg:#d4dbe3 bg:#0b0d10",
+        "completion-menu.completion.current": "fg:#0b0d10 bg:#6bbdb4 bold underline",
+        "completion-menu.meta.completion": "fg:#8c98a4 bg:#0b0d10",
+        "completion-menu.meta.completion.current": "fg:#0b0d10 bg:#6bbdb4 bold underline",
+    }
+    if env.get("NO_COLOR"):
+        return {name: "" for name in dark}
+    if not _terminal_background_is_light(env):
+        return dark
+
+    return {
+        "": "fg:#20252b bg:#ffffff",
+        "header": "bg:#ffffff",
+        "header.brand": "fg:#075e59 bold",
+        "header.muted": "fg:#4c5965",
+        "header.workspace": "fg:#303943",
+        "status": "fg:#374151 bg:#f1f3f5",
+        "prompt": "fg:#075e59 bold",
+        "input": "fg:#20252b",
+        "input.separator": "fg:#c4cbd3",
+        "transcript": "fg:#20252b",
+        "transcript.diff.add": "fg:#145a32",
+        "transcript.diff.remove": "fg:#9e2434",
+        "transcript.diff.meta": "fg:#59636e",
+        "empty.background": "bg:#ffffff",
+        "empty.title": "fg:#075e59 bg:#ffffff bold",
+        "empty.hint": "fg:#59636e bg:#ffffff",
+        "approval": "fg:#20252b",
+        "approval.heading": "fg:#075e59 bold",
+        "button": "fg:#424b55 bg:#ffffff",
+        "button.focused": "fg:#ffffff bg:#075e59 bold underline",
+        "completion-menu": "bg:#ffffff",
+        "completion-menu.completion": "fg:#20252b bg:#ffffff",
+        "completion-menu.completion.current": "fg:#ffffff bg:#075e59 bold underline",
+        "completion-menu.meta.completion": "fg:#59636e bg:#ffffff",
+        "completion-menu.meta.completion.current": "fg:#ffffff bg:#075e59 bold underline",
+    }
+
+
+class _TranscriptDiffLexer(Lexer):
+    """Style unified diff additions and deletions only inside patch previews."""
+
+    def lex_document(self, document):
+        styles: list[str] = [""] * document.line_count
+        in_diff = False
+        for index, line in enumerate(document.lines):
+            if in_diff and not line:
+                in_diff = False
+            if line == "补丁差异":
+                in_diff = False
+                continue
+            if line.startswith("变化（+ 新增，- 删除）："):
+                in_diff = True
+                continue
+            if line.startswith("审批选择："):
+                in_diff = False
+            if not in_diff:
+                continue
+            if line.startswith(("--- ", "+++ ", "@@")):
+                styles[index] = "class:transcript.diff.meta"
+            elif line.startswith("+"):
+                styles[index] = "class:transcript.diff.add"
+            elif line.startswith("-"):
+                styles[index] = "class:transcript.diff.remove"
+
+        lines = document.lines
+
+        def get_line(index: int):
+            if index < 0 or index >= len(lines):
+                return []
+            line = lines[index]
+            return [(styles[index], line)] if styles[index] else [("", line)]
+
+        return get_line
+
+
+def _truncate_cells(text: str, width: int, *, from_start: bool = False) -> str:
+    if width <= 0:
+        return ""
+    if wcswidth(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    shown: list[str] = []
+    used = 0
+    characters = reversed(text) if from_start else iter(text)
+    for character in characters:
+        cell_width = max(0, wcswidth(character))
+        if used + cell_width > width - 1:
+            break
+        shown.append(character)
+        used += cell_width
+    body = "".join(reversed(shown)) if from_start else "".join(shown)
+    return f"…{body}" if from_start else f"{body}…"
+
+
+def _short_workspace_label(path: str) -> str:
+    parts = [part for part in re.split(r"[\\/]+", path.rstrip("\\/")) if part]
+    if len(parts) > 1:
+        return f"…/{parts[-2]}/{parts[-1]}"
+    return parts[0] if parts else path
 
 
 def _safe_text(value: str) -> str:
@@ -303,6 +447,7 @@ class TerminalUI:
             focus_on_click=True,
             wrap_lines=True,
             scrollbar=True,
+            lexer=_TranscriptDiffLexer(),
             height=Dimension(min=1, max=8),
             style="class:transcript",
         )
@@ -405,36 +550,7 @@ class TerminalUI:
         self._application = Application(
             layout=Layout(content, focused_element=self.input_area),
             key_bindings=self._bindings,
-            style=Style.from_dict(
-                {
-                    "": "fg:#d8dee6 bg:#0b0d10",
-                    "header": "bg:#0b0d10",
-                    "header.brand": "fg:#6bbdb4 bold",
-                    "header.muted": "fg:#84909b",
-                    "header.workspace": "fg:#c1c9d2",
-                    "status": "fg:#aab4bf bg:#11151a",
-                    "prompt": "fg:#6bbdb4 bold",
-                    "input": "fg:#e1e6ec",
-                    "input.separator": "fg:#303942",
-                    "transcript": "fg:#d1d7df",
-                    "empty.background": "bg:#0b0d10",
-                    "empty.title": "fg:#6bbdb4 bg:#0b0d10 bold",
-                    "empty.hint": "fg:#8b96a1 bg:#0b0d10",
-                    "approval": "fg:#d8dee6",
-                    "approval.heading": "fg:#6bbdb4 bold",
-                    "button": "fg:#adb7c1 bg:#0b0d10",
-                    "button.focused": "fg:#0b0d10 bg:#6bbdb4 bold underline",
-                    "completion-menu": "bg:#0b0d10",
-                    "completion-menu.completion": "fg:#d4dbe3 bg:#0b0d10",
-                    "completion-menu.completion.current": (
-                        "fg:#0b0d10 bg:#6bbdb4 bold underline"
-                    ),
-                    "completion-menu.meta.completion": "fg:#8c98a4 bg:#0b0d10",
-                    "completion-menu.meta.completion.current": (
-                        "fg:#0b0d10 bg:#6bbdb4 bold underline"
-                    ),
-                }
-            ),
+            style=Style.from_dict(_style_rules_for_environment()),
             full_screen=True,
             erase_when_done=False,
             mouse_support=True,
@@ -537,7 +653,13 @@ class TerminalUI:
                         self._approval_choice_yes = False
                         self._update_approval_buttons()
                         context = self._last_output
-                        if any(marker in context for marker in ("差异", "审批范围")):
+                        patch_context = context.lstrip("\n")
+                        if patch_context.startswith("补丁差异\n"):
+                            # The full diff remains in the transcript above; the
+                            # approval dock keeps just the target and trusted
+                            # file fingerprint next to the decision buttons.
+                            self._approval_text = "\n".join(patch_context.splitlines()[1:3])
+                        elif any(marker in context for marker in ("差异", "审批范围")):
                             self._approval_text = _safe_text(context)
                         else:
                             self._approval_text = self._prompt
@@ -833,7 +955,7 @@ class TerminalUI:
         return "输入任务  ·  /命令"
 
     def _header_fragments(self) -> list[tuple[str, str]]:
-        fragments = [("class:header.brand", "chenxiVFX Harness")]
+        brand = "chenxiVFX Harness"
         metadata = self._header_model
         if metadata:
             parts = [part.strip() for part in metadata.split("|")]
@@ -852,9 +974,56 @@ class TerminalUI:
                     .strip()
                 )
                 metadata = f"{version}  {provider} / {model}"
-            fragments.append(("class:header.muted", f"  {metadata}"))
-        if self._header_workspace:
-            fragments.append(("class:header.workspace", f"  {self._header_workspace}"))
+        workspace = _short_workspace_label(self._header_workspace) if self._header_workspace else ""
+        try:
+            columns = max(0, self._application.output.get_size().columns)
+        except (AttributeError, NotImplementedError, OSError):
+            columns = 80
+
+        brand_width = max(0, wcswidth(brand))
+        if columns <= brand_width:
+            return [("class:header.brand", _truncate_cells(brand, columns))]
+
+        has_metadata = bool(metadata)
+        has_workspace = bool(workspace)
+        separator_width = 2 * (int(has_metadata) + int(has_workspace))
+        content_width = max(0, columns - brand_width - separator_width)
+        if content_width == 0:
+            return [("class:header.brand", brand)]
+        if has_metadata and has_workspace and content_width < 12:
+            metadata_budget = content_width
+            workspace_budget = 0
+        elif has_metadata and has_workspace:
+            workspace_budget = min(
+                max(0, wcswidth(workspace)),
+                max(1, content_width // 3),
+            )
+            metadata_budget = max(0, content_width - workspace_budget)
+            if wcswidth(metadata) < metadata_budget:
+                workspace_budget = min(
+                    max(0, wcswidth(workspace)),
+                    workspace_budget + metadata_budget - wcswidth(metadata),
+                )
+                metadata_budget = content_width - workspace_budget
+        elif has_metadata:
+            metadata_budget = content_width
+            workspace_budget = 0
+        else:
+            metadata_budget = 0
+            workspace_budget = content_width
+
+        fragments = [("class:header.brand", brand)]
+        if has_metadata and metadata_budget:
+            fragments.append(
+                ("class:header.muted", f"  {_truncate_cells(metadata, metadata_budget)}")
+            )
+        if has_workspace and workspace_budget:
+            fragments.append(
+                (
+                    "class:header.workspace",
+                    f"  {_truncate_cells(workspace, workspace_budget, from_start=True)}",
+                )
+            )
         return fragments
 
     def _select_no(self) -> None:
