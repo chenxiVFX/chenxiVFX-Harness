@@ -91,10 +91,17 @@ def _stream_transport_category(error: BaseException, stage: str) -> str:
     if isinstance(error, urllib.error.URLError) and isinstance(error.reason, BaseException):
         reason = error.reason
     timeout_codes = {errno.ETIMEDOUT, 10060}  # POSIX ETIMEDOUT and Winsock WSAETIMEDOUT.
+    would_block_codes = {errno.EAGAIN, errno.EWOULDBLOCK, 10035}  # Winsock WSAEWOULDBLOCK.
     if (
         isinstance(reason, TimeoutError)
         or getattr(reason, "errno", None) in timeout_codes
         or getattr(reason, "winerror", None) == 10060
+    ):
+        return "connect_timeout" if stage in {"connect", "response_headers"} else "read_timeout"
+    if (
+        isinstance(reason, BlockingIOError)
+        or getattr(reason, "errno", None) in would_block_codes
+        or getattr(reason, "winerror", None) == 10035
     ):
         return "connect_timeout" if stage in {"connect", "response_headers"} else "read_timeout"
     if isinstance(reason, ssl.SSLError):
@@ -721,9 +728,10 @@ class OpenAICompatibleProvider:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise ProviderStreamError("SSE 流超过总时限。")
+                    poll_timeout = min(STREAM_READ_POLL_SECONDS, remaining)
                     if raw_socket is not None:
                         try:
-                            raw_socket.settimeout(min(STREAM_READ_POLL_SECONDS, remaining))
+                            raw_socket.settimeout(poll_timeout)
                         except OSError:
                             try:
                                 socket_closed = raw_socket.fileno() < 0
@@ -735,6 +743,7 @@ class OpenAICompatibleProvider:
                             # response data can still be consumed and EOF is bounded.
                             raw_socket = None
                     try:
+                        read_started_at = time.monotonic()
                         chunk = response.read1(8192)
                     except http.client.IncompleteRead as exc:
                         if isinstance(exc.partial, bytes):
@@ -749,6 +758,14 @@ class OpenAICompatibleProvider:
                         continue
                     except (OSError, urllib.error.URLError) as exc:
                         category = _stream_transport_category(exc, stage)
+                        if (
+                            category == "transport_error"
+                            and stage == "response_body"
+                            and time.monotonic() - read_started_at >= poll_timeout * 0.8
+                        ):
+                            # Some platform transports surface their socket timeout as a
+                            # generic OSError; a poll-length read still has a safe timeout label.
+                            category = "read_timeout"
                         message = {
                             "read_timeout": "SSE 响应读取超时。",
                             "tls_failure": "SSE TLS 安全传输失败。",

@@ -1366,6 +1366,7 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn(private_text, str(caught.exception))
         self.assertEqual(_stream_transport_category(OSError(10060, private_text), "connect"), "connect_timeout")
         self.assertEqual(_stream_transport_category(OSError(10060, private_text), "response_body"), "read_timeout")
+        self.assertEqual(_stream_transport_category(OSError(10035, private_text), "response_body"), "read_timeout")
 
         malformed = b"data: {\xff}\n\n"
 
@@ -1446,6 +1447,25 @@ class ProviderTests(unittest.TestCase):
                     on_text_delta=lambda _fragment: None,
                 )
         self.assertTrue(cancellation_response.closed)
+
+        class SlowSocketErrorResponse(TrackingResponse):
+            def read1(self, _size: int) -> bytes:
+                time.sleep(0.1)
+                raise OSError("synthetic transport detail must remain hidden")
+
+        slow_response = SlowSocketErrorResponse()
+        bounded_provider = OpenAICompatibleProvider(
+            "http://127.0.0.1:9", "", "fixture-model", timeout=1, stream_timeout=0.12
+        )
+        with patch("urllib.request.urlopen", return_value=slow_response):
+            with self.assertRaises(ProviderStreamError) as caught:
+                bounded_provider.complete_streaming(
+                    [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
+                )
+        self.assertEqual(caught.exception.diagnostics.category, "read_timeout")
+        self.assertEqual(caught.exception.diagnostics.stage, "response_body")
+        self.assertNotIn("synthetic transport detail", str(caught.exception))
+        self.assertTrue(slow_response.closed)
 
     def test_sse_tls_proxy_reports_slow_read_and_disconnect_diagnostics(self) -> None:
         prefix = fixture_sse_frames([
