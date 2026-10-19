@@ -231,7 +231,8 @@
 - unified diff 为缺少末尾换行的变更行输出标准 `\ No newline at end of file` 标记，避免新旧行粘连。
 - 写入、补丁和撤销在临时文件准备后再次按工作区目标核对内容、权限位与文件状态。若检查发现编辑冲突，不覆盖目标；原始备份和读取到的竞争版本快照（包括非 UTF-8 字节）保留在 Harness 私有撤销记录中。撤销遇到审批前外部修改时，在请求审批前保存原始字节快照并记录 `undo_conflict`，随后拒绝恢复。
 - 最后一次比较与文件系统 rename/replace 之间仍有不可移植的竞态；不声称通用 CAS，也不把 advisory lock 当作约束非协作编辑器的保证。Windows 仍使用 reparse 检查和路径式替换，存在相同的最后检查窗口。
-- Debian / Python 3.12 本地离线回归：231 项，228 通过、3 项平台限定跳过（Windows junction 1 项、Windows DACL 2 项）；覆盖普通权限保留、Windows-only protected/inherited DACL 和 ACL-only 冲突夹具、审批前 UTF-8/二进制撤销冲突快照。`compileall`、安装自检、TUI 合成键盘自检、unittest/pytest 合成 profile 自检和 `git diff --check` 通过。只用临时合成文件与 Mock；结果不等同完整产品验收。
+- Windows DACL 复制按继承控制位和有序 ACE 内容核验，忽略不定义权限的 ACL 缓冲区容量/保留字段；并发检查和既有备份摘要仍使用原始快照。新增夹具检查 stat 未变化但 DACL 变化的最后写入拒绝，以及撤销前/审批中 DACL 变化；UTF-8/二进制撤销冲突同时覆盖原文件恢复与新文件删除路径。Windows 夹具只修改测试自己的临时文件。
+- Debian / Python 3.12 本地离线回归：234 项，229 通过、5 项平台限定跳过（Windows junction 1 项、Windows DACL 4 项）；Windows 原生夹具须由 Windows CI 执行。`compileall`、安装自检、TUI 合成键盘自检、unittest/pytest 合成 profile 自检和 `git diff --check` 通过。只用临时合成文件与 Mock；结果不等同完整产品验收。
 
 ## 参考项目复用边界
 

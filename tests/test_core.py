@@ -115,14 +115,14 @@ def _set_windows_dacl_protection(path: Path, protected: bool) -> None:
         ctypes.byref(descriptor),
     )
     if status != 0 or not descriptor.value:
-        raise AssertionError("could not read synthetic Windows DACL")
+        raise AssertionError(f"could not read synthetic Windows DACL: status {status}")
     try:
         protection = 0x80000000 if protected else 0x20000000
         status = set_named(
             str(path), 1, dacl_information | protection, None, None, dacl, None
         )
         if status != 0:
-            raise AssertionError("could not set synthetic Windows DACL protection")
+            raise AssertionError(f"could not set synthetic Windows DACL protection: status {status}")
     finally:
         local_free(descriptor)
 
@@ -386,6 +386,54 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("4755 → 0755", requests[0].diff)
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
 
+    def test_windows_dacl_copy_comparison_preserves_permissions_not_buffer_capacity(self) -> None:
+        # Synthetic S-1-0-0 SID, never an account or environment identifier.
+        sid = bytes((1, 1)) + bytes(10)
+
+        def ace(kind: int, flags: int, mask: int) -> bytes:
+            return bytes((kind, flags)) + (20).to_bytes(2, "little") + mask.to_bytes(4, "little") + sid
+
+        def snapshot(entries: tuple[bytes, ...], extra_capacity: int = 0, control: int = 0x1400) -> bytes:
+            used = 8 + sum(len(entry) for entry in entries)
+            acl = (
+                bytes((2, 0))
+                + (used + extra_capacity).to_bytes(2, "little")
+                + len(entries).to_bytes(2, "little")
+                + bytes(2)
+                + b"".join(entries)
+            )
+            return (
+                b"cvfx-windows-dacl-v1\0"
+                + control.to_bytes(2, "little")
+                + bytes((1, 0))
+                + len(acl).to_bytes(4, "little")
+                + acl
+            )
+
+        allow = ace(0, 0x10, 1)
+        deny = ace(1, 0, 2)
+        expected = Workspace._windows_dacl_copy_token(snapshot((allow, deny)))
+        self.assertEqual(
+            Workspace._windows_dacl_copy_token(snapshot((allow, deny), extra_capacity=64)),
+            expected,
+        )
+        for changed in (
+            snapshot((deny, allow)),
+            snapshot((ace(0, 0, 1), deny)),
+            snapshot((ace(0, 0x10, 4), deny)),
+            snapshot((allow, deny), control=0x0400),
+        ):
+            self.assertNotEqual(Workspace._windows_dacl_copy_token(changed), expected)
+        empty_acl = snapshot((), control=0)
+        null_acl = b"cvfx-windows-dacl-v1\0" + bytes((0, 0, 1, 0)) + bytes(4)
+        self.assertNotEqual(
+            Workspace._windows_dacl_copy_token(empty_acl),
+            Workspace._windows_dacl_copy_token(null_acl),
+        )
+        for invalid in (b"", snapshot((allow,))[:-1], snapshot((allow,)) + b"extra"):
+            with self.assertRaises(WorkspaceError):
+                Workspace._windows_dacl_copy_token(invalid)
+
     @unittest.skipUnless(os.name == "nt", "Windows DACL semantics require a Windows fixture")
     def test_write_preserves_protected_and_inherited_windows_dacls(self) -> None:
         for index, protected in enumerate((True, False)):
@@ -407,7 +455,11 @@ class WorkspaceTests(unittest.TestCase):
                 )
 
                 self.assertEqual(target.read_bytes(), b"after")
-                self.assertEqual(Workspace._windows_dacl_token(target), before_token)
+                self.assertTrue(
+                    Workspace._windows_dacl_copy_token(Workspace._windows_dacl_token(target))
+                    == Workspace._windows_dacl_copy_token(before_token),
+                    "Windows DACL or inheritance changed after replacement",
+                )
 
     @unittest.skipUnless(os.name == "nt", "Windows DACL semantics require a Windows fixture")
     def test_windows_dacl_only_change_after_approval_is_a_conflict(self) -> None:
@@ -439,6 +491,67 @@ class WorkspaceTests(unittest.TestCase):
             snapshot["acl_sha256"],
             Workspace._acl_sha256(Workspace._windows_dacl_token(target)),
         )
+
+    @unittest.skipUnless(os.name == "nt", "Windows DACL semantics require a Windows fixture")
+    def test_windows_final_write_guard_checks_dacl_without_stat_changes(self) -> None:
+        target = self.root / "windows-final-dacl-race.txt"
+        target.write_bytes(b"before")
+        _set_windows_dacl_protection(target, True)
+        original_copy = Workspace._copy_windows_dacl
+
+        def change_after_copy(source: Path, destination: Path) -> None:
+            original_copy(source, destination)
+            _set_windows_dacl_protection(source, False)
+
+        with (
+            patch.object(Workspace, "_copy_windows_dacl", side_effect=change_after_copy),
+            patch.object(Workspace, "_stat_token", return_value=(1,)),
+            self.assertRaisesRegex(WorkspaceConflictError, "并发文件变化"),
+        ):
+            run_tool(
+                self.workspace,
+                self.write_call(target.name, "after"),
+                approve_action=self.approve(),
+            )
+
+        self.assertEqual(target.read_bytes(), b"before")
+        record = self.workspace._load_backups()[-1][1]
+        self.assertEqual(record["state"], "conflict")
+        self.assertEqual(
+            record["conflict_snapshot"]["acl_sha256"],
+            Workspace._acl_sha256(Workspace._windows_dacl_token(target)),
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows DACL semantics require a Windows fixture")
+    def test_windows_undo_rejects_dacl_changes_before_and_during_approval(self) -> None:
+        for during_approval in (False, True):
+            with self.subTest(during_approval=during_approval):
+                target = self.root / f"windows-undo-dacl-{during_approval}.txt"
+                target.write_bytes(b"original")
+                _set_windows_dacl_protection(target, True)
+                run_tool(
+                    self.workspace,
+                    self.write_call(target.name, "harness write"),
+                    approve_action=self.approve(),
+                )
+
+                def approve(_request: ActionRequest) -> bool:
+                    self.assertTrue(during_approval, "DACL conflict must not prompt")
+                    _set_windows_dacl_protection(target, False)
+                    return True
+
+                if not during_approval:
+                    _set_windows_dacl_protection(target, False)
+                with self.assertRaises(WorkspaceConflictError):
+                    self.workspace.undo_last(approve_action=approve)
+
+                self.assertEqual(target.read_bytes(), b"harness write")
+                record = self.workspace._load_backups()[-1][1]
+                self.assertTrue(record["undo_conflict"])
+                self.assertEqual(
+                    record["conflict_snapshot"]["acl_sha256"],
+                    Workspace._acl_sha256(Workspace._windows_dacl_token(target)),
+                )
 
     def test_commit_detects_last_moment_editor_change_and_keeps_recovery_snapshot(self) -> None:
         target = self.root / "last-moment-race.txt"
@@ -1084,17 +1197,24 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(target.read_text(encoding="utf-8"), "external edit")
 
     def test_undo_saves_utf8_and_binary_external_conflict_snapshots(self) -> None:
-        for filename, external_bytes in (
-            ("utf8-conflict.txt", "编辑器的外部修改".encode("utf-8")),
-            ("binary-conflict.txt", b"\xff\x00editor change"),
-        ):
+        cases = (
+            (f"{before_exists}-{label}-conflict.txt", before_exists, external_bytes)
+            for before_exists in (False, True)
+            for label, external_bytes in (
+                ("utf8", "编辑器的外部修改".encode("utf-8")),
+                ("binary", b"\xff\x00editor change"),
+            )
+        )
+        for filename, before_exists, external_bytes in cases:
             with self.subTest(filename=filename):
+                target = self.root / filename
+                if before_exists:
+                    target.write_bytes(b"original")
                 run_tool(
                     self.workspace,
                     self.write_call(filename, "harness write"),
                     approve_action=self.approve(),
                 )
-                target = self.root / filename
                 target.write_bytes(external_bytes)
 
                 with self.assertRaisesRegex(WorkspaceConflictError, "未覆盖当前文件"):
@@ -1111,6 +1231,11 @@ class WorkspaceTests(unittest.TestCase):
                     if record["path"] == filename
                 )
                 self.assertTrue(record["undo_conflict"])
+                self.assertEqual(record["before_exists"], before_exists)
+                if before_exists:
+                    self.assertEqual(
+                        base64.b64decode(record["before_base64"]), b"original"
+                    )
                 snapshot = record["conflict_snapshot"]
                 self.assertEqual(
                     base64.b64decode(snapshot["bytes_base64"]), external_bytes

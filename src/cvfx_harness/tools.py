@@ -1006,6 +1006,40 @@ class Workspace:
             local_free(descriptor)
 
     @staticmethod
+    def _windows_dacl_copy_token(snapshot: bytes) -> bytes:
+        """Compare ordered ACEs and inheritance, excluding ACL buffer allocation."""
+        prefix = b"cvfx-windows-dacl-v1\0"
+        header_size = len(prefix) + 8
+        if not snapshot.startswith(prefix) or len(snapshot) < header_size:
+            raise WorkspaceError("Windows DACL 快照无效；目标文件未替换。")
+        state = snapshot[len(prefix) : len(prefix) + 4]
+        acl_length = int.from_bytes(snapshot[len(prefix) + 4 : header_size], "little")
+        acl = snapshot[header_size:]
+        if len(acl) != acl_length:
+            raise WorkspaceError("Windows DACL 快照长度无效；目标文件未替换。")
+        if not acl:
+            return state + b"\0"
+        if len(acl) < 8 or int.from_bytes(acl[2:4], "little") < len(acl):
+            raise WorkspaceError("Windows DACL 结构无效；目标文件未替换。")
+        ace_count = int.from_bytes(acl[4:6], "little")
+        entries: list[bytes] = []
+        offset = 8
+        for _ in range(ace_count):
+            if offset + 4 > len(acl):
+                raise WorkspaceError("Windows DACL 条目无效；目标文件未替换。")
+            size = int.from_bytes(acl[offset + 2 : offset + 4], "little")
+            if size < 4 or offset + size > len(acl):
+                raise WorkspaceError("Windows DACL 条目长度无效；目标文件未替换。")
+            entries.append(acl[offset : offset + size])
+            offset += size
+        if offset != len(acl):
+            raise WorkspaceError("Windows DACL 条目范围无效；目标文件未替换。")
+        # Preserve ACE order and every ACE byte, including inheritance flags,
+        # access masks, SIDs, object GUIDs, and callback/conditional data. The ACL
+        # header's capacity/reserved fields do not describe access permissions.
+        return state + b"\1" + acl[:1] + ace_count.to_bytes(2, "little") + b"".join(entries)
+
+    @staticmethod
     def _copy_windows_dacl(source: Path, destination: Path) -> None:
         if os.name != "nt":
             return
@@ -1091,7 +1125,9 @@ class Workspace:
                 raise WorkspaceError("无法保留目标 Windows DACL 及继承状态；目标文件未替换。")
         finally:
             local_free(descriptor)
-        if Workspace._windows_dacl_token(source) != Workspace._windows_dacl_token(destination):
+        source_token = Workspace._windows_dacl_copy_token(Workspace._windows_dacl_token(source))
+        destination_token = Workspace._windows_dacl_copy_token(Workspace._windows_dacl_token(destination))
+        if source_token != destination_token:
             raise WorkspaceError("替换文件的 Windows DACL 与继承状态不匹配；目标文件未替换。")
 
     def _snapshot_matches(
@@ -1484,8 +1520,9 @@ class Workspace:
                     self._windows_dacl_token(current_target)
                 )
             except WorkspaceError:
-                # Existing-file replacement already verified that the copied
-                # DACL matched the source token before the rename.
+                # Permissions/inheritance were verified before replacement.
+                # Keep the original digest on failed readback: if Windows
+                # normalized ACL allocation, undo may conservatively reject.
                 if not preview.existed:
                     record["after_acl_sha256"] = None
         try:

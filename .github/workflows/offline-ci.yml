@@ -53,20 +53,5 @@ jobs:
       - name: Compile project and tests
         run: python -m compileall -q src tests scripts
 
-      - name: Run offline tests (Linux)
-        if: runner.os == 'Linux'
-        run: python -m unittest discover -s tests -v
-
-      - name: Run offline tests (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $testLog = Join-Path $env:RUNNER_TEMP "offline-tests.log"
-          python -m unittest discover -s tests -v 2>&1 | Tee-Object -FilePath $testLog
-          $testExitCode = $LASTEXITCODE
-          if ($testExitCode -ne 0) {
-            $summary = ((Get-Content $testLog -Tail 25) -join "`n")
-            $summary = $summary.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
-            Write-Output "::error title=Offline test failure::$summary"
-          }
-          exit $testExitCode
+      - name: Run offline tests and annotate failures
+        run: python scripts/offline_tests_ci.py
