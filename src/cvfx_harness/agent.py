@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from .providers import AssistantTurn, Provider, ToolCall
+from .providers import AssistantTurn, Provider, ProviderCancelled, ProviderError, ToolCall
 from .sessions import contains_likely_secret
 from .tools import ApprovalCallback, TOOL_SCHEMAS, Workspace, WorkspaceError, run_tool
 from .usage import DEFAULT_TOKEN_BUDGET, UsageStats, estimate_payload_tokens, estimate_tokens
@@ -18,6 +19,10 @@ SYSTEM_PROMPT = """你是 Windows 优先的中文编程助手。用简体中文�
 当前没有命令执行工具；不得暗示或模拟执行了 PowerShell、cmd 或其他 shell 命令。"""
 MAX_TOOL_ROUNDS = 4
 MAX_TOOL_CALLS_PER_ROUND = 4
+MAX_TOOL_CALLS_PER_RESPONSE = 16
+MAX_TOOL_ARGUMENT_BYTES = 128 * 1024
+DEFAULT_MAX_OUTPUT_TOKENS = 2048
+READ_LIMIT_RESPONSE = 64 * 1024
 
 
 @dataclass
@@ -47,13 +52,17 @@ class Agent:
         *,
         approve_action: ApprovalCallback,
         token_budget: int = DEFAULT_TOKEN_BUDGET,
+        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     ) -> None:
         if type(token_budget) is not int or not 1024 <= token_budget <= 1_000_000:
             raise ValueError("token_budget must be between 1024 and 1000000")
+        if type(max_output_tokens) is not int or not 1 <= max_output_tokens <= 65536:
+            raise ValueError("max_output_tokens must be between 1 and 65536")
         self.provider = provider
         self.workspace = workspace
         self.approve_action = approve_action
         self.token_budget = token_budget
+        self.max_output_tokens = max_output_tokens
         self.goal = ""
         self.usage = UsageStats()
         self.turns: list[ConversationTurn] = []
@@ -84,6 +93,7 @@ class Agent:
         *,
         references: list[tuple[str, str]] | None = None,
         plan_only: bool = False,
+        cancellation_event: threading.Event | None = None,
     ) -> str:
         references = references or []
         content = self._user_content(user_text, self.goal, references)
@@ -95,56 +105,202 @@ class Agent:
         self.persistence_tainted = self.persistence_tainted or taint_this_turn
         self.turns.append(turn)
         self._rebuild_messages()
-
-        for _ in range(MAX_TOOL_ROUNDS):
-            estimated_input = estimate_payload_tokens(self.messages, TOOL_SCHEMAS)
-            self.usage.record_request(estimated_input)
-            response = self.provider.complete(self.messages, TOOL_SCHEMAS)
-            self.usage.record_response(
-                estimate_tokens(response.content or ""), response.usage
-            )
-            assistant_message = response.assistant_message or {
-                "role": "assistant",
-                "content": response.content,
-            }
-            turn.messages.append(assistant_message)
-            if response.tool_calls:
-                turn.persistable = False
-                turn.kind = "tool"
-                self.persistence_tainted = True
-            if contains_likely_secret(response.content or ""):
-                turn.persistable = False
-                self.persistence_tainted = True
-            self._rebuild_messages()
-
-            if not response.tool_calls:
-                turn.complete = True
-                return response.content or "（模型没有返回文本。）"
-
-            for index, call in enumerate(response.tool_calls):
-                if index >= MAX_TOOL_CALLS_PER_ROUND:
-                    result = "本轮工具调用数超过本地上限；该调用未执行。"
-                else:
-                    try:
-                        result = run_tool(
-                            self.workspace,
-                            call,
-                            approve_action=self.approve_action,
-                            plan_only=plan_only,
-                        )
-                    except WorkspaceError as exc:
-                        result = f"操作被工作区策略阻止：{exc}"
-                turn.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.call_id,
-                        "content": result[:READ_LIMIT_RESPONSE],
-                    }
+        try:
+            consumed_output_tokens = 0
+            seen_call_ids: set[str] = set()
+            for round_index in range(MAX_TOOL_ROUNDS):
+                self._raise_if_cancelled(cancellation_event)
+                remaining = self.max_output_tokens - consumed_output_tokens
+                if remaining < 1:
+                    raise ProviderError("本轮模型输出预算已耗尽；后续工具未执行。")
+                estimated_input = estimate_payload_tokens(self.messages, TOOL_SCHEMAS)
+                self.usage.record_request(estimated_input)
+                response = self.provider.complete(
+                    self.messages,
+                    TOOL_SCHEMAS,
+                    cancellation_event=cancellation_event,
+                    max_tokens=remaining,
                 )
-            self._rebuild_messages()
+                self._raise_if_cancelled(cancellation_event)
+                if not isinstance(response, AssistantTurn):
+                    raise ProviderError("模型响应格式无效。")
+                self._validate_tool_calls(response.tool_calls, seen_call_ids)
+                if not isinstance(response.content, str):
+                    raise ProviderError("模型响应格式无效。")
+                response_tokens = self._estimate_response_tokens(response)
+                self.usage.record_response(response_tokens, response.usage)
+                consumed_output_tokens += response_tokens
+                if consumed_output_tokens > self.max_output_tokens:
+                    raise ProviderError("模型响应超过本地输出预算；本轮工具未执行。")
 
-        turn.complete = True
-        return "已达到工具轮数上限。本次会话已停止继续调用工具。"
+                assistant_message = response.assistant_message or {
+                    "role": "assistant",
+                    "content": response.content,
+                }
+                if not isinstance(assistant_message, dict) or assistant_message.get("role") != "assistant":
+                    raise ProviderError("模型响应格式无效。")
+                assistant_message = dict(assistant_message)
+                if set(assistant_message) - {"role", "content", "reasoning_content", "tool_calls"}:
+                    raise ProviderError("模型响应格式无效。")
+                if assistant_message.get("content") is not None and not isinstance(
+                    assistant_message.get("content"), str
+                ):
+                    raise ProviderError("模型响应格式无效。")
+                reasoning_content = assistant_message.get("reasoning_content")
+                if reasoning_content is not None and not isinstance(reasoning_content, str):
+                    raise ProviderError("模型响应格式无效。")
+                if response.tool_calls:
+                    raw_calls = assistant_message.get("tool_calls")
+                    if raw_calls is not None:
+                        if not isinstance(raw_calls, list) or len(raw_calls) != len(response.tool_calls):
+                            raise ProviderError("模型返回了格式无效的工具调用。")
+                        for raw_call, call in zip(raw_calls, response.tool_calls):
+                            try:
+                                raw_args = raw_call["function"]["arguments"]
+                                parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else None
+                                matches = (
+                                    isinstance(raw_call, dict)
+                                    and raw_call.get("id") == call.call_id
+                                    and raw_call["function"].get("name") == call.name
+                                    and parsed_args == call.arguments
+                                )
+                            except (KeyError, TypeError, json.JSONDecodeError, RecursionError):
+                                matches = False
+                            if not matches:
+                                raise ProviderError("模型返回了格式无效的工具调用。")
+                    assistant_message["tool_calls"] = [
+                        {
+                            "id": call.call_id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": json.dumps(
+                                    call.arguments, ensure_ascii=False, separators=(",", ":")
+                                ),
+                            },
+                        }
+                        for call in response.tool_calls
+                    ]
+                elif assistant_message.get("tool_calls"):
+                    raise ProviderError("模型返回了格式无效的工具调用。")
+                else:
+                    assistant_message.pop("tool_calls", None)
+                turn.messages.append(assistant_message)
+                if response.tool_calls:
+                    turn.persistable = False
+                    turn.kind = "tool"
+                    self.persistence_tainted = True
+                if contains_likely_secret(json.dumps(assistant_message, ensure_ascii=False, default=str)):
+                    turn.persistable = False
+                    self.persistence_tainted = True
+                self._rebuild_messages()
+
+                if not response.tool_calls:
+                    turn.complete = True
+                    return response.content or "（模型没有返回文本。）"
+
+                reached_round_limit = round_index + 1 >= MAX_TOOL_ROUNDS
+                reached_output_limit = consumed_output_tokens >= self.max_output_tokens
+                for index, call in enumerate(response.tool_calls):
+                    if reached_round_limit:
+                        result = "已达到工具轮数上限；该调用未执行。"
+                    elif reached_output_limit:
+                        result = "已达到本次提问输出上限；该调用未执行。"
+                    elif index >= MAX_TOOL_CALLS_PER_ROUND:
+                        result = "本轮工具调用数超过本地上限；该调用未执行。"
+                    else:
+                        self._raise_if_cancelled(cancellation_event)
+                        try:
+                            result = run_tool(
+                                self.workspace,
+                                call,
+                                approve_action=self.approve_action,
+                                plan_only=plan_only,
+                                cancellation_event=cancellation_event,
+                            )
+                        except WorkspaceError as exc:
+                            result = f"操作被工作区策略阻止：{exc}"
+                    turn.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.call_id,
+                            "content": result[:READ_LIMIT_RESPONSE],
+                        }
+                    )
+                self._rebuild_messages()
+                if reached_round_limit or reached_output_limit:
+                    answer = (
+                        "已达到工具轮数上限。本次未执行最后一轮工具调用。"
+                        if reached_round_limit
+                        else "已达到本次提问输出上限。本轮工具调用未执行。"
+                    )
+                    turn.messages.append({"role": "assistant", "content": answer})
+                    turn.complete = True
+                    self._rebuild_messages()
+                    return answer
+            raise ProviderError("工具循环意外终止。")
+        except BaseException:
+            # Never leave a partial assistant/tool exchange in the next provider request.
+            if self.turns and self.turns[-1] is turn:
+                self.turns.pop()
+                self._rebuild_messages()
+            raise
+
+    @staticmethod
+    def _raise_if_cancelled(cancellation_event: threading.Event | None) -> None:
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise ProviderCancelled("agent request cancelled")
+
+    @staticmethod
+    def _estimate_response_tokens(response: AssistantTurn) -> int:
+        reasoning = (
+            response.assistant_message.get("reasoning_content", "")
+            if isinstance(response.assistant_message, dict)
+            else ""
+        )
+        payload = {
+            "content": response.content,
+            "reasoning_content": reasoning,
+            "tool_calls": [
+                {"id": call.call_id, "name": call.name, "arguments": call.arguments}
+                for call in response.tool_calls
+            ],
+        }
+        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+        estimate = estimate_tokens(serialized)
+        if response.usage is not None:
+            estimate = max(estimate, response.usage.completion_tokens)
+        return estimate
+
+    @staticmethod
+    def _validate_tool_calls(calls: list[ToolCall], seen_call_ids: set[str]) -> None:
+        if not isinstance(calls, list) or len(calls) > MAX_TOOL_CALLS_PER_RESPONSE:
+            raise ProviderError("模型返回了格式无效的工具调用。")
+        current_ids: set[str] = set()
+        for call in calls:
+            if (
+                not isinstance(call, ToolCall)
+                or not isinstance(call.call_id, str)
+                or not call.call_id
+                or len(call.call_id) > 128
+                or not isinstance(call.name, str)
+                or not call.name
+                or len(call.name) > 128
+                or not isinstance(call.arguments, dict)
+            ):
+                raise ProviderError("模型返回了格式无效的工具调用。")
+            if call.call_id in seen_call_ids or call.call_id in current_ids:
+                raise ProviderError("模型返回了重复的工具调用编号；本轮没有执行工具。")
+            current_ids.add(call.call_id)
+            try:
+                arguments_size = len(
+                    json.dumps(call.arguments, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                )
+            except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+                raise ProviderError("模型返回了格式无效的工具调用。") from None
+            if arguments_size > MAX_TOOL_ARGUMENT_BYTES:
+                raise ProviderError("模型工具参数超过本地大小上限；本轮没有执行工具。")
+        seen_call_ids.update(current_ids)
 
     def safe_session_turns(self) -> list[dict[str, Any]]:
         safe: list[dict[str, Any]] = []
@@ -331,6 +487,3 @@ class Agent:
             raise ValueError("对话在预览后已变化；请重新预览压缩。")
         self.turns = list(preview.replacement)
         self._rebuild_messages()
-
-
-READ_LIMIT_RESPONSE = 64 * 1024

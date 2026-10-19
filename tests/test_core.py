@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from cvfx_harness.agent import Agent
+from cvfx_harness.agent import Agent, SYSTEM_PROMPT
 from cvfx_harness.cli import parse_references, run_console
 from cvfx_harness.providers import (
     AssistantTurn,
@@ -29,6 +29,7 @@ from cvfx_harness.providers import (
     provider_from_environment,
 )
 from cvfx_harness.tools import ActionRequest, Workspace, WorkspaceError, run_tool
+from cvfx_harness.usage import ProviderUsage
 
 _LINK_TESTS_ENABLED = os.environ.get("HARNESS_TEST_CREATE_LINKS") == "1"
 
@@ -241,6 +242,73 @@ class WorkspaceTests(unittest.TestCase):
                 approve_action=self.approve(),
             )
 
+    def test_directory_listing_is_read_only_bounded_and_requires_approval(self) -> None:
+        (self.root / "资料").mkdir()
+        (self.root / "资料" / "文档.txt").write_text("正文不能出现在列表", encoding="utf-8")
+        (self.root / "资料" / ".env").write_text("SECRET_SENTINEL", encoding="utf-8")
+        (self.root / "资料" / ".harness").mkdir()
+        approvals: list[ActionRequest] = []
+        result = run_tool(
+            self.workspace,
+            ToolCall("list-1", "list_directory", {"path": "资料"}),
+            approve_action=self.approve(approvals),
+        )
+        parsed = json.loads(result)
+        self.assertEqual(approvals[0].operation, "list")
+        self.assertEqual(parsed["path"], "资料")
+        self.assertEqual(parsed["entries"], [{"name": "文档.txt", "type": "file"}])
+        self.assertNotIn("正文不能出现在列表", result)
+        self.assertNotIn("SECRET_SENTINEL", result)
+        self.assertFalse((self.root / ".harness").exists())
+
+        denied = run_tool(
+            self.workspace,
+            ToolCall("list-2", "list_directory", {"path": "资料"}),
+            approve_action=self.approve(answer=False),
+        )
+        self.assertIn("拒绝", denied)
+        self.assertNotIn("文档.txt", denied)
+
+        many = self.root / "many"
+        many.mkdir()
+        for index in range(105):
+            (many / f"file-{index:03d}.txt").touch()
+        bounded = json.loads(run_tool(
+            self.workspace,
+            ToolCall("list-3", "list_directory", {"path": "many"}),
+            approve_action=self.approve(),
+        ))
+        self.assertEqual(len(bounded["entries"]), 100)
+        self.assertTrue(bounded["truncated"])
+
+    def test_directory_listing_blocks_traversal_sensitive_paths_and_malicious_args(self) -> None:
+        approvals: list[ActionRequest] = []
+        invalid = (
+            ToolCall("list-1", "list_directory", {"path": "../outside"}),
+            ToolCall("list-2", "list_directory", {"path": ".env"}),
+            ToolCall("list-3", "list_directory", {"path": ".", "approval": True}),
+        )
+        for call in invalid:
+            with self.subTest(arguments=call.arguments), self.assertRaises(WorkspaceError):
+                run_tool(self.workspace, call, approve_action=self.approve(approvals))
+        self.assertEqual(approvals, [])
+
+    def test_cancel_after_read_approval_prevents_file_access(self) -> None:
+        (self.root / "readme.txt").write_text("must not be returned", encoding="utf-8")
+        event = threading.Event()
+
+        def cancel_at_approval(_request: ActionRequest) -> bool:
+            event.set()
+            return True
+
+        with self.assertRaises(ProviderCancelled):
+            run_tool(
+                self.workspace,
+                ToolCall("read-1", "read_file", {"path": "readme.txt"}),
+                approve_action=cancel_at_approval,
+                cancellation_event=event,
+            )
+
     def test_write_shows_diff_backs_up_and_undo_restores_existing_file(self) -> None:
         file = self.root / "说明.txt"
         file.write_text("旧内容\n", encoding="utf-8")
@@ -426,9 +494,11 @@ class ScriptedProvider:
     def __init__(self, turns: list[AssistantTurn]) -> None:
         self.turns = turns
         self.requests: list[list[dict[str, object]]] = []
+        self.max_token_history: list[int] = []
 
-    def complete(self, messages, tools):
-        del tools
+    def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+        del tools, cancellation_event
+        self.max_token_history.append(max_tokens)
         self.requests.append(list(messages))
         return self.turns.pop(0)
 
@@ -462,6 +532,134 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(approvals[0].operation, "write")
             self.assertEqual((Path(temp) / "你好.txt").read_text(encoding="utf-8"), "写入成功")
             self.assertEqual(provider.requests[1][-1]["role"], "tool")
+
+    def test_tool_loop_backfills_results_preserves_reasoning_and_shares_output_budget(self) -> None:
+        with make_test_temp() as temp:
+            Path(temp, "a.txt").write_text("approved body", encoding="utf-8")
+            call = ToolCall("call-1", "read_file", {"path": "a.txt"})
+            assistant_message = {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "合成 reasoning 记号",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'},
+                }],
+            }
+            provider = ScriptedProvider([
+                AssistantTurn("", [call], assistant_message),
+                AssistantTurn("分析完成", assistant_message={"role": "assistant", "content": "分析完成"}),
+            ])
+            approvals: list[ActionRequest] = []
+            agent = Agent(
+                provider,
+                Workspace(temp),
+                approve_action=self._approval(approvals),
+                max_output_tokens=512,
+            )
+            self.assertEqual(agent.ask("读取 a.txt"), "分析完成")
+            self.assertEqual(approvals[0].operation, "read")
+            self.assertEqual(provider.requests[1][-2]["reasoning_content"], "合成 reasoning 记号")
+            self.assertEqual(provider.requests[1][-1]["role"], "tool")
+            self.assertEqual(provider.requests[1][-1]["tool_call_id"], "call-1")
+            self.assertEqual(provider.requests[1][-1]["content"], "approved body")
+            self.assertEqual(provider.max_token_history[0], 512)
+            self.assertLess(provider.max_token_history[1], 512)
+
+    def test_duplicate_or_malformed_tool_calls_stop_before_any_approval(self) -> None:
+        cases = [
+            [
+                ToolCall("duplicate", "read_file", {"path": "a.txt"}),
+                ToolCall("duplicate", "read_file", {"path": "a.txt"}),
+            ],
+            [ToolCall("bad-args", "read_file", ["a.txt"])],  # type: ignore[arg-type]
+        ]
+        for calls in cases:
+            with self.subTest(calls=calls), make_test_temp() as temp:
+                provider = ScriptedProvider([AssistantTurn("", calls)])
+                agent = Agent(
+                    provider,
+                    Workspace(temp),
+                    approve_action=lambda _request: self.fail("malformed calls must not prompt"),
+                )
+                with self.assertRaises(ProviderError):
+                    agent.ask("讀取文件")
+                self.assertEqual(agent.turns, [])
+                self.assertEqual(agent.messages, [{"role": "system", "content": SYSTEM_PROMPT}])
+
+    def test_output_budget_cancellation_and_round_cap_terminate_tool_execution(self) -> None:
+        with make_test_temp() as temp:
+            target = Path(temp, "blocked.txt")
+            call = ToolCall("write-1", "write_file", {"path": "blocked.txt", "content": "must not write"})
+            too_large = ScriptedProvider([
+                AssistantTurn(
+                    "",
+                    [call],
+                    usage=ProviderUsage(1, 40, 41),
+                )
+            ])
+            agent = Agent(
+                too_large,
+                Workspace(temp),
+                approve_action=lambda _request: self.fail("over-budget calls must not prompt"),
+                max_output_tokens=20,
+            )
+            with self.assertRaisesRegex(ProviderError, "超过本地输出预算"):
+                agent.ask("寫入文件")
+            self.assertFalse(target.exists())
+            self.assertEqual(too_large.max_token_history, [20])
+            self.assertEqual(agent.turns, [])
+
+        with make_test_temp() as temp:
+            call = ToolCall("write-1", "write_file", {"path": "blocked.txt", "content": "must not write"})
+            response = AssistantTurn("", [call])
+            exact_budget = Agent._estimate_response_tokens(response)
+            provider = ScriptedProvider([response])
+            agent = Agent(
+                provider,
+                Workspace(temp),
+                approve_action=lambda _request: self.fail("no output budget remains for tool execution"),
+                max_output_tokens=exact_budget,
+            )
+            answer = agent.ask("寫入文件")
+            self.assertIn("输出上限", answer)
+            self.assertFalse(Path(temp, "blocked.txt").exists())
+            self.assertIn("未执行", agent.messages[-2]["content"])
+
+        with make_test_temp() as temp:
+            event = threading.Event()
+
+            class CancellingProvider:
+                label = "cancel-test"
+
+                def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                    del messages, tools, max_tokens
+                    cancellation_event.set()
+                    return AssistantTurn("", [call])
+
+            calls: list[ActionRequest] = []
+            agent = Agent(CancellingProvider(), Workspace(temp), approve_action=self._approval(calls))
+            with self.assertRaises(ProviderCancelled):
+                agent.ask("寫入文件", cancellation_event=event)
+            self.assertEqual(calls, [])
+            self.assertFalse(Path(temp, "blocked.txt").exists())
+            self.assertEqual(agent.turns, [])
+
+        with make_test_temp() as temp:
+            responses = [
+                AssistantTurn("", [ToolCall(f"list-{n}", "list_directory", {"path": "."})])
+                for n in range(4)
+            ]
+            provider = ScriptedProvider(responses)
+            approvals: list[ActionRequest] = []
+            agent = Agent(provider, Workspace(temp), approve_action=self._approval(approvals))
+            answer = agent.ask("列出工作区")
+            self.assertIn("工具轮数上限", answer)
+            self.assertEqual(len(provider.requests), 4)
+            self.assertEqual(len(approvals), 3)
+            self.assertEqual(agent.messages[-2]["tool_call_id"], "list-3")
+            self.assertIn("该调用未执行", agent.messages[-2]["content"])
 
     def test_plan_mode_blocks_model_write_and_unknown_command_tool(self) -> None:
         with make_test_temp() as temp:
@@ -875,6 +1073,34 @@ class ProviderTests(unittest.TestCase):
 
         self.assertEqual(len(bodies), 1)
         self.assertEqual(bodies[0]["max_tokens"], 128)
+
+    def test_openai_malformed_tool_calls_fail_closed(self) -> None:
+        provider = OpenAICompatibleProvider(
+            "https://api.deepseek.com", "TEST_KEY_ONLY", "deepseek-flash"
+        )
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, _size):
+                payload = {"choices": [{"message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{malformed"},
+                    }],
+                }}]}
+                return json.dumps(payload).encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=FakeResponse()):
+            with self.assertRaisesRegex(ProviderError, "格式无效的工具调用"):
+                provider.complete([{"role": "user", "content": "synthetic"}], [])
 
     def test_rejects_remote_http_and_missing_key(self) -> None:
         with self.assertRaises(ProviderError):

@@ -8,8 +8,13 @@ import unicodedata
 from pathlib import Path
 from typing import Callable
 
-from .agent import Agent
-from .providers import DEEPSEEK_API_KEY_ENV, ProviderError, provider_from_environment
+from .agent import Agent, DEFAULT_MAX_OUTPUT_TOKENS
+from .providers import (
+    DEEPSEEK_API_KEY_ENV,
+    ProviderCancelled,
+    ProviderError,
+    provider_from_environment,
+)
 from .sessions import SessionError, SessionStore
 from .subagents import DelegationPlanError, build_delegation_plan, run_bounded_subagents
 from .tools import ActionRequest, Workspace, WorkspaceError
@@ -106,6 +111,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TOKEN_BUDGET,
         help="本地上下文预算提示；只是估算，不会限制提供商侧输出上限",
     )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=DEFAULT_MAX_OUTPUT_TOKENS,
+        help="单次提问跨工具轮次共享的模型输出上限（1–65536）；兼容提供商收到对应 max_tokens",
+    )
     return parser
 
 
@@ -129,6 +140,7 @@ def _help_text() -> str:
 
 文件引用：在提问中写 @相对路径，或用 @{包含空格的相对路径}。
 每次文件读取和写入都要人工确认；写入/撤销会先显示完整差异。
+目录列表只返回名称和类型，每次也要人工确认；不读取目录项文件内容。
 敏感凭据路径默认禁止读取或修改。当前版本不会运行 shell 命令。
 """
 
@@ -142,6 +154,8 @@ def _confirm_action(
     if request.operation == "read":
         source = "你引用的文件" if request.source == "reference" else "模型请求读取的文件"
         prompt = f"\n{source} {request.path!r} 会发送给模型。确认读取？[y/N] "
+    elif request.operation == "list":
+        prompt = f"\n模型请求查看目录 {request.path!r} 的名称和类型。确认列出？[y/N] "
     elif request.operation == "undo":
         diff = _safe_terminal_text(request.diff) or "（内容无差异）"
         output(f"\n撤销差异（备份 {request.backup_id}）：\n{diff}")
@@ -159,7 +173,7 @@ def _confirm_action(
         prompt = f"确认写入此工作区文件？[y/N] "
     try:
         answer = input_fn(prompt)
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         return False
     return answer.strip().casefold() in {"y", "yes", "是"}
 
@@ -182,6 +196,10 @@ def run_console(
     if type(token_budget) is not int or not 1024 <= token_budget <= 1_000_000:
         output("错误：--token-budget 必须在 1024 到 1000000 之间。")
         return 2
+    max_output_tokens = getattr(args, "max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
+    if type(max_output_tokens) is not int or not 1 <= max_output_tokens <= 65536:
+        output("错误：--max-output-tokens 必须在 1 到 65536 之间。")
+        return 2
     approve_action = lambda request: _confirm_action(
         request, input_fn=input_fn, output=output
     )
@@ -190,6 +208,7 @@ def run_console(
         workspace,
         approve_action=approve_action,
         token_budget=token_budget,
+        max_output_tokens=max_output_tokens,
     )
     session_store = SessionStore(workspace)
     output(f"chenxiVFX Harness v0.4.0 | 提供商：{_safe_terminal_text(str(provider.label))}")
@@ -237,6 +256,7 @@ def run_console(
                 f"工作区：{_safe_terminal_text(str(workspace.root))}\n"
                 f"会话目录：{_safe_terminal_text(str(workspace.root / '.harness' / 'sessions'))}\n"
                 f"Token 预算提示：{agent.token_budget}\n"
+                f"单次提问输出上限：{agent.max_output_tokens} tokens\n"
                 f"OpenAI 密钥变量：{DEEPSEEK_API_KEY_ENV}；仅 OpenAI 模式读取，不展示或写入会话\n"
                 "Shell：禁用"
             )
@@ -440,6 +460,9 @@ def run_console(
             except DelegationPlanError as exc:
                 output(f"无法执行受限子代理计划：{exc}")
                 continue
+            except KeyboardInterrupt:
+                output("已取消子代理审批；没有启动未确认的任务。")
+                continue
             output(_safe_terminal_text(outcome.summary))
             continue
         if command in {"/撤销", "/undo"}:
@@ -452,21 +475,30 @@ def run_console(
                 )
             except WorkspaceError as exc:
                 output(f"撤销失败：{exc}")
+            except KeyboardInterrupt:
+                output("已取消撤销审批；文件未修改。")
             continue
 
-        prompt, references = parse_references(
-            line,
-            workspace,
-            approve_action=approve_action,
-            on_blocked=lambda path, reason: output(f"已跳过文件引用 {path!r}：{reason}"),
-        )
+        try:
+            prompt, references = parse_references(
+                line,
+                workspace,
+                approve_action=approve_action,
+                on_blocked=lambda path, reason: output(f"已跳过文件引用 {path!r}：{reason}"),
+            )
+        except KeyboardInterrupt:
+            output("已取消文件引用审批；没有读取或发送文件内容。")
+            continue
         try:
             answer = agent.ask(prompt, references=references, plan_only=mode == "计划")
         except KeyboardInterrupt:
-            output("\n已取消当前模型请求；不完整轮次不会写入会话存档。")
+            output("\n已取消当前模型请求；不完整轮次不会写入会话存档。前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。")
             continue
         except ProviderError as exc:
-            output(f"模型请求失败：{exc}")
+            output(f"模型请求失败：{exc}。前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。")
+            continue
+        except ProviderCancelled:
+            output("已取消当前模型请求；不完整轮次不会写入会话存档。前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。")
             continue
         output(_safe_terminal_text(answer))
 

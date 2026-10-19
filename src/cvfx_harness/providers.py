@@ -13,6 +13,8 @@ from urllib.parse import urlsplit
 from .usage import ProviderUsage, estimate_tokens
 
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
+MAX_PROVIDER_TOOL_CALLS = 16
+MAX_PROVIDER_TOOL_ARGUMENT_BYTES = 128 * 1024
 
 
 class ProviderError(RuntimeError):
@@ -42,7 +44,12 @@ class Provider(Protocol):
     label: str
 
     def complete(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        cancellation_event: threading.Event | None = None,
+        max_tokens: int = 2048,
     ) -> AssistantTurn: ...
 
 
@@ -55,14 +62,27 @@ class MockProvider:
         self.model = model
 
     def complete(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        cancellation_event: threading.Event | None = None,
+        max_tokens: int = 2048,
     ) -> AssistantTurn:
         del tools
+        if type(max_tokens) is not int or not 1 <= max_tokens <= 65536:
+            raise ProviderError("max_tokens must be between 1 and 65536")
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise ProviderCancelled("provider request cancelled before response")
         last_user = next(
             (item.get("content", "") for item in reversed(messages) if item.get("role") == "user"),
             "",
         )
         answer = f"[模拟模式] 已收到：{last_user[:400]}"
+        while answer and estimate_tokens(answer) > max_tokens:
+            answer = answer[:-1]
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise ProviderCancelled("provider request cancelled after response")
         return AssistantTurn(
             content=answer,
             assistant_message={"role": "assistant", "content": answer},
@@ -183,34 +203,69 @@ class OpenAICompatibleProvider:
         try:
             payload = json.loads(raw.decode("utf-8"))
             message = payload["choices"][0]["message"]
-        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, RecursionError):
             raise ProviderError("模型响应格式无效。") from None
+        if not isinstance(message, dict):
+            raise ProviderError("模型响应格式无效。")
 
         content_value = message.get("content")
+        if content_value is not None and not isinstance(content_value, str):
+            raise ProviderError("模型响应格式无效。")
         content = content_value if isinstance(content_value, str) else ""
-        raw_calls = message.get("tool_calls") or []
+        raw_calls = message.get("tool_calls")
+        if raw_calls is None:
+            raw_calls = []
+        if not isinstance(raw_calls, list) or len(raw_calls) > MAX_PROVIDER_TOOL_CALLS:
+            raise ProviderError("模型返回了格式无效的工具调用。")
         calls: list[ToolCall] = []
-        for index, raw_call in enumerate(raw_calls):
+        seen_call_ids: set[str] = set()
+        for raw_call in raw_calls:
             try:
+                if not isinstance(raw_call, dict):
+                    raise ValueError("tool call must be an object")
                 function = raw_call["function"]
-                arguments = json.loads(function.get("arguments") or "{}")
+                if not isinstance(function, dict):
+                    raise ValueError("tool function must be an object")
+                call_id = raw_call.get("id")
+                name = function.get("name")
+                raw_arguments = function.get("arguments")
+                if (
+                    not isinstance(call_id, str)
+                    or not call_id
+                    or len(call_id) > 128
+                    or any(ord(char) < 32 for char in call_id)
+                    or call_id in seen_call_ids
+                    or not isinstance(name, str)
+                    or not name
+                    or len(name) > 128
+                    or not isinstance(raw_arguments, str)
+                    or len(raw_arguments.encode("utf-8")) > MAX_PROVIDER_TOOL_ARGUMENT_BYTES
+                ):
+                    raise ValueError("invalid tool metadata")
+                arguments = json.loads(raw_arguments)
                 if not isinstance(arguments, dict):
                     raise ValueError("tool arguments must be an object")
+                if len(json.dumps(arguments, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_PROVIDER_TOOL_ARGUMENT_BYTES:
+                    raise ValueError("tool arguments exceed size limit")
+                seen_call_ids.add(call_id)
                 calls.append(
                     ToolCall(
-                        call_id=str(raw_call.get("id") or f"call-{index}"),
-                        name=str(function["name"]),
+                        call_id=call_id,
+                        name=name,
                         arguments=arguments,
                     )
                 )
-            except (KeyError, TypeError, json.JSONDecodeError, ValueError):
+            except (KeyError, TypeError, json.JSONDecodeError, ValueError, UnicodeEncodeError, RecursionError):
                 # Preserve the assistant response but surface malformed tool calls
                 # as an ordinary answer; never try to execute partial arguments.
                 raise ProviderError("模型返回了格式无效的工具调用。") from None
 
         assistant_message: dict[str, Any] = {"role": "assistant", "content": content_value}
-        if message.get("reasoning_content") is not None:
-            assistant_message["reasoning_content"] = message["reasoning_content"]
+        reasoning_content = message.get("reasoning_content")
+        if reasoning_content is not None:
+            if not isinstance(reasoning_content, str):
+                raise ProviderError("模型响应格式无效。")
+            assistant_message["reasoning_content"] = reasoning_content
         if raw_calls:
             assistant_message["tool_calls"] = raw_calls
         return AssistantTurn(

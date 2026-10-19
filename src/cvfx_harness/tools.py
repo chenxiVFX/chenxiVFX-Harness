@@ -9,15 +9,18 @@ import re
 import stat
 import tempfile
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
-from .providers import ToolCall
+from .providers import ProviderCancelled, ToolCall
 
 READ_LIMIT_BYTES = 64 * 1024
 WRITE_LIMIT_BYTES = 64 * 1024
+DIRECTORY_ENTRY_LIMIT = 100
+DIRECTORY_SCAN_LIMIT = 1000
 _CONTROL_DIR = ".harness"
 _BACKUP_DIR = "backups"
 _SENSITIVE_DIRECTORIES = {
@@ -60,6 +63,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "read_file",
             "description": "Read a UTF-8 text file inside the current workspace; the user must approve every read.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "List names and types in one workspace directory; the user must approve every listing. File contents are not read.",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -157,9 +173,11 @@ class Workspace:
         ):
             raise WorkspaceError("不能把凭据目录设为工作区。")
 
-    def resolve(self, relative_path: str) -> Path:
+    def _resolve_path(self, relative_path: str, *, allow_root: bool) -> Path:
         if not isinstance(relative_path, str) or not relative_path.strip():
             raise WorkspaceError("文件路径不能为空。")
+        if len(relative_path) > 4096:
+            raise WorkspaceError("路径超过本地长度上限。")
         if "\x00" in relative_path or any(ord(char) < 32 for char in relative_path):
             raise WorkspaceError("文件路径包含无效控制字符。")
 
@@ -173,6 +191,8 @@ class Workspace:
             raise WorkspaceError("只允许工作区内的相对路径。")
         if ":" in relative_path:
             raise WorkspaceError("不允许 Windows 备用数据流或带冒号的路径。")
+        if ".." in re.split(r"[\\/]+", relative_path):
+            raise WorkspaceError("路径不能包含父目录遍历片段。")
 
         try:
             candidate = (self.root / relative_path).resolve(strict=False)
@@ -182,11 +202,27 @@ class Workspace:
         except ValueError:
             raise WorkspaceError("拒绝访问工作区之外的路径。") from None
 
-        if candidate == self.root:
+        if candidate == self.root and not allow_root:
             raise WorkspaceError("路径必须指向工作区中的文件。")
         self._reject_internal_state_path(candidate)
         self._reject_sensitive_path(candidate, relative_path)
         return candidate
+
+    def resolve(self, relative_path: str) -> Path:
+        return self._resolve_path(relative_path, allow_root=False)
+
+    def resolve_directory(self, relative_path: str) -> Path:
+        target = self._resolve_path(relative_path, allow_root=True)
+        current = self.root
+        for part in Path(relative_path).parts:
+            if part in {".", ""}:
+                continue
+            current = current / part
+            if self._is_reparse_point(current):
+                raise WorkspaceError("目录列表不跟随 symlink 或 junction。")
+        if not target.is_dir():
+            raise WorkspaceError(f"目录不存在或不是目录：{relative_path}")
+        return target
 
     def _relative_parts(self, candidate: Path) -> tuple[str, ...]:
         try:
@@ -558,21 +594,29 @@ def _string_argument(call: ToolCall, name: str) -> str:
     return value
 
 
+def _raise_if_cancelled(cancellation_event: Any | None) -> None:
+    if cancellation_event is not None and cancellation_event.is_set():
+        raise ProviderCancelled("tool operation cancelled")
+
+
 def run_tool(
     workspace: Workspace,
     call: ToolCall,
     *,
     approve_action: ApprovalCallback,
     plan_only: bool = False,
+    cancellation_event: Any | None = None,
 ) -> str:
     """Execute one validated tool; model output never grants local permission."""
 
     if call.name == "read_file":
+        _raise_if_cancelled(cancellation_event)
         _validate_arguments(call, {"path"})
         path = _string_argument(call, "path")
         target = workspace.resolve(path)
         if not approve_action(ActionRequest("read", path, source="tool")):
             return "用户拒绝读取该文件；文件内容未提供给模型。"
+        _raise_if_cancelled(cancellation_event)
         # Re-resolve after the approval to catch a link changed while the prompt was open.
         if workspace.resolve(path) != target:
             raise WorkspaceError("审批后文件路径发生变化；读取已取消。")
@@ -581,7 +625,52 @@ def run_tool(
             raise WorkspaceError(f"文件不存在或不是普通文件：{path}")
         return data.decode("utf-8-sig")
 
+    if call.name == "list_directory":
+        _raise_if_cancelled(cancellation_event)
+        _validate_arguments(call, {"path"})
+        path = _string_argument(call, "path")
+        target = workspace.resolve_directory(path)
+        if not approve_action(ActionRequest("list", path, source="tool")):
+            return "用户拒绝列出该目录；目录项未提供给模型。"
+        _raise_if_cancelled(cancellation_event)
+        if workspace.resolve_directory(path) != target:
+            raise WorkspaceError("审批后目录路径发生变化；列表读取已取消。")
+        entries: list[dict[str, str]] = []
+        scanned = 0
+        try:
+            with os.scandir(target) as iterator:
+                for entry in iterator:
+                    scanned += 1
+                    if scanned > DIRECTORY_SCAN_LIMIT:
+                        break
+                    name = entry.name
+                    if name in {".", ".."} or any(
+                        unicodedata.category(char).startswith("C") for char in name
+                    ):
+                        continue
+                    entry_path = Path(entry.path)
+                    try:
+                        if Workspace._is_reparse_point(entry_path):
+                            continue
+                        relative = entry_path.relative_to(workspace.root).as_posix()
+                        workspace.resolve(relative)
+                    except (WorkspaceError, ValueError):
+                        continue
+                    kind = "directory" if entry.is_dir(follow_symlinks=False) else "file"
+                    entries.append({"name": name, "type": kind})
+        except OSError as exc:
+            raise WorkspaceError(f"无法列出目录：{type(exc).__name__}") from None
+        entries.sort(key=lambda item: (item["name"].casefold(), item["name"]))
+        truncated = len(entries) > DIRECTORY_ENTRY_LIMIT or scanned > DIRECTORY_SCAN_LIMIT
+        result = {
+            "path": "." if target == workspace.root else target.relative_to(workspace.root).as_posix(),
+            "entries": entries[:DIRECTORY_ENTRY_LIMIT],
+            "truncated": truncated,
+        }
+        return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
     if call.name == "write_file":
+        _raise_if_cancelled(cancellation_event)
         _validate_arguments(call, {"path", "content"})
         path = _string_argument(call, "path")
         content = _string_argument(call, "content")
@@ -599,6 +688,7 @@ def run_tool(
         )
         if not approve_action(request):
             return "用户拒绝本次写入；文件未修改，也未创建撤销备份。"
+        _raise_if_cancelled(cancellation_event)
         backup_id = workspace.commit_write(preview)
         if backup_id is None:
             return "文件内容已经相同，没有写入。"

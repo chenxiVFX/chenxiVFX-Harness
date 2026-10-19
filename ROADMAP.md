@@ -6,17 +6,18 @@
 | --- | --- | --- |
 | Windows 中文 CLI、帮助与 UTF-8 | 已实现 / 离线可测 | PowerShell 启动脚本、中文命令、UTF-8 I/O；Windows Python 3.13 本机运行 |
 | Mock provider | 已实现 / 离线可测 | 默认离线，不发请求、不读密钥 |
-| OpenAI 兼容 Chat Completions | 已实现 / 离线可测 | stdlib HTTP、`reasoning_content` 工具往返、usage、`max_tokens` 上限、429 不重试、脱敏错误和边界取消；真实 DeepSeek API 未测 |
-| DeepSeek API key 读取 | 已实现 / 离线可测 | OpenAI 模式读取 `DEEPSEEK_API_KEY`，只允许 HTTPS `api.deepseek.com:443`；Mock 不查询该值，配置页不显示。Codex Cloud Network secret 的 Bearer 头代理替换仍未真实验证 |
-| 受限真实 DeepSeek smoke | 待用户配置并确认 | 用户自行在 Codex Cloud Network secrets 添加 `DEEPSEEK_API_KEY`，Allowed domains 限定 `api.deepseek.com`；最多 128 tokens、合成短文本、无工具；本轮没有真实 API 调用 |
+| OpenAI 兼容 Chat Completions | 已实现 / 离线可测 | stdlib HTTP、`reasoning_content` 工具往返、usage、`max_tokens` 上限、429 不重试、脱敏错误和边界取消；真实 API 仅完成无工具的基本 smoke，工具往返未测 |
+| DeepSeek API key 读取 | 已实现 / 离线可测 | OpenAI 模式读取 `DEEPSEEK_API_KEY`，只允许 HTTPS `api.deepseek.com:443`；Mock 不查询该值，配置页不显示。独立 smoke 已有限验证 Network secret 的基本认证对话通路；工具请求仍未在线验证 |
+| 受限真实 DeepSeek smoke | 已完成（有限验收） | 独立新环境通过 `api.deepseek.com:443` 的网络 secret 代理，以 `deepseek-flash` 发起一次、128-token 上限、无工具的合成请求；HTTP 200，答复“连接成功”，usage 输入 36 / 输出 43 / 总计 79。只证明认证与基本对话通路，不证明多轮工具闭环 |
 | Anthropic provider / 更多供应商 | 待实现 | 尚无独立协议适配；当前用户要求的 `deepseek-flash` 只配置了兼容接口 |
-| 工作区文件引用与读写 | 已实现 / 离线可测 | 路径与敏感路径检查，单次人工审批，写入差异预览、撤销备份 |
+| 多轮工具循环 | 已实现 / 离线可测 | 最多 4 轮、每轮最多执行 4 项，回填工具结果；重复调用编号、格式错误或超预算时关闭当前轮次 |
+| 工作区文件引用、目录列表与读写 | 已实现 / 离线可测 | 目录只返回名称/类型且逐次批准；文件读取与写入逐次批准；路径和敏感路径检查、写入差异预览与撤销备份 |
 | junction / symlink / hard link 逃逸 | 部分实现 / 未实测 | 检测逻辑和普通路径回归在；本机策略拒绝创建链接，逃逸集成测试跳过 |
 | 计划模式 | 已实现 / 离线可测 | 拒绝工具写入；没有 shell 工具 |
 | 目标模式 | 已实现（有限） | 目标仅作为不可信上下文；没有计划编排或权限变化 |
 | 安全会话保存/恢复 | 已实现 / 离线可测 | `.harness/sessions/`；默认存安全完整轮次；`/检查点` 另存用户手写脱敏摘要，预览确认后才保存；不复制工具结果 |
 | 可审核上下文压缩 | 已实现 / 离线可测 | 本地确定性摘要，用户确认后应用；不可信 `user` 消息，工具/引用/敏感轮次不概括 |
-| Token / 预算统计 | 已实现 / 离线可测 | 字符启发式估算与可选 provider usage 报告；预算只提示、不限制远端生成 |
+| Token / 预算统计 | 已实现 / 离线可测 | 上下文预算只提示；每次提问的输出预算按轮次累计并传入 provider `max_tokens`，同时用估算与可选 provider usage 报告检查 |
 | Cache-friendly 稳定前缀 | 部分实现 | 静态 system prompt 和固定工具 schema；没有缓存命中率承诺，也未测远端缓存 |
 | 子代理 | 已实现 / 离线可测（Mock 限定） | 最多 3 项、逐项工具层批准；独立输入、一次调用、输入/输出预算、5 秒超时和取消；无工具/递归；结果标为不可信 |
 | PTC（Programmatic Tool Calling） | 待实现 / 术语假设 | 暂按“模型组合调用工具/程序化工具调用”记录；未实现脚本或工具执行链 |
@@ -39,13 +40,22 @@
 - Debian 13 / Python 3.12 云端：按实际平台文件系统区分路径大小写断言；Windows 分支仍要求 Harness 解析回磁盘目录项实际大小写，POSIX 分支验证 Harness 保留输入大小写并按实际卷行为读文件。
 - OpenAI provider 仅在选择 OpenAI 模式时读取 `DEEPSEEK_API_KEY`，该环境密钥限定 HTTPS `api.deepseek.com:443`；Mock 不查询该变量。认证值不出现在 `/配置`、消息体或 provider 的默认表示中。
 - 用合成值、stub 响应及 `127.0.0.1` 本地 HTTP fixture 验证了请求构造与响应解析；没有读取本任务环境的密钥值、没有配置凭据、没有访问外部 API。
-- Codex Cloud Network secret 文档说明 placeholder 由 HTTPS 443 代理按 Allowed domains 替换；DeepSeek 对 Bearer Authorization 头的代理兼容性尚未由本项目验证。用户保存环境配置后需 Republish，并在新 task 中验证。
+- Codex Cloud Network secret placeholder 代理通路已由独立新环境的一次 DeepSeek 认证/对话 smoke 有限验证；工具调用与多轮消息仍未在线验证。
 - `compileall` 与中文 mock CLI 冒烟通过；`python3 -m unittest discover -s tests -v` 共 53 项，50 项通过，3 项 Windows 链接创建测试按策略跳过，无失败。
 - Windows Python 3.13 本轮未运行；Debian 下 3 项 Windows 专属链接创建测试因平台/opt-in 条件跳过，没有尝试创建链接。
 
+## 多轮工具循环迭代（2026-10-19）
+
+- 增加受批准的只读目录列表：最多扫描 1000 个目录项、最多返回 100 项；跳过敏感/内部路径和链接项，不读取条目正文。
+- Agent 逐轮把尚余输出上限传给兼容 provider，最多运行 4 轮、每轮最多执行 4 项；超预算响应、重复调用编号、畸形参数及取消会停止当前轮次并清理未完成上下文。
+- 工具结果按调用编号回填；DeepSeek `reasoning_content` 在下一轮请求中保留。末轮工具请求不执行，并回填未执行状态。
+- 使用本地模拟 provider、stub HTTP 与临时工作区完成离线覆盖；未调用真实模型、未读取或配置任何密钥。
+- Debian / Python 3 环境：`compileall` 通过；`python3 -m unittest discover -s tests -v` 共 60 项，57 项通过，3 项 Windows 链接集成测试跳过，无失败。Windows Python 3.13 未运行。
+- 真实 DeepSeek smoke 在独立新环境已由用户确认完成：一次 128-token 上限、无工具的合成短请求成功返回固定中文答复；本轮没有再次调用真实 API，也没有接触凭据。工具调用往返仍只有离线 fixture 覆盖。
+
 ## 当前恢复点
 
-- 当前迭代基于 `main` / `origin/main` 的 `73d9bf5`；本轮提交及远端状态以 `main` / `origin/main` 指针核对。产品代码变更经测试后以中文提交，只允许普通快进推送。
+- 本轮起点是 `main` / `origin/main` 的 `33a9563`；完成后由本轮中文提交作为新的恢复点，并以普通快进方式推送到 `origin/main`。
 - 本轮只更改 Harness 源码、测试和说明文档；`.harness/`、`.test-tmp/` 和 Python 缓存均忽略，不放入版本控制。
 - 本轮没有新增 Windows 链接集成测试，也没有调整系统链接权限；需在允许创建链接的 Windows 环境继续验收。
 
@@ -53,12 +63,12 @@
 
 - 普通 Windows 路径、中文路径、UTF-8 内容、UNC/ADS/遍历拒绝与路径边界已有本机测试。junction、symlink、hard link 测试需创建链接 fixture，当前系统拒绝这些操作；按要求不再尝试创建，不宣称逃逸已实测。
 - `pip install -e .` 曾因本地缺少 `setuptools>=68` 且网络不可用而未验证；可继续使用 `run.ps1` 或 `python -m cvfx_harness`。
-- 真实 API 需要用户提供安全配置和具体端点；当前没有 API 请求，也没有读取聊天历史或从本机搜索密钥。
+- 本轮没有 API 请求，也没有读取聊天历史或搜索、读取、配置任何密钥。之前独立 smoke 只覆盖基本认证对话，不能代替工具循环验收。
 - 本地会话文件为明文 JSON，不含工具返回正文或密钥；共享工作区前仍应检查用户主动输入的普通对话内容。
 
 ## 下一轮优先级
 
-1. 云端迭代实现终端隐藏密钥输入和单次有界真实 smoke；使用用户重新签发并在本地输入的密钥，不读旧聊天记录或环境变量。
+1. 在新 task 中基于本 checkpoint 验证真实模型的多轮工具请求；先限输出、无写入或逐项人工批准，明确记录在线行为与本地离线结果的差异。
 2. 继续测试子代理 Provider 取消的实际中断能力；Mock 已有逐项取消，OpenAI provider 仍仅在 HTTP 请求前/响应后检查。
 3. 增加完整的会话恢复/检查点覆盖策略与 schema migration；保留检查点只来自用户手写摘要的边界。
 4. 先设计 Windows 沙箱/进程隔离模型，再决定是否实现 PowerShell/cmd。Shell 执行未授权之前保持关闭。
