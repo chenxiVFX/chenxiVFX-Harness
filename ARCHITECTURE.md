@@ -28,7 +28,9 @@ Agent 的 system message 在每个请求、恢复和压缩后保持固定文本�
 
 ## SSE 流式传输
 
-OpenAI 兼容 CLI 通过 `complete_streaming` 使用 `text/event-stream`。SSE 解析器增量解码严格 UTF-8，并识别 LF、CRLF、多行 `data` 和注释行；每条事件经完成空行分发，必须收到合法 finish reason 与 `[DONE]`。响应最多 4 MiB、助手文本/推理合计 2 MiB、单行或事件 512 KiB、16,384 个事件、最长 120 秒。响应体读取期间以不超过 250 ms 的 socket read timeout 检查取消；建连/响应头使用 provider timeout。
+OpenAI 兼容 CLI 通过 `complete_streaming` 使用 `text/event-stream`。SSE 解析器增量解码严格 UTF-8，并识别 LF、CRLF、多行 `data` 和注释行；每条事件经完成空行分发，必须收到合法 finish reason 与 `[DONE]`。响应最多 4 MiB、助手文本/推理合计 2 MiB、单行或事件 512 KiB、16,384 个事件，截止时间配置最多 120 秒。响应体由调用线程使用 urllib 的 HTTP 解码器读取；每个响应另有一个 watchdog，以最多 250 ms 的间隔检查取消，并在取消或截止时间到达时 shutdown 该响应 socket。读取、解析和文本回调不切换线程；所有退出路径停止并 join watchdog，不使用无界队列或后台请求重试。
+
+socket 的读取超时设为剩余截止时间，不以短超时轮询后恢复读取。[Python 文档](https://docs.python.org/3.12/library/socket.html#socket.socket.makefile)明确说明 socket 文件缓冲在超时后可能失效；真正的读取超时必须终止该响应。建连、代理 CONNECT、TLS 和响应头阶段仍由 urllib 的网络超时约束，取消需等这些调用返回才能检查；DNS 或多阶段、慢滴响应头不能承诺与响应体相同的主动硬截止边界。
 
 普通内容片段可立即交给 CLI；reasoning 内容不显示。流式函数工具调用按索引累积，结束后复用已有完整消息/参数校验，之后 Agent 才执行原有逐次人工审批。未收到完整终止标记、格式错误或超限时，Provider 抛出安全的流错误，Agent 清除未完成轮次且不返回工具调用。流式文字可能已显示一部分，错误后不会撤回；终端输出先脱敏疑似凭据并转义控制字符。当前拒绝多候选项、多模态、logprobs、未知 delta 字段和不支持流式的 provider。
 
@@ -61,7 +63,7 @@ OpenAI 兼容 CLI 通过 `complete_streaming` 使用 `text/event-stream`。SSE �
 - 默认不提供文件工具。提交时可预授权最多 4 个现存工作区相对路径：文件对应 `read_file`，目录对应 `list_directory`；调用前再次通过 `Workspace` 校验，路径必须与授权路径完全匹配。工具 schema 过滤掉 `write_file`，首轮最多 2 个只读调用，第二轮只用于最终答复；没有 shell、递归委派或任意代码入口。子代理只执行最多 2 轮模型请求，深度为 0。
 - 每会话最多 3 项，最多 2 项并发；单项任务最多 240 字符，单请求估算输入最多 512 tokens，全会话最多 3072 估算输入 tokens，每项输出最多 256 tokens，全会话保留输出上限最多 768 tokens。子代理总运行时限默认 60 秒，可设为 5–120 秒，从该任务首个 provider 请求开始；逐项审批和执行前排队不计入。OpenAI 每次 SSE 请求默认受 45 秒总时限限制，可配置为 5–120 秒；时限从建连开始，响应读取期间每 250 ms 检查取消。任务总体 deadline 跨模型/工具轮次共享，每任务最多 2 轮。超时、取消、失败、拒绝和预算耗尽为不同终态。
 - 结果先做疑似凭据脱敏，再 JSON 编码并转义可能伪造的封装标记。用户用 `收取` 后，结果以 `kind=subagent`、`persistable=False` 的 user 消息附加到父 Agent；不自动解析结果内的 `@` 文件引用。父会话的普通引用流程仍会对每个读取请求独立审批，子代理审批不等同父代理文件审批。
-- 非流式 OpenAI 请求在请求前和响应后检查取消；CLI 的 SSE 响应体采用短 socket 读取超时并轮询取消，建连/响应头等待仍由 provider timeout 约束。429 不自动重试；记录 provider 返回的 Token 用量，不估算货币成本，也不把价格写入代码。
+- 非流式 OpenAI 请求在请求前和响应后检查取消；CLI 的两种 SSE provider 共用响应体 watchdog，建连/响应头等待仍由 provider timeout 约束。429 和读取失败都不自动重试；记录 provider 返回的 Token 用量，不估算货币成本，也不把价格写入代码。
 - OpenAI 兼容 CLI 只在该 provider 启动时读取 `DEEPSEEK_API_KEY`；环境密钥限定 HTTPS `api.deepseek.com:443`，不能通过 `HARNESS_BASE_URL` 转发到其他主机。`/配置` 不显示值，密钥只作为 Bearer 认证头，不加入对话、存档或 Harness 日志。Mock 不查询密钥变量。
 - Codex Cloud Network secret 可把 `DEEPSEEK_API_KEY` placeholder 交给程序，再由 HTTPS 代理向允许的 DeepSeek 目标替换真实值；官方文档没有确认本适配器 Bearer 头的端到端兼容性，本项目尚未使用真实密钥验证。普通环境变量会直接对 task 代码可见，云端应由用户自行选择 Network secret 并限定 Allowed domains。
 - 本地回环 HTTP fixture 验证请求/响应、密钥只在认证头、错误不披露请求认证值；这些结果不代表真实 DeepSeek API 或云端代理已验收。真实 API smoke 仍需要用户完成环境配置并单独确认测试范围。

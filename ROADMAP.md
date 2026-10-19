@@ -172,6 +172,13 @@
 - 回归只使用 loopback HTTP fixture 与合成消息，覆盖跨字节中文、固定 URL 路径和无凭据请求、签名 thinking/工具往返、现有文件审批、缺 usage 预留、重定向拒绝、不完整工具流不审批、未知内容/事件、响应大小限制、总时限和取消。未访问真实模型或读取/设置/输出凭据；测试不等于完整产品验收。
 - Linux / Python 3.12 本地离线回归：150 项，149 通过、1 项 Windows-only junction 跳过；loopback fixture 不发送 API 密钥或 Authorization。`compileall`、editable install、安装自检与 `git diff --check` 均通过。Windows/Linux × Python 3.11/3.12 四矩阵 CI 全部成功（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39225734297)）；本轮使用合成数据且没有真实模型 usage，真实调用用量单独跟踪。CI 和本地回归均不等同完整产品验收。
 
+## SSE 正常停顿与缓冲读取修复（2026-10-19）
+
+- 确认旧读取器的短 socket 超时会使 urllib 底层 SocketIO 文件缓冲失效；正常生成停顿超过轮询间隔后，继续读取便误报网络传输失败。合成 HTTP 与验证证书的 CONNECT/TLS fixture 均可复现，普通 JSON 读取没有相同的短超时重读步骤。历史远端失败缺少阶段记录，因此不能回溯证明其唯一根因。
+- 两种 SSE provider 共用一个响应体读取 guard：调用线程负责读取、协议解析与回调，单个 watchdog 仅在取消或截止时间到达时 shutdown 当前响应 socket，并在所有退出路径停止和 join。正常停顿继续等待，真正超时直接结束；不恢复已超时的文件缓冲、不自动重试、不新增模型工具或执行权限。
+- 新增正常停顿恢复、分块头拆分、持续慢滴、取消、KeyboardInterrupt、超时不重读及 watchdog 回收验证，覆盖 OpenAI/Anthropic、HTTP/验证证书的 CONNECT/TLS 两种传输。保留大小限制、完成标记、工具审批和错误脱敏；建连/响应头的网络栈取消与硬截止限制已在架构文档明示。
+- Debian / Python 3.12 离线回归：157 项，156 通过、1 项 Windows-only junction 跳过；测试不等同完整产品验收。用量账本不写入仓库，真实工具闭环、子代理及 Anthropic endpoint 的验收范围独立判断。
+
 ## 参考项目复用边界
 
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)：公开 GitHub 页面标示 MIT；这里只借鉴公开的模块边界和流程概念，不复制源码。

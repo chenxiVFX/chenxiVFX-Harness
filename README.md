@@ -133,7 +133,7 @@ Anthropic SSE 使用与现有 provider 相同的有界 UTF-8/SSE 解析器：跨
 
 CLI 的 OpenAI 兼容模式和 DeepSeek Anthropic 兼容模式均使用有界 SSE 逐段显示中文文本；UTF-8 解码器和事件解析器可跨任意网络分块处理中文及 LF/CRLF 行界。OpenAI 兼容流要求完成状态及 `[DONE]`；Anthropic 兼容流按 `message_start`、content block、`message_delta`、`message_stop` 校验。响应上限为 4 MiB、助手文本和推理合计上限为 2 MiB、单行/单事件上限为 512 KiB、最多 16,384 个事件、总时限最多 120 秒。取消事件在响应体读取期间每 250 ms 检查一次；建连和响应头等待受 provider 超时限制。网络错误只附加固定分类、阶段、HTTP 状态、已收字节数和耗时；POSIX `ETIMEDOUT` / `EAGAIN` 和 Winsock `10060` / `10035` 均按超时阶段归类；不显示原始异常、请求头、URL 或响应体。响应由上下文管理器关闭，HTTP 状态错误也会显式关闭。
 
-SSE 保留 Python `urllib` 的 HTTP 代理 CONNECT 和 TLS 验证路径，轮询取消时使用其响应 socket 的短超时与 `read1()`；未使用 `select`。若响应不提供可用于有界读取的 socket，会明确报错。离线测试通过本机 CONNECT 代理和测试专用证书检查代理隧道、TLS 主机名与证书校验、分块中文、慢读和截断；测试证书只为 `sse-fixture.invalid` 使用，客户端仍要求有效证书且开启主机名检查。普通 JSON `complete()` 仍走非流式 `read()`，其取消检查只在发送前和收到响应后执行。
+SSE 保留 Python `urllib` 的 HTTP 代理 CONNECT 和 TLS 验证路径，调用线程用 `read1()` 读取，单个 watchdog 在取消或截止时间到达时 shutdown 当前响应 socket，并在退出时停止和 join。正常生成停顿不会触发短超时后重读，真正的读取超时直接终止；未使用 `select`。若响应不提供可用于有界读取的 socket，会明确报错。建连、代理 CONNECT、TLS 和响应头仍依赖网络栈超时，取消需等这些调用返回才能检查；这些阶段不能保证与响应体同样的主动硬截止边界。离线测试通过本机 CONNECT 代理和测试专用证书检查代理隧道、TLS 主机名与证书校验、正常停顿、分块头慢滴、中文、取消与截断；测试证书只为 `sse-fixture.invalid` 使用，客户端仍要求有效证书且开启主机名检查。普通 JSON `complete()` 仍走非流式 `read()`，其取消检查只在发送前和收到响应后执行。
 
 工具调用片段会先在内存中累积并校验，收到协议完整结束标记后才交给既有 Agent 循环；工具仍逐次审批。截断、无效或超限流不会返回不完整工具调用，因此不能触发该轮工具。当前支持 OpenAI 兼容的单候选文本、`reasoning_content` 和函数工具调用，以及 DeepSeek Anthropic 兼容的文本、签名 thinking 与标准工具块；不支持多模态、`logprobs`、未签名/未知增量和其他 Anthropic 内容块。Mock 默认离线且不使用 SSE；请求流式输出的 provider 若没有 `complete_streaming` 会明确拒绝。流式文本可能在完整状态尚未到达前已显示；取消或传输失败后不完整轮次不会写入会话，已显示片段不会自动撤回。控制字符会以可见转义显示，疑似凭据片段在终端输出前脱敏。单元与本机 fixture 测试不等于完整产品验收；本轮 DeepSeek Anthropic 兼容行为也没有在线验证。
 

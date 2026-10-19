@@ -2293,6 +2293,148 @@ class ProviderTests(unittest.TestCase):
             worker.join(timeout=2)
             server.server_close()
 
+    def test_sse_resumes_after_generation_pauses_with_http_and_verified_connect_tls(self) -> None:
+        for anthropic, proxied, chunked in (
+            (False, False, False), (False, True, True),
+            (True, False, True), (True, True, False),
+        ):
+            with self.subTest(anthropic=anthropic, proxied=proxied, chunked=chunked):
+                if anthropic:
+                    prefix = fixture_anthropic_sse([
+                        {"type": "message_start", "message": {"type": "message", "role": "assistant", "content": [], "usage": {"input_tokens": 3, "output_tokens": 0}}},
+                        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "合成"}},
+                    ])
+                    suffix = fixture_anthropic_sse([
+                        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "中文"}},
+                        {"type": "content_block_stop", "index": 0},
+                        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}},
+                        {"type": "message_stop"},
+                    ])
+                else:
+                    prefix = fixture_sse_frames([
+                        {"choices": [{"index": 0, "delta": {"content": "合成"}, "finish_reason": None}]},
+                    ], done=False)
+                    suffix = fixture_sse_frames([
+                        {"choices": [{"index": 0, "delta": {"content": "中文"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}},
+                    ])
+                wire = prefix + suffix
+                requests: list[bool] = []
+
+                def serve(handler, _request_body: bytes) -> None:
+                    requests.append(True)
+                    self.assertIsNone(handler.headers.get("Authorization"))
+                    self.assertIsNone(handler.headers.get("x-api-key"))
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", "text/event-stream")
+                    handler.send_header("Transfer-Encoding" if chunked else "Content-Length", "chunked" if chunked else str(len(wire)))
+                    handler.end_headers()
+                    if chunked:
+                        size_line = f"{len(wire):x}\r\n".encode("ascii")
+                        handler.wfile.write(size_line[:1])
+                        handler.wfile.flush()
+                    time.sleep(0.4)  # Longer than the cancellation poll, below the request deadline.
+                    if chunked:
+                        handler.wfile.write(size_line[1:])
+                    handler.wfile.write(prefix)
+                    handler.wfile.flush()
+                    time.sleep(0.4)
+                    handler.wfile.write(suffix)
+                    if chunked:
+                        handler.wfile.write(b"\r\n0\r\n\r\n")
+                    handler.wfile.flush()
+
+                origin, worker = (local_tls_http_fixture if proxied else local_http_fixture)(serve)
+                proxy = proxy_worker = None
+                callbacks: list[tuple[int, str]] = []
+                try:
+                    provider = (
+                        DeepSeekAnthropicProvider("http://127.0.0.1:9/anthropic", "", "deepseek-flash", timeout=3, stream_timeout=3)
+                        if anthropic else OpenAICompatibleProvider("http://127.0.0.1:9", "", "fixture-model", timeout=3, stream_timeout=3)
+                    )
+                    if proxied:
+                        proxy, proxy_worker, targets = local_connect_proxy_fixture(origin.server_port)
+                        opener, context = local_verified_tls_proxy_opener(proxy.server_port)
+                        provider.endpoint = f"https://sse-fixture.invalid:{origin.server_port}/synthetic"
+                    else:
+                        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                        provider.endpoint = f"http://127.0.0.1:{origin.server_port}/synthetic"
+                    with patch("cvfx_harness.providers._open_without_redirect", side_effect=lambda request, timeout: opener.open(request, timeout=timeout)):
+                        turn = provider.complete_streaming(
+                            [{"role": "user", "content": "合成中文请求"}], [], max_tokens=32,
+                            on_text_delta=lambda fragment: callbacks.append((threading.get_ident(), fragment)),
+                        )
+                    self.assertEqual(turn.content, "合成中文")
+                    self.assertEqual(turn.usage.total_tokens, 5)
+                    self.assertEqual(callbacks, [(threading.get_ident(), "合成"), (threading.get_ident(), "中文")])
+                    self.assertEqual(requests, [True])
+                    self.assertFalse(any(t.name == "cvfx-sse-watchdog" for t in threading.enumerate()))
+                    if proxied:
+                        self.assertEqual(len(targets), 1)
+                        self.assertTrue(context.check_hostname)
+                        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+                finally:
+                    if proxy is not None:
+                        proxy.shutdown()
+                        proxy_worker.join(timeout=2)
+                        proxy.server_close()
+                    origin.shutdown()
+                    worker.join(timeout=2)
+                    origin.server_close()
+
+    def test_sse_slow_drip_chunk_header_is_interrupted_without_leaking_watchdogs(self) -> None:
+        for anthropic in (False, True):
+            for cancel in (False, True):
+                with self.subTest(anthropic=anthropic, cancel=cancel):
+                    headers_sent = threading.Event()
+                    release = threading.Event()
+                    cancellation = threading.Event()
+
+                    def serve(handler, _request_body: bytes) -> None:
+                        handler.send_response(200)
+                        handler.send_header("Content-Type", "text/event-stream")
+                        handler.send_header("Transfer-Encoding", "chunked")
+                        handler.end_headers()
+                        headers_sent.set()
+                        try:
+                            while not release.wait(0.02):
+                                handler.wfile.write(b"1")  # No CRLF: keep readline busy beyond per-read timeouts.
+                                handler.wfile.flush()
+                        except OSError:
+                            pass
+
+                    server, worker = local_http_fixture(serve)
+                    timer = None
+                    if cancel:
+                        def cancel_after_headers() -> None:
+                            if headers_sent.wait(1):
+                                time.sleep(0.08)
+                                cancellation.set()
+                        timer = threading.Thread(target=cancel_after_headers)
+                        timer.start()
+                    try:
+                        provider = (
+                            DeepSeekAnthropicProvider(f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash", timeout=2, stream_timeout=2 if cancel else 0.15)
+                            if anthropic else OpenAICompatibleProvider(f"http://127.0.0.1:{server.server_port}", "", "fixture-model", timeout=2, stream_timeout=2 if cancel else 0.15)
+                        )
+                        started = time.monotonic()
+                        with self.assertRaises(ProviderCancelled if cancel else ProviderStreamError) as caught:
+                            provider.complete_streaming(
+                                [{"role": "user", "content": "合成"}], [], max_tokens=32,
+                                cancellation_event=cancellation, on_text_delta=lambda _text: self.fail("incomplete chunk must not reach parser"),
+                            )
+                        self.assertLess(time.monotonic() - started, 1.0)
+                        if not cancel:
+                            self.assertEqual(caught.exception.diagnostics.category, "read_timeout")
+                        self.assertFalse(any(t.name == "cvfx-sse-watchdog" for t in threading.enumerate()))
+                    finally:
+                        release.set()
+                        if timer is not None:
+                            timer.join(timeout=2)
+                        server.shutdown()
+                        worker.join(timeout=2)
+                        server.server_close()
+
     def test_sse_responses_close_after_parse_failure_and_cancellation(self) -> None:
         class FakeSocket:
             def settimeout(self, _timeout: float) -> None:
@@ -2300,6 +2442,9 @@ class ProviderTests(unittest.TestCase):
 
             def fileno(self) -> int:
                 return 10
+
+            def shutdown(self, _how: int) -> None:
+                return
 
         class TrackingResponse:
             status = 200
@@ -2353,17 +2498,48 @@ class ProviderTests(unittest.TestCase):
 
         slow_response = SlowSocketErrorResponse()
         bounded_provider = OpenAICompatibleProvider(
-            "http://127.0.0.1:9", "", "fixture-model", timeout=1, stream_timeout=0.12
+            "http://127.0.0.1:9", "", "fixture-model", timeout=1, stream_timeout=1
         )
         with patch("cvfx_harness.providers._open_without_redirect", return_value=slow_response):
             with self.assertRaises(ProviderStreamError) as caught:
                 bounded_provider.complete_streaming(
                     [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
                 )
-        self.assertEqual(caught.exception.diagnostics.category, "read_timeout", str(caught.exception))
+        self.assertEqual(caught.exception.diagnostics.category, "transport_error", str(caught.exception))
         self.assertEqual(caught.exception.diagnostics.stage, "response_body")
         self.assertNotIn("synthetic transport detail", str(caught.exception))
         self.assertTrue(slow_response.closed)
+
+        class TimedOutResponse(TrackingResponse):
+            reads = 0
+
+            def read1(self, _size: int) -> bytes:
+                self.reads += 1
+                raise TimeoutError("synthetic timeout must remain hidden")
+
+        timed_out = TimedOutResponse()
+        with patch("cvfx_harness.providers._open_without_redirect", return_value=timed_out):
+            with self.assertRaises(ProviderStreamError) as caught:
+                provider.complete_streaming(
+                    [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
+                )
+        self.assertEqual(caught.exception.diagnostics.category, "read_timeout")
+        self.assertEqual(timed_out.reads, 1)
+        self.assertTrue(timed_out.closed)
+        self.assertFalse(any(t.name == "cvfx-sse-watchdog" for t in threading.enumerate()))
+
+        class InterruptedResponse(TrackingResponse):
+            def read1(self, _size: int) -> bytes:
+                raise KeyboardInterrupt
+
+        interrupted = InterruptedResponse()
+        with patch("cvfx_harness.providers._open_without_redirect", return_value=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                provider.complete_streaming(
+                    [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
+                )
+        self.assertTrue(interrupted.closed)
+        self.assertFalse(any(t.name == "cvfx-sse-watchdog" for t in threading.enumerate()))
 
     def test_sse_tls_proxy_reports_slow_read_and_disconnect_diagnostics(self) -> None:
         prefix = fixture_sse_frames([

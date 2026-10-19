@@ -350,6 +350,81 @@ def _open_without_redirect(request: urllib.request.Request, *, timeout: float):
     return opener.open(request, timeout=timeout)
 
 
+class _SSEReadGuard:
+    """Interrupt blocking HTTP reads without retrying a timed-out makefile buffer.
+
+    Parsing and callbacks stay on the caller thread. A single joined watchdog
+    only shuts down this response socket on cancellation or the total deadline.
+    """
+
+    def __init__(self, response, deadline: float, cancellation_event: threading.Event | None) -> None:
+        self.response = response
+        self.deadline = deadline
+        self.cancellation_event = cancellation_event
+        self.socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+        self._finished = threading.Event()
+        self._expired = threading.Event()
+        self._watchdog: threading.Thread | None = None
+
+    def _check(self) -> None:
+        if self.cancellation_event is not None and self.cancellation_event.is_set():
+            raise ProviderCancelled("provider stream cancelled")
+        if self._expired.is_set() or time.monotonic() >= self.deadline:
+            raise ProviderStreamError("SSE 流超过总时限。", category="read_timeout")
+
+    def _shutdown(self) -> None:
+        try:
+            self.socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass  # The response may already have closed after its final bytes.
+
+    def _watch(self) -> None:
+        while not self._finished.is_set():
+            remaining = max(0.0, self.deadline - time.monotonic())
+            if self._finished.wait(min(STREAM_READ_POLL_SECONDS, remaining)):
+                return
+            cancelled = self.cancellation_event is not None and self.cancellation_event.is_set()
+            expired = time.monotonic() >= self.deadline
+            if cancelled or expired:
+                if expired:
+                    self._expired.set()
+                self._shutdown()
+                return
+
+    def __enter__(self):
+        if self.socket is None or not all(
+            callable(getattr(self.socket, name, None)) for name in ("settimeout", "shutdown", "fileno")
+        ):
+            raise ProviderStreamError("无法建立有界 SSE 网络读取。", category="bounded_reader_unavailable")
+        self._check()
+        self._watchdog = threading.Thread(target=self._watch, name="cvfx-sse-watchdog")
+        self._watchdog.start()
+        return self
+
+    def read1(self, size: int) -> bytes:
+        self._check()
+        try:
+            # A short timeout poisons SocketIO's makefile buffer after a normal
+            # generation pause. A real timeout is terminal; never resume it.
+            self.socket.settimeout(max(0.001, self.deadline - time.monotonic()))
+        except OSError:
+            if self.socket.fileno() >= 0:
+                raise ProviderStreamError("SSE 网络传输配置失败。", category="transport_error") from None
+        try:
+            chunk = self.response.read1(size)
+        except BaseException:
+            self._check()
+            raise
+        self._check()
+        return chunk
+
+    def __exit__(self, *_args) -> None:
+        self._finished.set()
+        self._shutdown()
+        if self._watchdog is not None:
+            self._watchdog.join()
+
+
 @dataclass
 class ToolCall:
     call_id: str
@@ -777,82 +852,42 @@ class OpenAICompatibleProvider:
                     except ValueError:
                         raise ProviderStreamError("SSE Content-Length 格式无效。") from None
                 stage = "response_body"
-                raw_socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
-                if raw_socket is None:
-                    raise ProviderStreamError("无法建立有界 SSE 网络读取。", category="bounded_reader_unavailable")
-                while True:
-                    stage = "response_body"
-                    if cancellation_event is not None and cancellation_event.is_set():
-                        raise ProviderCancelled("provider stream cancelled")
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise ProviderStreamError("SSE 流超过总时限。")
-                    poll_timeout = min(STREAM_READ_POLL_SECONDS, remaining)
-                    if raw_socket is not None:
+                with _SSEReadGuard(response, deadline, cancellation_event) as reader:
+                    while True:
+                        stage = "response_body"
                         try:
-                            raw_socket.settimeout(poll_timeout)
-                        except OSError:
-                            try:
-                                socket_closed = raw_socket.fileno() < 0
-                            except OSError:
-                                socket_closed = True
-                            if not socket_closed:
-                                raise ProviderStreamError("SSE 网络传输配置失败。", category="transport_error") from None
-                            # A peer may close after sending Content-Length bytes; buffered
-                            # response data can still be consumed and EOF is bounded.
-                            raw_socket = None
-                    try:
-                        chunk = response.read1(8192)
-                    except http.client.IncompleteRead as exc:
-                        if isinstance(exc.partial, bytes):
-                            received_bytes += len(exc.partial)
-                        stage = "completion"
-                        raise ProviderStreamError("SSE 响应在完成标记前结束。") from None
-                    except TimeoutError:
-                        if cancellation_event is not None and cancellation_event.is_set():
-                            raise ProviderCancelled("provider stream cancelled") from None
-                        if time.monotonic() >= deadline:
-                            raise ProviderStreamError("SSE 流超过总时限。") from None
-                        continue
-                    except (OSError, urllib.error.URLError) as exc:
-                        category = _stream_transport_category(exc, stage)
-                        if (
-                            category == "transport_error"
-                            and stage == "response_body"
-                            and deadline - time.monotonic() <= STREAM_READ_POLL_SECONDS
-                        ):
-                            # Some platform transports surface the final poll timeout as a
-                            # generic OSError; keep that near-deadline read safely classified.
-                            category = "read_timeout"
-                        message = {
-                            "read_timeout": "SSE 响应读取超时。",
-                            "tls_failure": "SSE TLS 安全传输失败。",
-                            "remote_disconnect": "SSE 对端提前断开连接。",
-                            "connection_reset": "SSE 连接被对端重置。",
-                            "name_resolution_failure": "SSE 主机名解析失败。",
-                            "connect_timeout": "SSE 建连或响应头等待超时。",
-                        }.get(category, "SSE 网络传输失败。")
-                        raise ProviderStreamError(message, category=category) from None
-                    except Exception:
-                        raise ProviderStreamError("SSE 流读取处理失败。", category="internal_error") from None
-                    if cancellation_event is not None and cancellation_event.is_set():
-                        raise ProviderCancelled("provider stream cancelled")
-                    if time.monotonic() >= deadline:
-                        raise ProviderStreamError("SSE 流超过总时限。")
-                    if not chunk:
+                            chunk = reader.read1(8192)
+                        except http.client.IncompleteRead as exc:
+                            if isinstance(exc.partial, bytes):
+                                received_bytes += len(exc.partial)
+                            stage = "completion"
+                            raise ProviderStreamError("SSE 响应在完成标记前结束。") from None
+                        except TimeoutError:
+                            raise ProviderStreamError("SSE 响应读取超时。", category="read_timeout") from None
+                        except (OSError, urllib.error.URLError) as exc:
+                            category = _stream_transport_category(exc, stage)
+                            message = {
+                                "read_timeout": "SSE 响应读取超时。",
+                                "tls_failure": "SSE TLS 安全传输失败。",
+                                "remote_disconnect": "SSE 对端提前断开连接。",
+                                "connection_reset": "SSE 连接被对端重置。",
+                                "name_resolution_failure": "SSE 主机名解析失败。",
+                            }.get(category, "SSE 网络传输失败。")
+                            raise ProviderStreamError(message, category=category) from None
+                        if not chunk:
+                            stage = "sse_parse"
+                            parser.finish()
+                            stage = "completion"
+                            raise ProviderStreamError("SSE 响应在完成标记前结束。")
+                        received_bytes += len(chunk)
                         stage = "sse_parse"
-                        parser.finish()
-                        stage = "completion"
-                        raise ProviderStreamError("SSE 响应在完成标记前结束。")
-                    received_bytes += len(chunk)
-                    stage = "sse_parse"
-                    stream_done = parser.feed(chunk)
-                    stage = "response_body"
-                    if time.monotonic() >= deadline:
-                        raise ProviderStreamError("SSE 流超过总时限。")
-                    if stream_done:
-                        stage = "completion"
-                        break
+                        stream_done = parser.feed(chunk)
+                        stage = "response_body"
+                        if time.monotonic() >= deadline:
+                            raise ProviderStreamError("SSE 流超过总时限。", category="read_timeout")
+                        if stream_done:
+                            stage = "completion"
+                            break
         except urllib.error.HTTPError as exc:
             status = exc.code
             if type(status) is int and 100 <= status <= 599:
@@ -1676,66 +1711,38 @@ class DeepSeekAnthropicProvider:
                             raise ProviderStreamError("Anthropic SSE 响应超过 4 MiB 上限。")
                     except ValueError:
                         raise ProviderStreamError("Anthropic SSE Content-Length 格式无效。") from None
-                raw_socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
-                if raw_socket is None:
-                    raise ProviderStreamError("无法建立有界 Anthropic SSE 网络读取。", category="bounded_reader_unavailable")
-                while True:
-                    stage = "response_body"
-                    if cancellation_event is not None and cancellation_event.is_set():
-                        raise ProviderCancelled("provider stream cancelled")
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise ProviderStreamError("Anthropic SSE 超过总时限。")
-                    if raw_socket is not None:
+                with _SSEReadGuard(response, deadline, cancellation_event) as reader:
+                    while True:
+                        stage = "response_body"
                         try:
-                            raw_socket.settimeout(min(STREAM_READ_POLL_SECONDS, remaining))
-                        except OSError:
-                            try:
-                                closed = raw_socket.fileno() < 0
-                            except OSError:
-                                closed = True
-                            if not closed:
-                                raise ProviderStreamError("Anthropic SSE 网络传输配置失败。", category="transport_error") from None
-                            raw_socket = None
-                    try:
-                        chunk = response.read1(8192)
-                    except http.client.IncompleteRead as exc:
-                        if isinstance(exc.partial, bytes):
-                            received_bytes += len(exc.partial)
-                        raise ProviderStreamError("Anthropic SSE 在 message_stop 前断开。", category="missing_end_marker") from None
-                    except TimeoutError:
-                        if cancellation_event is not None and cancellation_event.is_set():
-                            raise ProviderCancelled("provider stream cancelled") from None
-                        if time.monotonic() >= deadline:
-                            raise ProviderStreamError("Anthropic SSE 超过总时限。") from None
-                        continue
-                    except (OSError, urllib.error.URLError) as exc:
-                        category = _stream_transport_category(exc, stage)
-                        if category == "transport_error" and deadline - time.monotonic() <= STREAM_READ_POLL_SECONDS:
-                            category = "read_timeout"
-                        message = {
-                            "read_timeout": "Anthropic SSE 响应读取超时。",
-                            "tls_failure": "Anthropic SSE TLS 安全传输失败。",
-                            "remote_disconnect": "Anthropic SSE 对端提前断开连接。",
-                            "connection_reset": "Anthropic SSE 连接被对端重置。",
-                            "name_resolution_failure": "Anthropic SSE 主机名解析失败。",
-                        }.get(category, "Anthropic SSE 网络传输失败。")
-                        raise ProviderStreamError(message, category=category) from None
-                    if cancellation_event is not None and cancellation_event.is_set():
-                        raise ProviderCancelled("provider stream cancelled")
-                    if time.monotonic() >= deadline:
-                        raise ProviderStreamError("Anthropic SSE 超过总时限。")
-                    if not chunk:
+                            chunk = reader.read1(8192)
+                        except http.client.IncompleteRead as exc:
+                            if isinstance(exc.partial, bytes):
+                                received_bytes += len(exc.partial)
+                            raise ProviderStreamError("Anthropic SSE 在 message_stop 前断开。", category="missing_end_marker") from None
+                        except TimeoutError:
+                            raise ProviderStreamError("Anthropic SSE 响应读取超时。", category="read_timeout") from None
+                        except (OSError, urllib.error.URLError) as exc:
+                            category = _stream_transport_category(exc, stage)
+                            message = {
+                                "read_timeout": "Anthropic SSE 响应读取超时。",
+                                "tls_failure": "Anthropic SSE TLS 安全传输失败。",
+                                "remote_disconnect": "Anthropic SSE 对端提前断开连接。",
+                                "connection_reset": "Anthropic SSE 连接被对端重置。",
+                                "name_resolution_failure": "Anthropic SSE 主机名解析失败。",
+                            }.get(category, "Anthropic SSE 网络传输失败。")
+                            raise ProviderStreamError(message, category=category) from None
+                        if not chunk:
+                            stage = "sse_parse"
+                            parser.finish()
+                            raise ProviderStreamError("Anthropic SSE 在 message_stop 前结束。", category="missing_end_marker")
+                        received_bytes += len(chunk)
                         stage = "sse_parse"
-                        parser.finish()
-                        raise ProviderStreamError("Anthropic SSE 在 message_stop 前结束。", category="missing_end_marker")
-                    received_bytes += len(chunk)
-                    stage = "sse_parse"
-                    parser.feed(chunk)
-                    if time.monotonic() >= deadline:
-                        raise ProviderStreamError("Anthropic SSE 超过总时限。")
-                    if parser.done:
-                        break
+                        parser.feed(chunk)
+                        if time.monotonic() >= deadline:
+                            raise ProviderStreamError("Anthropic SSE 超过总时限。", category="read_timeout")
+                        if parser.done:
+                            break
         except urllib.error.HTTPError as exc:
             status = exc.code
             if type(status) is int and 100 <= status <= 599:
