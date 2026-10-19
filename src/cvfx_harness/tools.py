@@ -196,6 +196,11 @@ class Workspace:
             raise WorkspaceError(f"工作区路径不可用：{type(exc).__name__}") from None
         if not self.root.is_dir():
             raise WorkspaceError("工作区必须是已存在的目录。")
+        try:
+            root_info = self.root.stat()
+            self._root_identity = (root_info.st_dev, root_info.st_ino)
+        except OSError:
+            raise WorkspaceError("工作区路径不可用。") from None
         root_parts = tuple(part.casefold() for part in self.root.parts)
         if _CONTROL_DIR.casefold() in root_parts or any(
             part in _SENSITIVE_DIRECTORIES for part in root_parts
@@ -309,9 +314,55 @@ class Workspace:
         return stat.S_ISLNK(info.st_mode)
 
     def _read_snapshot(self, target: Path) -> bytes | None:
+        if self._supports_dir_fd_operations():
+            try:
+                parent_fd, name = self._open_parent_directory_fd(target)
+            except FileNotFoundError:
+                return None
+            except OSError:
+                raise WorkspaceError("拒绝通过链接或工作区外路径读取文件。") from None
+            try:
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                try:
+                    descriptor = os.open(name, flags, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    return None
+                except OSError:
+                    raise WorkspaceError("目标不是普通文件，或文件路径在访问期间发生变化。") from None
+                try:
+                    info = os.fstat(descriptor)
+                    if not stat.S_ISREG(info.st_mode):
+                        raise WorkspaceError("目标路径不是普通文件。")
+                    if getattr(info, "st_nlink", 1) > 1:
+                        raise WorkspaceError("拒绝访问含多个硬链接的文件，避免越过工作区边界。")
+                    if info.st_size > READ_LIMIT_BYTES:
+                        raise WorkspaceError("文件超过 64 KiB 安全上限。")
+                    chunks: list[bytes] = []
+                    remaining = READ_LIMIT_BYTES + 1
+                    while remaining:
+                        chunk = os.read(descriptor, min(8192, remaining))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    data = b"".join(chunks)
+                finally:
+                    os.close(descriptor)
+            finally:
+                os.close(parent_fd)
+            if len(data) > READ_LIMIT_BYTES:
+                raise WorkspaceError("文件超过 64 KiB 安全上限。")
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError:
+                raise WorkspaceError("当前仅支持 UTF-8 文本文件。") from None
+            return data
+
         if not target.exists():
             return None
         try:
+            self._assert_no_reparse_points(target)
             if not target.is_file():
                 raise WorkspaceError("目标路径不是普通文件。")
             info = target.stat()
@@ -320,6 +371,7 @@ class Workspace:
             if info.st_size > READ_LIMIT_BYTES:
                 raise WorkspaceError("文件超过 64 KiB 安全上限。")
             data = target.read_bytes()
+            self._assert_no_reparse_points(target)
         except WorkspaceError:
             raise
         except OSError as exc:
@@ -443,9 +495,107 @@ class Workspace:
         return self.internal_storage_dir(_BACKUP_DIR, create=create)
 
     @staticmethod
-    def _atomic_write_bytes(target: Path, data: bytes) -> None:
+    def _supports_dir_fd_operations() -> bool:
+        return (
+            os.name != "nt"
+            and hasattr(os, "O_DIRECTORY")
+            and hasattr(os, "O_NOFOLLOW")
+            and os.open in os.supports_dir_fd
+            and os.rename in os.supports_dir_fd
+            and os.unlink in os.supports_dir_fd
+        )
+
+    def _target_parts(self, target: Path) -> tuple[str, ...]:
+        try:
+            relative = target.relative_to(self.root)
+        except ValueError:
+            raise WorkspaceError("拒绝访问工作区之外的路径。") from None
+        parts = relative.parts
+        if not parts or any(part in {"", ".", ".."} for part in parts):
+            raise WorkspaceError("文件路径无效。")
+        return tuple(parts)
+
+    def _open_parent_directory_fd(self, target: Path) -> tuple[int, str]:
+        """Open the parent by directory handles without following symlink components."""
+        parts = self._target_parts(target)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_fd = os.open(self.root, flags)
+        try:
+            root_info = os.fstat(directory_fd)
+            if (root_info.st_dev, root_info.st_ino) != self._root_identity:
+                raise WorkspaceError("工作区根目录在运行期间发生变化；操作已取消。")
+            for component in parts[:-1]:
+                child_fd = os.open(component, flags, dir_fd=directory_fd)
+                os.close(directory_fd)
+                directory_fd = child_fd
+            return directory_fd, parts[-1]
+        except FileNotFoundError:
+            os.close(directory_fd)
+            raise
+        except OSError:
+            os.close(directory_fd)
+            raise WorkspaceError("拒绝通过链接或工作区外路径访问文件。") from None
+        except BaseException:
+            os.close(directory_fd)
+            raise
+
+    def _assert_no_reparse_points(self, target: Path) -> None:
+        self._target_parts(target)
+        current = self.root
+        if self._is_reparse_point(current):
+            raise WorkspaceError("工作区路径包含 symlink/junction；操作已取消。")
+        for component in target.relative_to(self.root).parts:
+            current = current / component
+            if self._is_reparse_point(current):
+                raise WorkspaceError("路径包含 symlink/junction；操作已取消。")
+
+    def _atomic_write_bytes(self, target: Path, data: bytes) -> None:
         if not target.parent.is_dir():
             raise WorkspaceError("目标文件的父目录必须已存在。")
+        if self._supports_dir_fd_operations():
+            try:
+                parent_fd, name = self._open_parent_directory_fd(target)
+            except FileNotFoundError:
+                raise WorkspaceError("目标目录在写入期间发生变化。") from None
+            temporary_name = f".harness-tmp-{uuid.uuid4().hex}.tmp"
+            descriptor: int | None = None
+            try:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+                with os.fdopen(descriptor, "wb") as handle:
+                    descriptor = None
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                # os.rename is the POSIX replace operation and explicitly
+                # supports directory-relative descriptors on supported builds.
+                os.rename(
+                    temporary_name,
+                    name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                temporary_name = ""
+            except WorkspaceError:
+                raise
+            except OSError as exc:
+                raise WorkspaceError(f"原子写入失败：{type(exc).__name__}") from None
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+                if temporary_name:
+                    try:
+                        os.unlink(temporary_name, dir_fd=parent_fd)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+                os.close(parent_fd)
+            return
+
+        self._assert_no_reparse_points(target)
         temporary_name: str | None = None
         try:
             descriptor, temporary_name = tempfile.mkstemp(
@@ -455,6 +605,7 @@ class Workspace:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
+            self._assert_no_reparse_points(target)
             os.replace(temporary_name, target)
             temporary_name = None
         except OSError as exc:
@@ -468,10 +619,28 @@ class Workspace:
                 except OSError:
                     pass
 
-    @staticmethod
-    def _atomic_write_json(target: Path, value: dict[str, Any]) -> None:
+    def _atomic_write_json(self, target: Path, value: dict[str, Any]) -> None:
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        Workspace._atomic_write_bytes(target, encoded)
+        self._atomic_write_bytes(target, encoded)
+
+    def _unlink_workspace_file(self, target: Path) -> None:
+        if self._supports_dir_fd_operations():
+            try:
+                parent_fd, name = self._open_parent_directory_fd(target)
+            except FileNotFoundError:
+                raise WorkspaceError("撤销目标路径在操作期间发生变化。") from None
+            try:
+                os.unlink(name, dir_fd=parent_fd)
+            except OSError as exc:
+                raise WorkspaceError(f"撤销时删除新文件失败：{type(exc).__name__}") from None
+            finally:
+                os.close(parent_fd)
+            return
+        self._assert_no_reparse_points(target)
+        try:
+            target.unlink()
+        except OSError as exc:
+            raise WorkspaceError(f"撤销时删除新文件失败：{type(exc).__name__}") from None
 
     def commit_write(
         self,
@@ -511,8 +680,8 @@ class Workspace:
             self._atomic_write_bytes(current_target, new_bytes)
         except (WorkspaceError, ProviderCancelled):
             try:
-                backup_path.unlink()
-            except OSError:
+                self._unlink_workspace_file(backup_path)
+            except (OSError, WorkspaceError):
                 pass
             raise
         return backup_id
@@ -639,10 +808,7 @@ class Workspace:
         if before_exists:
             self._atomic_write_bytes(target, restore_bytes)
         else:
-            try:
-                target.unlink()
-            except OSError as exc:
-                raise WorkspaceError(f"撤销时删除新文件失败：{type(exc).__name__}") from None
+            self._unlink_workspace_file(target)
         record["undone"] = True
         record["undone_ns"] = time.time_ns()
         self._atomic_write_json(backup_path, record)

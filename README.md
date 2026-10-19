@@ -107,7 +107,7 @@ Token 数由本地字符启发式估算，不是提供商 tokenizer 的精确数
 
 ## DeepSeek OpenAI 兼容模式
 
-适配器默认端点为 `https://api.deepseek.com/chat/completions`，模型默认为 `deepseek-flash`；工作区配置、环境变量和 CLI 参数可设置非敏感字段。选择 OpenAI 模式后，程序只读取 `DEEPSEEK_API_KEY`；Mock 模式不会查询这个变量。环境密钥只允许发往 `https://api.deepseek.com:443`。`/配置` 会显示变量名，不显示值；认证头不会进入模型消息、会话或 Harness 日志。HTTP 仅对本机 loopback 开放且仅供本地合成 fixture 使用；无凭据 provider 只允许 loopback。请勿把密钥放进 URL、命令行、项目文件、聊天或 Git。
+适配器默认端点为 `https://api.deepseek.com/chat/completions`，模型默认为 `deepseek-flash`；工作区配置、环境变量和 CLI 参数可设置非敏感字段。选择 OpenAI 模式后，程序只读取 `DEEPSEEK_API_KEY`；Mock 模式不会查询这个变量。非空 DeepSeek 密钥无论来自环境还是显式覆盖，都只允许发往 `https://api.deepseek.com:443`；带认证的 OpenAI 兼容与 Anthropic 兼容请求均拒绝 HTTP 重定向，避免认证头转发到重定向目标。`/配置` 会显示变量名，不显示值；认证头不会进入模型消息、会话或 Harness 日志。HTTP 仅对本机 loopback 开放且仅供本地合成 fixture 使用；无凭据 provider 只允许 loopback。请勿把密钥放进 URL、命令行、项目文件、聊天或 Git。
 
 本地 CLI 尚无隐藏输入界面；若直接使用普通环境变量，原值会进入 Harness 进程。若以后要在 Codex Cloud 使用 DeepSeek，用户可自行在该环境的 **Network secrets** 中添加变量 `DEEPSEEK_API_KEY`，Allowed domains 设为 `api.deepseek.com`。[Codex Cloud 官方说明](https://learn.chatgpt.com/docs/environments/cloud-environments)指出，Network secret 会以 placeholder 交给程序，并由代理在允许目标的 HTTPS 443 请求中替换原值，不把原始值放入本地进程或文件；普通 Environment variable 的值对 task 可见。保存环境改动后需要 Republish 并新建 task。网络密钥须使用自己的 Key，不能与同名直接环境变量冲突。
 
@@ -136,6 +136,7 @@ SSE 保留 Python `urllib` 的 HTTP 代理 CONNECT 和 TLS 验证路径，轮询
 - 文件工具只接受工作区内相对路径；拒绝绝对路径、UNC、ADS、父目录遍历、敏感路径、reparse point 和可识别的硬链接逃逸。只读目录工具逐次审批、限制扫描量和返回条目数、不跟随目录链接。
 - 模型提出 `write_file` 后，本地先检查路径和 UTF-8 文本内容，再逐项展示完整差异；提示明确标为“新建文件”或“覆盖已有文件”，只有本次输入 `y`、`yes` 或 `是` 才批准。多项写入各自询问，不会沿用上一次确认。EOF、Ctrl+C、拒绝或其他输入都不会写入。
 - 写入拒绝删除/清空已有文件、无效 UTF-8、NUL/控制字符二进制内容、超 64 KiB 内容、缺失父目录、链接路径、敏感路径和工作区外路径。审批后会重新解析路径并核对原文件字节；完成核对后保存撤销备份，再次检查文件版本，并通过同目录原子替换写入。`/撤销` 自身也需要单独预览和确认。
+- POSIX 写入通过不跟随链接的目录文件描述符定位父目录并相对原子替换。Windows 使用 reparse-point 检查和路径原子替换；Python 标准库没有对应的目录句柄相对替换接口，因此无法完全消除同一用户进程并发替换目录时的竞态。
 - 文件读取、引用、目录列表、写入和撤销均由本地执行代码逐次检查；计划模式在工具层拒绝模型写入。工作区私有 `.harness/` 状态不能由模型工具改动，模型没有删除、shell 或任意代码执行工具。
 
 实际修改时，在 `/模式 执行` 下直接描述单文件更改。若模型提出 `write_file`，CLI 会先显示新建/覆盖类型及完整 diff，再等待本次单独确认；检查差异后输入 `y` 写入，其他输入都拒绝。要恢复已批准写入，运行 `/撤销` 并再次审阅差异确认。该工具只编辑文本，不会运行或验证项目代码。

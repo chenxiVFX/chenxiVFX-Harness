@@ -519,7 +519,7 @@ class OpenAICompatibleProvider:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with _open_without_redirect(request, timeout=self.timeout) as response:
                 raw = response.read(4 * 1024 * 1024 + 1)
         except urllib.error.HTTPError as exc:
             # Provider response bodies are intentionally omitted: they are untrusted
@@ -754,7 +754,7 @@ class OpenAICompatibleProvider:
             return ProviderStreamError(error.safe_message, category=category, diagnostics=diagnostics)
 
         try:
-            with urllib.request.urlopen(
+            with _open_without_redirect(
                 request,
                 timeout=min(self.timeout, stream_timeout),
             ) as response:
@@ -1983,7 +1983,9 @@ def provider_from_environment(
             if api_key_override is not None
             else settings.get(DEEPSEEK_API_KEY_ENV, "")
         )
-        if api_key_override is None and api_key:
+        if api_key:
+            # An explicit key override is still a DeepSeek key. Never let that
+            # test/embedding hook widen the destination allowlist.
             base_url = validate_deepseek_base_url(base_url)
         else:
             base_url = validate_base_url(base_url)

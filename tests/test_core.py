@@ -643,7 +643,7 @@ class WorkspaceTests(unittest.TestCase):
     def test_commit_rechecks_after_backup_creation_before_atomic_write(self) -> None:
         file = self.root / "backup-race.txt"
         file.write_text("before", encoding="utf-8")
-        original = Workspace._atomic_write_json
+        original = self.workspace._atomic_write_json
 
         def mutate_during_backup(target: Path, value: dict[str, object]) -> None:
             file.write_text("changed during backup", encoding="utf-8")
@@ -657,6 +657,46 @@ class WorkspaceTests(unittest.TestCase):
                     approve_action=self.approve(),
                 )
         self.assertEqual(file.read_text(encoding="utf-8"), "changed during backup")
+
+    def test_write_parent_symlink_swap_after_approval_cannot_escape_workspace(self) -> None:
+        directory = self.root / "docs"
+        directory.mkdir()
+        inside_file = directory / "note.txt"
+        inside_file.write_text("inside-before", encoding="utf-8")
+        outside = self.root.parent / f"{self.root.name}-outside"
+        outside.mkdir()
+        outside_file = outside / "note.txt"
+        outside_file.write_text("outside-before", encoding="utf-8")
+        preview = self.workspace.preview_write("docs/note.txt", "approved-inside-update")
+        original = self.workspace._atomic_write_bytes
+        swapped = False
+
+        def swap_parent_then_write(target: Path, data: bytes) -> None:
+            nonlocal swapped
+            if target == preview.target and not swapped:
+                os.rename(directory, self.root / "docs-original")
+                try:
+                    os.symlink(outside, directory, target_is_directory=True)
+                except OSError as exc:
+                    os.rename(self.root / "docs-original", directory)
+                    self.skipTest(f"本机策略不允许创建 symlink fixture：{type(exc).__name__}")
+                swapped = True
+            original(target, data)
+
+        try:
+            with patch.object(self.workspace, "_atomic_write_bytes", side_effect=swap_parent_then_write):
+                with self.assertRaises(WorkspaceError):
+                    self.workspace.commit_write(preview)
+            self.assertTrue(swapped)
+            self.assertEqual(outside_file.read_text(encoding="utf-8"), "outside-before")
+            self.assertEqual((self.root / "docs-original" / "note.txt").read_text(encoding="utf-8"), "inside-before")
+        finally:
+            if directory.is_symlink():
+                directory.unlink()
+            if (self.root / "docs-original").exists():
+                os.rename(self.root / "docs-original", directory)
+            outside_file.unlink(missing_ok=True)
+            outside.rmdir()
         backups = self.root / ".harness" / "backups"
         self.assertEqual(list(backups.glob("*.json")), [])
 
@@ -664,7 +704,7 @@ class WorkspaceTests(unittest.TestCase):
         file = self.root / "cancel-race.txt"
         file.write_text("before", encoding="utf-8")
         cancellation_event = threading.Event()
-        original = Workspace._atomic_write_json
+        original = self.workspace._atomic_write_json
 
         def cancel_after_backup(target: Path, value: dict[str, object]) -> None:
             original(target, value)
@@ -881,6 +921,25 @@ class AgentTests(unittest.TestCase):
             self.assertFalse(approvals[0].file_existed)
             self.assertEqual((Path(temp) / "你好.txt").read_text(encoding="utf-8"), "写入成功")
             self.assertEqual(provider.requests[1][-1]["role"], "tool")
+
+    def test_each_write_in_one_model_response_requires_its_own_approval(self) -> None:
+        with make_test_temp() as temp:
+            workspace = Workspace(temp)
+            provider = ScriptedProvider([
+                AssistantTurn("", [
+                    ToolCall("write-first", "write_file", {"path": "same.txt", "content": "first"}),
+                    ToolCall("write-second", "write_file", {"path": "same.txt", "content": "second"}),
+                ]),
+                AssistantTurn("两个写入都已单独确认。"),
+            ])
+            approvals: list[ActionRequest] = []
+            agent = Agent(provider, workspace, approve_action=self._approval(approvals))
+
+            self.assertEqual(agent.ask("连续写入同一合成文件"), "两个写入都已单独确认。")
+
+            self.assertEqual([request.operation for request in approvals], ["write", "write"])
+            self.assertEqual([request.file_existed for request in approvals], [False, True])
+            self.assertEqual((Path(temp) / "same.txt").read_text(encoding="utf-8"), "second")
 
     def test_tool_loop_backfills_results_preserves_reasoning_and_shares_output_budget(self) -> None:
         with make_test_temp() as temp:
@@ -2165,7 +2224,7 @@ class ProviderTests(unittest.TestCase):
             )
             provider.endpoint = f"https://sse-fixture.invalid:{origin.server_port}/chat/completions"
             with patch(
-                "urllib.request.urlopen",
+                "cvfx_harness.providers._open_without_redirect",
                 side_effect=lambda request, timeout: opener.open(request, timeout=timeout),
             ):
                 turn = provider.complete_streaming(
@@ -2191,7 +2250,7 @@ class ProviderTests(unittest.TestCase):
             "http://127.0.0.1:9", "", "fixture-model", timeout=0.2, stream_timeout=0.2
         )
         private_text = "synthetic_exception_secret"
-        with patch("urllib.request.urlopen", side_effect=TimeoutError(private_text)):
+        with patch("cvfx_harness.providers._open_without_redirect", side_effect=TimeoutError(private_text)):
             with self.assertRaises(ProviderStreamError) as caught:
                 provider.complete_streaming(
                     [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
@@ -2270,7 +2329,7 @@ class ProviderTests(unittest.TestCase):
             "http://127.0.0.1:9", "", "fixture-model", timeout=1, stream_timeout=1
         )
         malformed_response = TrackingResponse()
-        with patch("urllib.request.urlopen", return_value=malformed_response):
+        with patch("cvfx_harness.providers._open_without_redirect", return_value=malformed_response):
             with self.assertRaises(ProviderStreamError):
                 provider.complete_streaming(
                     [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
@@ -2279,7 +2338,7 @@ class ProviderTests(unittest.TestCase):
 
         cancelled = threading.Event()
         cancellation_response = TrackingResponse(cancelled.set, b"data: [DONE]\n\n")
-        with patch("urllib.request.urlopen", return_value=cancellation_response):
+        with patch("cvfx_harness.providers._open_without_redirect", return_value=cancellation_response):
             with self.assertRaises(ProviderCancelled):
                 provider.complete_streaming(
                     [{"role": "user", "content": "fixture"}], [], cancellation_event=cancelled,
@@ -2296,7 +2355,7 @@ class ProviderTests(unittest.TestCase):
         bounded_provider = OpenAICompatibleProvider(
             "http://127.0.0.1:9", "", "fixture-model", timeout=1, stream_timeout=0.12
         )
-        with patch("urllib.request.urlopen", return_value=slow_response):
+        with patch("cvfx_harness.providers._open_without_redirect", return_value=slow_response):
             with self.assertRaises(ProviderStreamError) as caught:
                 bounded_provider.complete_streaming(
                     [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
@@ -2333,7 +2392,7 @@ class ProviderTests(unittest.TestCase):
             )
             provider.endpoint = f"https://sse-fixture.invalid:{origin.server_port}/chat/completions"
             with patch(
-                "urllib.request.urlopen",
+                "cvfx_harness.providers._open_without_redirect",
                 side_effect=lambda request, timeout: opener.open(request, timeout=timeout),
             ):
                 with self.assertRaises(ProviderStreamError) as caught:
@@ -2370,7 +2429,7 @@ class ProviderTests(unittest.TestCase):
             )
             provider.endpoint = f"https://sse-fixture.invalid:{origin.server_port}/chat/completions"
             with patch(
-                "urllib.request.urlopen",
+                "cvfx_harness.providers._open_without_redirect",
                 side_effect=lambda request, timeout: opener.open(request, timeout=timeout),
             ):
                 with self.assertRaises(ProviderStreamError) as caught:
@@ -2829,7 +2888,7 @@ class ProviderTests(unittest.TestCase):
             captured["timeout"] = timeout
             return FakeResponse()
 
-        with patch("urllib.request.urlopen", fake_urlopen):
+        with patch("cvfx_harness.providers._open_without_redirect", fake_urlopen):
             turn = provider.complete([{"role": "user", "content": "你好"}], [])
 
         self.assertEqual(turn.content, "收到")
@@ -2888,6 +2947,59 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(captured["path"], "/chat/completions")
         self.assertNotIn(test_key, captured["body"].decode("utf-8"))
 
+    def test_openai_json_and_sse_requests_refuse_redirects(self) -> None:
+        target_authorizations: list[str | None] = []
+
+        def target_serve(handler, _request_body: bytes) -> None:
+            target_authorizations.append(handler.headers.get("Authorization"))
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.end_headers()
+            handler.wfile.write(b'{"choices":[{"message":{"role":"assistant","content":"sink"}}]}')
+
+        target, target_worker = local_http_fixture(target_serve)
+
+        def redirect_serve(handler, _request_body: bytes) -> None:
+            handler.send_response(302)
+            handler.send_header("Location", f"http://127.0.0.1:{target.server_port}/collect")
+            handler.send_header("Content-Length", "0")
+            handler.end_headers()
+
+        redirect, redirect_worker = local_http_fixture(redirect_serve)
+        try:
+            base_url = f"http://127.0.0.1:{redirect.server_port}"
+            json_provider = OpenAICompatibleProvider(base_url, "SYNTHETIC_KEY_ONLY", "fixture-model")
+            with self.assertRaisesRegex(ProviderError, "HTTP 302"):
+                json_provider.complete([{"role": "user", "content": "fixture"}], [])
+
+            stream_provider = OpenAICompatibleProvider(base_url, "SYNTHETIC_KEY_ONLY", "fixture-model")
+            with self.assertRaises(ProviderStreamError) as caught:
+                stream_provider.complete_streaming(
+                    [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _text: None
+                )
+        finally:
+            redirect.shutdown()
+            redirect_worker.join(timeout=2)
+            redirect.server_close()
+            target.shutdown()
+            target_worker.join(timeout=2)
+            target.server_close()
+        self.assertEqual(target_authorizations, [])
+        self.assertEqual(caught.exception.diagnostics.http_status, 302)
+
+    def test_anthropic_request_uses_only_its_own_auth_header(self) -> None:
+        key = "SYNTHETIC_ANTHROPIC_KEY_ONLY"
+        provider = DeepSeekAnthropicProvider(
+            "https://api.deepseek.com/anthropic", key, "deepseek-flash"
+        )
+        body = provider._request_body([{"role": "user", "content": "fixture"}], [], max_tokens=4, stream=False)
+        request = provider._request(body, stream=False)
+        headers = {name.casefold(): value for name, value in request.header_items()}
+        self.assertEqual(headers.get("x-api-key"), key)
+        self.assertNotIn("authorization", headers)
+        self.assertNotIn(key, request.data.decode("utf-8"))
+        self.assertEqual(headers.get("anthropic-version"), "2023-06-01")
+
     def test_deepseek_network_secret_uses_fixed_host_without_disclosure(self) -> None:
         test_key = "TEST_SECRET_ONLY_NEVER_OUTPUT"
         provider = provider_from_environment(
@@ -2914,7 +3026,7 @@ class ProviderTests(unittest.TestCase):
             captured["body"] = request.data.decode("utf-8")
             return FakeResponse()
 
-        with patch("urllib.request.urlopen", fake_urlopen):
+        with patch("cvfx_harness.providers._open_without_redirect", fake_urlopen):
             self.assertEqual(
                 provider.complete([{"role": "user", "content": "合成测试"}], []).content,
                 "stub",
@@ -2946,6 +3058,16 @@ class ProviderTests(unittest.TestCase):
                         },
                     )
                 self.assertNotIn(test_key, str(caught.exception))
+
+    def test_explicit_key_override_does_not_bypass_deepseek_host_allowlist(self) -> None:
+        with self.assertRaisesRegex(ProviderError, "仅允许 HTTPS api.deepseek.com"):
+            provider_from_environment(
+                "openai",
+                "deepseek-flash",
+                api_key_override="SYNTHETIC_KEY_ONLY",
+                base_url_override="https://example.invalid",
+                environment={},
+            )
 
     def test_mock_provider_never_looks_up_deepseek_secret(self) -> None:
         class RecordingEnvironment(dict[str, str]):
@@ -3054,7 +3176,7 @@ class ProviderTests(unittest.TestCase):
             return FakeResponse(payloads.pop(0))
 
         first_messages = [{"role": "system", "content": "static system"}, {"role": "user", "content": "read"}]
-        with patch("urllib.request.urlopen", fake_urlopen):
+        with patch("cvfx_harness.providers._open_without_redirect", fake_urlopen):
             first = provider.complete(first_messages, [{"type": "function"}])
             second_messages = first_messages + [
                 first.assistant_message,
@@ -3089,7 +3211,7 @@ class ProviderTests(unittest.TestCase):
                 io.BytesIO(response_body),
             )
 
-        with patch("urllib.request.urlopen", rate_limited):
+        with patch("cvfx_harness.providers._open_without_redirect", rate_limited):
             with self.assertRaisesRegex(ProviderError, "429") as caught:
                 provider.complete([{"role": "user", "content": "hello"}], [])
         self.assertEqual(calls, 1, "automatic retries could amplify cost")
@@ -3102,7 +3224,7 @@ class ProviderTests(unittest.TestCase):
         )
         event = threading.Event()
         event.set()
-        with patch("urllib.request.urlopen", side_effect=AssertionError("must not send")):
+        with patch("cvfx_harness.providers._open_without_redirect", side_effect=AssertionError("must not send")):
             with self.assertRaises(ProviderCancelled):
                 provider.complete([{"role": "user", "content": "hello"}], [], cancellation_event=event)
 
@@ -3119,7 +3241,7 @@ class ProviderTests(unittest.TestCase):
                 event.set()
                 return json.dumps({"choices": [{"message": {"role": "assistant", "content": "late"}}]}).encode()
 
-        with patch("urllib.request.urlopen", return_value=CancellingResponse()):
+        with patch("cvfx_harness.providers._open_without_redirect", return_value=CancellingResponse()):
             with self.assertRaises(ProviderCancelled):
                 provider.complete([{"role": "user", "content": "hello"}], [], cancellation_event=event)
 
@@ -3144,7 +3266,7 @@ class ProviderTests(unittest.TestCase):
             bodies.append(json.loads(request.data.decode("utf-8")))
             return FakeResponse()
 
-        with patch("urllib.request.urlopen", fake_urlopen):
+        with patch("cvfx_harness.providers._open_without_redirect", fake_urlopen):
             provider.complete([{"role": "user", "content": "synthetic"}], [], max_tokens=128)
             for invalid in (0, 65537, True):
                 with self.assertRaises(ProviderError):
@@ -3179,7 +3301,7 @@ class ProviderTests(unittest.TestCase):
                 }}]}
                 return json.dumps(payload).encode("utf-8")
 
-        with patch("urllib.request.urlopen", return_value=FakeResponse()):
+        with patch("cvfx_harness.providers._open_without_redirect", return_value=FakeResponse()):
             with self.assertRaisesRegex(ProviderError, "格式无效的工具调用"):
                 provider.complete([{"role": "user", "content": "synthetic"}], [])
 
