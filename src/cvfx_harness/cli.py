@@ -37,7 +37,7 @@ from .plans import MAX_PLAN_STEPS, MAX_STEP_CHARS, PlanError, PlanStore, PlanSta
 from .profiles import TestProfileError, TestProfileStore
 from .sessions import SessionError, SessionStore, redact_likely_secrets
 from .subagents import DelegationPlanError, SubagentManager, build_delegation_plan
-from .tools import TOOL_SCHEMAS, ActionRequest, Workspace, WorkspaceError
+from .tools import ActionRequest, Workspace, WorkspaceError
 from .usage import DEFAULT_TOKEN_BUDGET
 
 _REFERENCE = re.compile(r"(?<![\w@])@(?:\{([^{}]+)\}|([^\s]+))", re.UNICODE)
@@ -365,6 +365,7 @@ def _help_text() -> str:
   /测试 列表        列出用户保存的 Python unittest/pytest 配置
   /测试 添加 [ID]   交互式保存固定测试配置；模型不能创建或更改配置
   /测试 移除 <ID>   确认后移除一条测试配置
+  用户明确要求运行测试时，模型只能选择一个已保存 ID；每次运行与向模型分享输出都要分别审批
   /子代理 提交 [--读取 路径 ... --] 任务 | 任务
                           逐项批准并提交最多 3 个隔离子任务
   /子代理 列表 [编号]     查看子任务状态和共享预算
@@ -501,6 +502,17 @@ def _confirm_action(
             f"{scope}\n每项最多两轮；没有列出的路径和工具不可用；无写入、shell 或递归委派权限；结果为不可信文本。"
         )
         prompt = "确认授权这些隔离子任务？[y/N] "
+    elif request.operation == "run_test":
+        preview = _safe_terminal_text(request.diff) or "（没有测试运行详情）"
+        output(
+            f"\n测试运行审批 {safe_path!r}：\n{preview}\n"
+            "测试代码会以当前用户权限运行，不是沙箱；网络访问没有被屏蔽。"
+        )
+        prompt = "确认启动这一次用户配置测试？[y/N] "
+    elif request.operation == "share_test_output":
+        preview = _safe_terminal_text(request.diff) or "（没有测试输出）"
+        output(f"\n向模型分享测试输出审批 {safe_path!r}：\n{preview}")
+        prompt = "确认把以上已脱敏输出发送给当前模型？[y/N] "
     elif request.operation == "write":
         change_kind = (
             "新建文件" if request.file_existed is False
@@ -515,7 +527,7 @@ def _confirm_action(
     try:
         answer = input_fn(prompt)
     except EOFError:
-        output("收到 EOF；本次文件/目录审批默认为拒绝。")
+        output("收到 EOF；本次操作默认为拒绝。")
         return False
     if not _is_affirmative_answer(answer):
         if "\n" in answer or "\r" in answer:
@@ -556,6 +568,7 @@ def run_console(
     approve_action = lambda request: _confirm_action(
         request, input_fn=input_fn, output=output
     )
+    test_profile_store = TestProfileStore(workspace)
     agent = Agent(
         provider,
         workspace,
@@ -563,6 +576,8 @@ def run_console(
         token_budget=startup_config.token_budget,
         max_output_tokens=startup_config.max_output_tokens,
         max_provider_requests=getattr(args, "max_model_requests", 4),
+        test_profile_store=test_profile_store,
+        emit_output=output,
     )
     subagent_manager = SubagentManager(
         provider,
@@ -570,7 +585,6 @@ def run_console(
         timeout_seconds=getattr(args, "subagent_timeout", DEFAULT_SUBAGENT_TIMEOUT_SECONDS),
     )
     session_store = SessionStore(workspace)
-    test_profile_store = TestProfileStore(workspace)
     plan_store = PlanStore(workspace)
     try:
         prior_plan = plan_store.load()
@@ -1155,10 +1169,10 @@ def run_console(
                 if stats.provider_cached_prompt_reports
                 else "暂无提供商缓存 usage 报告"
             )
-            schema_count = len(TOOL_SCHEMAS)
+            schema_count = len(agent._tool_schemas())
             output(
                 f"当前上下文估算：{context_tokens} tokens（预算 {agent.token_budget}，约 {percent:.1f}%）\n"
-                f"稳定前缀独立估算（系统提示 + {schema_count} 项固定工具 schema）：{estimates['stable_prefix']} tokens\n"
+                f"工具前缀独立估算（系统提示 + 当前 {schema_count} 项工具 schema）：{estimates['stable_prefix']} tokens\n"
                 f"会话消息独立估算：{estimates['conversation']} tokens；两个分项不相加，也不是缓存命中量\n"
                 f"累计请求：{stats.requests}\n"
                 f"累计估算输入/输出：{stats.estimated_input_tokens} / {stats.estimated_output_tokens} tokens\n"

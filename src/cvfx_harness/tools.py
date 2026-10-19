@@ -896,6 +896,37 @@ def _string_argument(call: ToolCall, name: str) -> str:
     return value
 
 
+def build_tool_schemas(test_profile_ids: list[str] | tuple[str, ...] = ()) -> list[dict[str, Any]]:
+    """Return fixed file tools plus an ID-only runner for configured user profiles."""
+    schemas = list(TOOL_SCHEMAS)
+    if test_profile_ids:
+        schemas.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_test_profile",
+                    "description": (
+                        "Run one exact user-owned Python test profile only when the user explicitly asks to run tests. "
+                        "The local harness asks for per-run approval and separately asks before sharing redacted output. "
+                        "This is not a shell and accepts no command, path, or arguments."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "profile_id": {
+                                "type": "string",
+                                "enum": list(test_profile_ids),
+                            }
+                        },
+                        "required": ["profile_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        )
+    return schemas
+
+
 def _raise_if_cancelled(cancellation_event: Any | None) -> None:
     if cancellation_event is not None and cancellation_event.is_set():
         raise ProviderCancelled("tool operation cancelled")
@@ -908,6 +939,8 @@ def run_tool(
     approve_action: ApprovalCallback,
     plan_only: bool = False,
     cancellation_event: Any | None = None,
+    test_profile_store: Any | None = None,
+    emit_output: Callable[[str], None] | None = None,
 ) -> str:
     """Execute one validated tool; model output never grants local permission."""
 
@@ -1009,5 +1042,24 @@ def run_tool(
         if backup_id is None:
             return "文件内容已经相同，没有写入。"
         return f"已写入工作区文件并创建撤销备份 {backup_id}：{path}"
+
+    if call.name == "run_test_profile":
+        _raise_if_cancelled(cancellation_event)
+        _validate_arguments(call, {"profile_id"})
+        profile_id = _string_argument(call, "profile_id")
+        if plan_only:
+            return "计划模式：测试进程已在工具层拦截；没有启动。"
+        if test_profile_store is None:
+            return "没有可运行的用户测试配置；未启动测试进程。"
+        from .test_runner import run_test_profile_tool
+
+        return run_test_profile_tool(
+            workspace,
+            test_profile_store,
+            profile_id,
+            approve_action=approve_action,
+            cancellation_event=cancellation_event,
+            emit_output=emit_output,
+        )
 
     return f"未授权的工具名称：{call.name}；没有执行任何操作。"

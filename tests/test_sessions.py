@@ -512,7 +512,7 @@ class CompressionTests(unittest.TestCase):
             combined = "\n".join(outputs)
             self.assertIn("/保存", combined)
             self.assertIn("当前上下文估算", combined)
-            self.assertIn("稳定前缀独立估算", combined)
+            self.assertIn("工具前缀独立估算", combined)
             self.assertIn("会话消息独立估算", combined)
             self.assertIn("不是缓存命中量", combined)
             self.assertIn("暂无提供商缓存 usage 报告", combined)

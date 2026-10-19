@@ -2,7 +2,7 @@
 
 ## 运行边界
 
-项目使用 Python 3.11+ 标准库，提供 Windows PowerShell 启动脚本。默认 Mock provider；Mock 不查询 DeepSeek 密钥变量。工作区非敏感设置位于 `.harness/config/settings.json`，按默认值、工作区配置、环境变量、CLI 参数的顺序覆盖。远端 HTTP 只会在用户显式选择 DeepSeek OpenAI 兼容 provider 并提供凭据时调用；本机 loopback HTTP 可用无凭据 fixture 验证协议。没有 shell 执行工具、自动文件写权限或常驻后台服务。
+项目使用 Python 3.11+ 标准库，提供 Windows PowerShell 启动脚本。默认 Mock provider；Mock 不查询 DeepSeek 密钥变量。工作区非敏感设置位于 `.harness/config/settings.json`，按默认值、工作区配置、环境变量、CLI 参数的顺序覆盖。远端 HTTP 只会在用户显式选择 DeepSeek OpenAI 兼容 provider 并提供凭据时调用；本机 loopback HTTP 可用无凭据 fixture 验证协议。没有 shell 工具、任意模型代码执行、自动文件写权限或常驻后台服务。唯一的代码运行入口是用户明确配置并逐次批准的固定 Python 测试 profile；它以当前用户权限运行，不是沙箱。
 
 ```text
 终端 UTF-8 输入
@@ -15,16 +15,17 @@ CLI：中文命令、文件引用、权限确认、压缩预览和会话切换
       │      └── Workspace：路径校验、读写审批、差异、撤销备份
       ├── SessionStore：.harness/sessions 下的安全对话与手写检查点 JSON
       ├── CompressionPreview：本地确定性摘录、摘要预览和确认后替换
-      └── SubagentManager：逐项授权、最多 2 并发的 Mock / OpenAI 只读子代理
+      ├── SubagentManager：逐项授权、最多 2 并发的只读子代理
+      └── TestProfileStore / ProcessRunner：用户维护的 ID-only Python profile；运行前审批与独立输出分享审批
 ```
 
 ## 对话与稳定前缀
 
-Agent 的 system message 在每个请求、恢复和压缩后保持固定文本；工具 schema 来自固定列表。每次提问最多进行 4 轮模型回复，每轮最多执行 4 项调用，单个响应最多接受 16 项调用。目录列表、文件读取和文件写入都要逐项审批；目录列表只返回有限数量的名称/类型，跳过敏感条目并拒绝链接目录。文件写入继续经过差异预览和备份。
+Agent 的 system message 在每个请求、恢复和压缩后保持固定文本；文件工具 schema 顺序固定，有已保存测试 profile 时才在尾部增加 ID 枚举 runner，profile 改动会改变该尾部 schema。每次提问最多进行 4 轮模型回复，每轮最多执行 4 项调用，单个响应最多接受 16 项调用。目录列表、文件读取和文件写入都要逐项审批；目录列表只返回有限数量的名称/类型，跳过敏感条目并拒绝链接目录。文件写入继续经过差异预览和备份。
 
 每次提问的输出预算默认为 2048 tokens，跨模型请求累计；默认最多 4 次请求。每次请求的 `max_tokens` 按剩余预算和剩余请求数分配，并从总预算中预留完整额度，使发送的单次上限之和不超过总预算。Provider usage 用于统计和检查单次上限；缺少 usage 时，字符估算只用于发现明显超限响应，不承担精确计量。超预算、取消、provider 错误或格式错误会清除当前未完成对话轮次，避免把断开的工具交换带到下一次请求。已经由用户批准并完成的文件操作不会因后续请求取消或失败自动回滚；CLI 会提示用户用 `/撤销` 检查写入。该估算不是 tokenizer，因此不能保证与远端计量完全一致。
 
-系统提示、工具输出、文件内容、历史摘要和模型回复之间的权限信任边界由本地执行代码维护。摘要只能是标注为 `untrusted-history-summary` 的 `user` 消息，不能合并进 system prompt。缓存友好前缀是结构设计目标，不承诺缓存命中率。
+系统提示、工具输出、文件内容、历史摘要、测试输出和模型回复之间的权限信任边界由本地执行代码维护。测试工具只接受用户配置的一个 profile ID，且计划模式不提供该工具；本地逐次批准后才启动，一次提问最多执行一次。摘要只能是标注为 `untrusted-history-summary` 的 `user` 消息，不能合并进 system prompt。缓存友好前缀是结构设计目标，不承诺缓存命中率。
 
 ## SSE 流式传输
 
@@ -32,7 +33,7 @@ OpenAI 兼容 CLI 通过 `complete_streaming` 使用 `text/event-stream`。SSE �
 
 socket 的读取超时设为剩余截止时间，不以短超时轮询后恢复读取。[Python 文档](https://docs.python.org/3.12/library/socket.html#socket.socket.makefile)明确说明 socket 文件缓冲在超时后可能失效；真正的读取超时必须终止该响应。建连、代理 CONNECT、TLS 和响应头阶段仍由 urllib 的网络超时约束，取消需等这些调用返回才能检查；DNS 或多阶段、慢滴响应头不能承诺与响应体相同的主动硬截止边界。
 
-普通内容片段可立即交给 CLI；reasoning 内容不显示。流式函数工具调用按索引累积，结束后复用已有完整消息/参数校验，之后 Agent 才执行原有逐次人工审批。未收到完整终止标记、格式错误或超限时，Provider 抛出安全的流错误，Agent 清除未完成轮次且不返回工具调用。流式文字可能已显示一部分，错误后不会撤回；终端输出先脱敏疑似凭据并转义控制字符。当前拒绝多候选项、多模态、logprobs、未知 delta 字段和不支持流式的 provider。
+普通内容片段可立即交给 CLI；reasoning 内容不显示。流式函数工具调用按索引累积，结束后复用已有完整消息/参数校验，之后 Agent 才执行原有逐次人工审批。用户测试 profile 工具沿用相同流程，且再执行独立的测试与输出分享审批。未收到完整终止标记、格式错误或超限时，Provider 抛出安全的流错误，Agent 清除未完成轮次且不返回工具调用。流式文字可能已显示一部分，错误后不会撤回；终端输出先脱敏疑似凭据并转义控制字符。当前拒绝多候选项、多模态、logprobs、未知 delta 字段和不支持流式的 provider。
 
 ## 会话格式
 
@@ -56,6 +57,9 @@ socket 的读取超时设为剩余截止时间，不以短超时轮询后恢复�
 - 读操作每次单独批准；模型写入先区分新建/覆盖、预览完整差异，再单独批准，重新核对原始字节并创建可恢复备份后以同目录原子替换。输入拒绝、EOF、取消或无效内容均不写入；已有文件不能被空内容清空。
 - 写入只支持工作区内≤64 KiB 的 UTF-8 文本，拒绝 NUL/控制字符、二进制、链接路径和敏感路径；没有模型删除工具。多个模型写调用各自询问，不批量批准。撤销仍预览并再次确认，计划模式的工具层继续拒绝写入。
 - `.harness/backups` 与 `.harness/sessions` 是 Harness 私有状态，不能通过模型工具访问。
+- 用户测试 profile 放在 `.harness/config/test_profiles.json`，模型文件工具不能读取或修改。profile 只包含 ID、`unittest`/`pytest` 框架和工作区相对 cwd/target；命令分别固定为当前 `sys.executable -m unittest discover -s <target>` 或 `sys.executable -m pytest -q <target>`，`shell=False`，不接受模型 argv、脚本、环境变量或工作目录。
+- 每次测试都显示确切解释器、argv、cwd、120 秒总限时和 32 KiB 合并 stdout/stderr 上限，并要求用户逐次批准。输出在本地脱敏、转义控制字符后展示；分享最多 16 KiB 输出另需用户批准，拒绝时只回传状态和退出码。一次用户提问最多启动一次测试，没有持久授权或自动重试。
+- 测试代码以当前用户 OS 权限运行，不是沙箱；网络访问没有被屏蔽，测试代码可访问用户权限范围内的其他文件和资源。子进程不会继承凭据或其他运行时环境变量；Windows 仅传递系统路径和临时目录。Linux 用 `start_new_session=True` 和进程组终止普通子进程，恶意/自行 `setsid` 脱离的后代不保证受控；Windows 使用 `CREATE_SUSPENDED`，先将进程放入不允许 breakaway 的 kill-on-close Job Object，再恢复主线程，启动失败时在用户代码运行前终止。Windows 合成测试会从被运行的 fixture 中验证 Job Object 成员关系。
 - `.harness/config/settings.json` 只存 provider/model/Base URL/预算等非敏感设置，拒绝重复键、未识别字段和疑似凭据，不包含 API Key；仅支持 Mock 与 DeepSeek OpenAI 兼容模式。`--ignore-config` 只跳过此文件以便修复损坏配置。
 - 目录 symlink 与硬链接逃逸通过实际链接 fixture 集成测试覆盖；junction 仅适用于 Windows。当前 Linux/Windows 与 Python 3.11/3.12 跨平台 CI 矩阵全部通过；若 Windows 系统拒绝创建测试 fixture，对应 Windows 用例会明确跳过。
 - 普通 Python 进程不能提供 OS 级沙箱。若未来加入 shell，须先设计并实测工作区隔离，不能把路径检查误称为进程沙箱。
