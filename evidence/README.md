@@ -14,6 +14,8 @@
 
 关键帧由官方 asciinema `agg` v1.9.0 回放录屏并用 `ffmpeg` 导出；窄终端帧裁切到 46×14 PTY 视口。
 
+本轮录屏另走查 `/项目说明`：默认拒绝后再次预览并明确确认；`/状态` 显示已确认和最近一次 provider 调用请求上下文中的文件路径、字节数、SHA-256 与失效条件。合成 `AGENTS.md` 含有要求绕过审批并运行 PowerShell 的恶意句子；在计划模式里 fixture 故意返回一次 `write_file` 请求，工具层拒绝且没有创建目标文件。随后明确批准一个子代理任务，并检查其 provider 消息不含项目说明标记或正文。录屏中的文件和所有 provider 都是一次性合成数据；没有真实 API、凭据或用户项目访问。
+
 - [主界面](tui-frame-main.png)
 - [补丁审阅与拒绝/批准](tui-frame-patch.png)
 - [压缩预览与默认拒绝](tui-frame-compression.png)

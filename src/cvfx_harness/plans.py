@@ -27,7 +27,8 @@ PLAN_PROGRESS_RESULTS = frozenset({
     "none", "approval_pending", "not_executed", "outcome_unknown", "returned_redacted", "user_verified"
 })
 PLAN_INTERRUPTION_CAUSES = frozenset({
-    "none", "cancelled", "provider_or_tool_error", "process_restarted", "legacy_state_unknown"
+    "none", "cancelled", "provider_or_tool_error", "project_guidance_changed",
+    "process_restarted", "legacy_state_unknown"
 })
 
 
@@ -451,7 +452,7 @@ class PlanStore:
         return updated
 
     def mark_interrupted(self, index: int, *, cause: str, cancelled: bool) -> PlanSnapshot:
-        if cause not in {"cancelled", "provider_or_tool_error"}:
+        if cause not in {"cancelled", "provider_or_tool_error", "project_guidance_changed"}:
             raise PlanError("中断原因无效。")
         snapshot = self.load()
         if type(index) is not int or not 1 <= index <= len(snapshot.steps):

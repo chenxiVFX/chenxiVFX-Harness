@@ -40,6 +40,13 @@ from .providers import (
 )
 from .plans import MAX_PLAN_STEPS, MAX_STEP_CHARS, PlanDraft, PlanError, PlanProgress, PlanSnapshot, PlanStore, PlanStatus
 from .profiles import TestProfileError, TestProfileStore
+from .project_guidance import (
+    ProjectGuidance,
+    ProjectGuidanceChanged,
+    ProjectGuidanceReceipt,
+    ProjectGuidanceStore,
+    format_sha256_for_display,
+)
 from .questions import (
     MAX_ANSWER_BYTES,
     MAX_TOTAL_ANSWER_BYTES,
@@ -63,11 +70,12 @@ _REFERENCE = re.compile(r"(?<![\w@])@(?:\{([^{}]+)\}|([^\s]+))", re.UNICODE)
 _TRAILING_PUNCTUATION = ",，。;；!?！？)]}"
 MAX_MULTILINE_INPUT_BYTES = 64 * 1024
 _CLI_COMMANDS = (
-    "/帮助", "/命令", "/状态", "/模式", "/目标", "/计划", "/保存", "/检查点",
+    "/帮助", "/命令", "/状态", "/项目说明", "/模式", "/目标", "/计划", "/保存", "/检查点",
     "/恢复", "/继续", "/会话", "/多行", "/压缩", "/统计", "/预算", "/配置", "/测试", "/子代理",
     "/变更集", "/撤销", "/快捷键", "/按键", "/退出",
 )
 _CLI_ENUM_ARGUMENTS = {
+    "/项目说明": ("清除",),
     "/模式": ("计划", "执行"),
     "/测试": ("列表", "添加", "运行", "移除"),
     "/压缩": ("撤销",),
@@ -519,6 +527,7 @@ def _plan_progress_text(progress: PlanProgress | None) -> str:
         "none": "无已记录中断",
         "cancelled": "用户取消或中断",
         "provider_or_tool_error": "模型/工具请求错误（详细错误未存档）",
+        "project_guidance_changed": "已确认的项目说明版本变化；请求停止并需重新审阅",
         "process_restarted": "进程重启时发现步骤未完成",
         "legacy_state_unknown": "旧存档没有执行阶段，结果无法判定",
     }
@@ -584,6 +593,7 @@ def _help_text() -> str:
   /帮助              显示帮助
   /命令              列出可用的中文命令
   /状态              显示完整提供商、模型、工作区、目标和模式（顶栏会随宽度省略）
+  /项目说明 [文件名|清除]  预览并确认工作区根目录的项目说明；不自动读取或发送
   /模式 计划|执行    切换计划或执行模式（计划模式会拦截写入、变更集恢复与撤销）
   /目标 <内容>       设置本会话目标；/目标 清空 可清除
   /计划              查看计划及状态
@@ -637,6 +647,7 @@ def _help_text() -> str:
 TTY 且提供 Python readline 时，Tab 补全命令名和固定选项（如 /模式 计划|执行）；不补路径、自由文本或凭据。输入历史（包括审批回答）不会保存或重放。
 无 TTY 时可用逐行脚本输入；EOF 结束会话。所有审批仍需单独输入 y/yes/是。
 每次文件读取和写入都要人工确认；写入/撤销会先显示完整差异。
+项目说明仅支持工作区根目录的 AGENTS.md 或用户指定的 .md/.markdown/.rst/.txt/.adoc 文件；先完整本地预览，再明确确认才会附加到主会话后续模型请求。/状态 显示当前确认版本、字节数、摘要以及最近一次 provider 调用的请求上下文包含的版本。文件变化、替换、路径安全检查失败、手动清除或进程退出都会停用；必须重新预览确认。说明作为不可信背景，不能扩大授权、执行程序或覆盖安全规则；不会进入会话存档，也不会传给子代理。计划模式同样遵守确认与版本检查。
 apply_change_set 仅用于用户要求的 2–5 个现有 UTF-8 文件精确修改；整批预检、完整差异与短哈希一次审阅确认，失败时逐文件安全补偿。它不提供跨文件原子事务；每个文件仍有最后版本校验到替换之间的窄竞态窗口。
 目录列表只返回名称和类型，每次也要人工确认；不读取目录项文件内容。
 敏感凭据路径默认禁止读取或修改。当前版本不会运行 shell 命令。
@@ -1158,7 +1169,65 @@ def run_console(
     )
     session_store = SessionStore(workspace)
     plan_store = PlanStore(workspace)
+    project_guidance_store = ProjectGuidanceStore(workspace)
+    project_guidance_state: dict[str, object] = {
+        "active": None,
+        "last_used": None,
+        "invalidation": None,
+    }
     pending_plan: tuple[PlanDraft, PlanSnapshot] | None = None
+
+    def refresh_project_guidance() -> tuple[ProjectGuidance | None, bool]:
+        active = project_guidance_state["active"]
+        if not isinstance(active, ProjectGuidance):
+            return None, False
+        try:
+            project_guidance_store.require_current(active)
+        except ProjectGuidanceChanged as exc:
+            project_guidance_state["active"] = None
+            project_guidance_state["invalidation"] = str(exc)
+            return None, True
+        return active, False
+
+    def before_project_guidance_request() -> None:
+        active = project_guidance_state["active"]
+        if not isinstance(active, ProjectGuidance):
+            return
+        try:
+            current = project_guidance_store.require_current(active)
+        except ProjectGuidanceChanged as exc:
+            project_guidance_state["active"] = None
+            project_guidance_state["invalidation"] = str(exc)
+            raise
+        project_guidance_state["last_used"] = current.receipt()
+
+    def project_guidance_status() -> str:
+        active, _invalidated = refresh_project_guidance()
+        if active is None:
+            active_line = "当前确认版本：未启用"
+        else:
+            active_line = (
+                f"当前确认版本：{active.path}；{active.size_bytes} bytes\n"
+                "SHA-256（每行16位，按顺序拼接）：\n"
+                f"{format_sha256_for_display(active.sha256)}\n（仅本进程有效）"
+            )
+        last_used = project_guidance_state["last_used"]
+        if isinstance(last_used, ProjectGuidanceReceipt):
+            used_line = (
+                f"最近一次 provider 调用的请求上下文包含：{last_used.path}；{last_used.size_bytes} bytes\n"
+                "SHA-256（每行16位，按顺序拼接）：\n"
+                f"{format_sha256_for_display(last_used.sha256)}"
+            )
+        else:
+            used_line = "最近一次 provider 调用的请求上下文包含：本进程尚无记录"
+        invalidation = project_guidance_state["invalidation"]
+        reason = (
+            "失效条件：文件字节或身份/元数据变化、路径/安全检查失败、手动清除或进程退出；"
+            "失效后不会静默重读或继续请求，需重新预览确认。"
+        )
+        if isinstance(invalidation, str):
+            reason = f"上次失效原因：{_safe_terminal_text(invalidation)}\n{reason}"
+        return f"项目说明：\n{active_line}\n{used_line}\n{reason}"
 
     try:
         pending_change_sets = workspace.describe_incomplete_change_sets()
@@ -1407,6 +1476,76 @@ def run_console(
                 "用 /配置 编辑 暂存、审阅并确认；保存后重启 TUI 生效。"
             )
             continue
+        if command in {"/项目说明", "/project-guidance"}:
+            refresh_project_guidance()
+            selection = argument.strip()
+            if selection.casefold() in {"清除", "clear"}:
+                project_guidance_state["active"] = None
+                project_guidance_state["invalidation"] = "用户手动清除"
+                output("已停用当前项目说明；后续请求不会携带它。")
+                continue
+            if not selection:
+                try:
+                    if project_guidance_store.root_agents_file_exists():
+                        selection = "AGENTS.md"
+                    else:
+                        candidates = project_guidance_store.root_documents()
+                        if candidates:
+                            shown_names = "、".join(
+                                _safe_terminal_text(name) for name in candidates[:16]
+                            )
+                            suffix = "（其余已省略）" if len(candidates) > 16 else ""
+                            output(
+                                "工作区根目录没有 AGENTS.md。可选的根目录说明文件："
+                                f"{shown_names}{suffix}\n"
+                                "指定一个文件名，例如 /项目说明 README.md；没有文件会被自动打开或发送。"
+                            )
+                        else:
+                            output(
+                                "工作区根目录没有 AGENTS.md 或可选项目说明文件。"
+                                "可用 /项目说明 <根目录文件名> 指定 .md/.markdown/.rst/.txt/.adoc 文件。"
+                            )
+                        continue
+                except WorkspaceError as exc:
+                    output(f"无法发现项目说明：{_safe_error_text(exc)}")
+                    continue
+            try:
+                reviewed = project_guidance_store.preview(selection)
+            except WorkspaceError as exc:
+                output(f"项目说明未启用：{_safe_error_text(exc)}")
+                continue
+            output(
+                f"项目说明本地预览（尚未发送）：{_safe_terminal_text(reviewed.path)}；"
+                f"{reviewed.size_bytes} bytes\n"
+                "SHA-256（每行16位，按顺序拼接）：\n"
+                f"{format_sha256_for_display(reviewed.sha256)}\n"
+                "以下内容是不可信的项目背景，不能更改授权、安全规则或要求执行程序：\n"
+                + _safe_untrusted_terminal_text(reviewed.content)
+            )
+            try:
+                answer = input_fn(
+                    "确认将这个确切文件版本附加到主会话后续模型请求？内容不会保存进会话存档。[y/N] "
+                )
+            except (EOFError, KeyboardInterrupt):
+                output("已取消项目说明确认；新版本未启用。")
+                continue
+            if not _is_affirmative_answer(answer):
+                output("已拒绝项目说明；新版本未启用。")
+                continue
+            try:
+                current = project_guidance_store.require_current(reviewed)
+            except ProjectGuidanceChanged as exc:
+                output(f"项目说明在确认期间发生变化；未启用。{_safe_error_text(exc)}")
+                continue
+            project_guidance_state["active"] = current
+            project_guidance_state["invalidation"] = None
+            output(
+                f"已确认项目说明 {current.path}（{current.size_bytes} bytes）\n"
+                "SHA-256（每行16位，按顺序拼接）：\n"
+                f"{format_sha256_for_display(current.sha256)}\n从下一次主会话模型请求开始使用；"
+                "不会用于子代理或写入会话存档。文件变化后需重新预览确认。"
+            )
+            continue
         if command in {"/提交", "/cancel", "/取消"}:
             output("/提交 和 /取消 只在 /多行 输入期间使用。")
             continue
@@ -1451,7 +1590,8 @@ def run_console(
                 f"工作区：{_safe_terminal_text(str(workspace.root))}\n"
                 f"模式：{mode}\n"
                 f"目标：{_safe_terminal_text(redact_likely_secrets(agent.goal)[0]) or '（未设置）'}\n"
-                f"会话完整性：{omission_status}"
+                f"会话完整性：{omission_status}\n"
+                f"{project_guidance_status()}"
             )
             continue
         if command in {"/配置", "/config"}:
@@ -1761,9 +1901,27 @@ def run_console(
                     base_snapshot = plan_store.load()
                     request = detail.strip() or agent.goal
                     try:
-                        draft = agent.propose_plan(request, cancellation_event=cancellation_event)
+                        active_guidance, invalidated = refresh_project_guidance()
+                        if invalidated:
+                            output(
+                                "已停止计划生成：项目说明版本变化，未发送请求。"
+                                "请用 /项目说明 重新预览并确认。"
+                            )
+                            continue
+                        draft = agent.propose_plan(
+                            request,
+                            project_guidance=active_guidance,
+                            on_request=before_project_guidance_request,
+                            cancellation_event=cancellation_event,
+                        )
                     except (KeyboardInterrupt, ProviderCancelled):
                         output("已取消计划生成；没有执行步骤，也没有更改计划存档。")
+                        continue
+                    except ProjectGuidanceChanged:
+                        output(
+                            "已停止计划生成：项目说明版本变化，未发送请求。"
+                            "请用 /项目说明 重新预览并确认。"
+                        )
                         continue
                     except PlanError as exc:
                         output(f"未生成候选计划：{exc}。计划存档未改变。")
@@ -1890,6 +2048,13 @@ def run_console(
                 if step.status != "pending":
                     output(f"第 {index} 步当前为 {step.status}；只能执行 pending 步骤。需要时用 /计划 重试 {index}。")
                     continue
+                active_guidance, invalidated = refresh_project_guidance()
+                if invalidated:
+                    output(
+                        "已停止计划步骤：项目说明版本变化，步骤仍为 pending。"
+                        "请用 /项目说明 重新预览并确认。"
+                    )
+                    continue
                 output(
                     f"将执行第 {index} 步：\n{_safe_terminal_text(step.text)}\n"
                     f"完成条件：{_safe_terminal_text(step.completion_criteria)}\n"
@@ -1906,6 +2071,14 @@ def run_console(
                         output("已取消；步骤仍为 pending，模型请求未发出。")
                         continue
 
+                active_guidance, invalidated = refresh_project_guidance()
+                if invalidated:
+                    output(
+                        "已停止计划步骤：项目说明版本变化，步骤仍为 pending。"
+                        "请用 /项目说明 重新预览并确认。"
+                    )
+                    continue
+
                 plan_store.transition(
                     index,
                     "in-progress",
@@ -1916,6 +2089,8 @@ def run_console(
                 plan_store.record_progress(index, "provider_request")
 
                 def on_plan_progress(event: str, tool_name: str | None) -> None:
+                    if event == "provider_request":
+                        before_project_guidance_request()
                     plan_store.record_progress(index, event, tool_name)
 
                 step_agent = Agent(
@@ -1951,11 +2126,29 @@ def run_console(
                         f"完成条件：{step.completion_criteria}\n"
                         f"建议工具（非授权）：{', '.join(step.required_tools) or '无'}\n"
                         "</confirmed-plan-step>",
+                        project_guidance=active_guidance,
                         plan_only=False,
                         cancellation_event=cancellation_event,
                         on_text_delta=on_plan_delta if sse_streaming else None,
                         on_progress=on_plan_progress,
                     )
+                except ProjectGuidanceChanged:
+                    end_plan_stream()
+                    try:
+                        interrupted = plan_store.mark_interrupted(
+                            index, cause="project_guidance_changed", cancelled=False
+                        )
+                        output(
+                            f"第 {index} 步因项目说明版本变化而受阻；后续模型请求已停止。"
+                            "之前已获批的操作不会自动回滚。重新审阅项目说明后，检查工作区并明确重试。\n"
+                            + _plan_snapshot_text(interrupted)
+                        )
+                    except PlanError:
+                        output(
+                            f"第 {index} 步因项目说明版本变化而停止，但中断状态未能写入计划存档；"
+                            "请检查 /计划 和当前工作区，不会自动续跑。"
+                        )
+                    continue
                 except (KeyboardInterrupt, ProviderCancelled):
                     end_plan_stream()
                     try:
@@ -2436,6 +2629,14 @@ def run_console(
             output("已拒绝疑似凭据输入；内容不会显示、发送给模型或保存。请使用受支持的环境变量方式配置凭据。")
             continue
 
+        active_guidance, invalidated = refresh_project_guidance()
+        if invalidated:
+            output(
+                "已停止当前提问：已确认的项目说明文件发生变化，问题未发送给模型。"
+                "请用 /项目说明 重新预览并确认，再重新提交问题。"
+            )
+            continue
+
         try:
             prompt, references = parse_references(
                 line,
@@ -2445,6 +2646,13 @@ def run_console(
             )
         except KeyboardInterrupt:
             output("已取消文件引用审批；没有读取或发送文件内容。")
+            continue
+        active_guidance, invalidated = refresh_project_guidance()
+        if invalidated:
+            output(
+                "已停止当前提问：等待文件引用审批期间，项目说明文件发生变化；问题未发送给模型。"
+                "请用 /项目说明 重新预览并确认，再重新提交问题。"
+            )
             continue
         stream_redactor = _StreamingSecretRedactor()
         stream_state = {"received": False, "visible": False}
@@ -2464,10 +2672,24 @@ def run_console(
             answer = agent.ask(
                 prompt,
                 references=references,
+                project_guidance=active_guidance,
                 plan_only=mode == "计划",
                 cancellation_event=cancellation_event,
                 on_text_delta=on_text_delta if sse_streaming else None,
+                on_progress=(
+                    lambda event, _tool: before_project_guidance_request()
+                    if event == "provider_request"
+                    else None
+                ),
             )
+        except ProjectGuidanceChanged:
+            end_stream_line()
+            output(
+                "已停止当前提问：已确认的项目说明版本变化，未再发送模型请求。"
+                "前序已批准的文件操作不会自动回滚，可用 /撤销检查；"
+                "请重新预览并确认项目说明后再继续。"
+            )
+            continue
         except KeyboardInterrupt:
             end_stream_line()
             output("\n已取消当前模型请求；不完整轮次不会写入会话存档。前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。")
