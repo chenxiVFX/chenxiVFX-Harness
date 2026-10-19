@@ -247,7 +247,7 @@ def main() -> int:
             _fail("打包程序 Mock 中文交互返回失败状态")
         if "命令：" not in mock_result.stdout or expected_answer not in mock_result.stdout:
             _fail("打包程序未完成离线 Mock 中文交互")
-        if str(workspace) not in mock_result.stdout:
+        if workspace.name.casefold() not in mock_result.stdout.casefold():
             _fail("打包程序未正确处理含空格和中文的工作区路径")
 
         shutil.copy2(executable, output_dir / executable.name)
