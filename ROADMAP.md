@@ -188,7 +188,7 @@
 - 交互组件测试、隔离合成键盘自检和 POSIX PTY 测试只使用本地合成内容与 Mock；Windows standalone workflow 会在打包 EXE 内运行 TUI 合成键盘自检。中文 IME 和终端缩放/鼠标差异仍待人工兼容测试。
 - 实际 Linux PTY 录屏展示主界面、状态栏、细分隔线、命令候选高亮、多行草稿、审批预览和拒绝结果；[原始录屏与 PNG 关键帧](evidence/README.md)。PNG 由官方 asciinema `agg` v1.9.0 和 ffmpeg 从 PTY 录屏回放导出；不是重画图或 Windows 截图。录屏、POSIX PTY 测试均启动真实 TUI，只使用本地合成文本与 Mock；不是 Windows Terminal/ConPTY 或中文输入法人工验收。
 - 录屏前发现候选浮层被 `hide_when_covering_content` 隐藏，移除此布局选项后真实 PTY 可见候选与简介；新增 POSIX PTY 回归，验证出现 `/帮助`、简介、选择 `/命令` 并退出。另测试鼠标开关、输入/输出点击聚焦、滚动条、当前候选高亮样式，以及审批按钮点击只切换选择、不提交审批。本轮收紧窄终端状态栏文字、去掉审批区全宽卡片；Agent 流式生成时锁定输入区并显示暂停提示，取消后恢复输入。新增 TUI 到 Agent 的离线集成场景，覆盖流式取消/续聊、默认拒绝不落盘及显式审批仅提交一次写入。
-- Linux / Python 3.12 离线回归：182 项，181 通过、1 项 Windows-only junction 跳过；editable install、自检、TUI 合成键盘自检、`compileall` 与 `git diff --check` 通过。当前更改推送后将重新运行 Windows/Linux × Python 3.11/3.12 四格 CI 和 Windows standalone 工作流。没有真实模型请求或凭据读取；自动测试不等同完整产品验收。
+- Linux / Python 3.12 离线回归：182 项，181 通过、1 项 Windows-only junction 跳过；editable install、自检、TUI 合成键盘自检、`compileall` 与 `git diff --check` 通过。Windows/Linux × Python 3.11/3.12 四格 CI 全部通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39246029345)）；Windows standalone EXE 构建、归档审查、帮助/Mock/TUI 自检和 artifact 上传通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39246029495)）。没有真实模型请求或凭据读取；自动测试不等同完整产品验收。
 
 ## 参考项目复用边界
 
