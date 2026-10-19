@@ -41,11 +41,13 @@ COMMANDS = (
     ("/恢复", "恢复安全会话"), ("/会话", "列出本地会话"),
     ("/多行", "撰写多行问题"), ("/压缩", "预览并压缩上下文"),
     ("/统计", "查看上下文用量"), ("/预算", "设置本轮预算"),
-    ("/配置", "查看非敏感配置"), ("/子代理", "管理隔离子任务"),
+    ("/配置", "查看非敏感配置"), ("/测试", "管理固定 Python 测试配置"),
+    ("/子代理", "管理隔离子任务"),
     ("/撤销", "预览并撤销写入"), ("/退出", "结束会话"),
 )
 ENUM_COMPLETIONS = {
     "/模式": ("计划", "执行"),
+    "/测试": ("列表", "添加", "移除"),
 }
 _APPROVAL_PROMPT = re.compile(r"\[y/N\]\s*$", re.IGNORECASE)
 
@@ -137,14 +139,16 @@ class CommandCompleter(Completer):
             return
         if "\n" in before:
             return
-        if before.startswith("/模式 "):
-            prefix = before[len("/模式 ") :]
-            if " " in prefix:
+        for command, values in ENUM_COMPLETIONS.items():
+            marker = command + " "
+            if before.startswith(marker):
+                prefix = before[len(marker) :]
+                if " " in prefix:
+                    return
+                for value in values:
+                    if value.startswith(prefix):
+                        yield Completion(value, start_position=-len(prefix))
                 return
-            for value in ENUM_COMPLETIONS["/模式"]:
-                if value.startswith(prefix):
-                    yield Completion(value, start_position=-len(prefix))
-            return
         if before.startswith("/") and " " not in before:
             for command, description in COMMANDS:
                 if command.startswith(before):

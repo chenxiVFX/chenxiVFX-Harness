@@ -34,6 +34,7 @@ from .providers import (
     provider_from_environment,
 )
 from .plans import MAX_PLAN_STEPS, MAX_STEP_CHARS, PlanError, PlanStore, PlanStatus
+from .profiles import TestProfileError, TestProfileStore
 from .sessions import SessionError, SessionStore, redact_likely_secrets
 from .subagents import DelegationPlanError, SubagentManager, build_delegation_plan
 from .tools import TOOL_SCHEMAS, ActionRequest, Workspace, WorkspaceError
@@ -44,10 +45,10 @@ _TRAILING_PUNCTUATION = ",，。;；!?！？)]}"
 MAX_MULTILINE_INPUT_BYTES = 64 * 1024
 _CLI_COMMANDS = (
     "/帮助", "/命令", "/状态", "/模式", "/目标", "/计划", "/保存", "/检查点",
-    "/恢复", "/会话", "/多行", "/压缩", "/统计", "/预算", "/配置", "/子代理",
+    "/恢复", "/会话", "/多行", "/压缩", "/统计", "/预算", "/配置", "/测试", "/子代理",
     "/撤销", "/退出",
 )
-_CLI_ENUM_ARGUMENTS = {"/模式": ("计划", "执行")}
+_CLI_ENUM_ARGUMENTS = {"/模式": ("计划", "执行"), "/测试": ("列表", "添加", "移除")}
 _STREAM_SECRET_TAIL_CHARS = 16
 _STREAM_SECRET_RUN_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+/=-"
@@ -361,6 +362,9 @@ def _help_text() -> str:
   /配置 端点 <DeepSeek HTTPS URL>|默认
   /配置 预算 <1024–1000000>
   /配置 输出上限 <1–65536>
+  /测试 列表        列出用户保存的 Python unittest/pytest 配置
+  /测试 添加 [ID]   交互式保存固定测试配置；模型不能创建或更改配置
+  /测试 移除 <ID>   确认后移除一条测试配置
   /子代理 提交 [--读取 路径 ... --] 任务 | 任务
                           逐项批准并提交最多 3 个隔离子任务
   /子代理 列表 [编号]     查看子任务状态和共享预算
@@ -566,6 +570,7 @@ def run_console(
         timeout_seconds=getattr(args, "subagent_timeout", DEFAULT_SUBAGENT_TIMEOUT_SECONDS),
     )
     session_store = SessionStore(workspace)
+    test_profile_store = TestProfileStore(workspace)
     plan_store = PlanStore(workspace)
     try:
         prior_plan = plan_store.load()
@@ -760,6 +765,68 @@ def run_console(
                     output(f"该配置值已保存，但本次启动由更高优先级的 {startup_config.sources[key]} 覆盖。")
             if startup_config.provider == "openai":
                 output(f"运行 OpenAI 兼容模式仍需从环境变量提供 {DEEPSEEK_API_KEY_ENV}；密钥不会写入配置文件。")
+            continue
+        if command in {"/测试", "/tests"}:
+            subcommand, _, detail = argument.strip().partition(" ")
+            subcommand = subcommand.casefold()
+            try:
+                if subcommand in {"", "列表", "list"}:
+                    profiles = test_profile_store.load()
+                    if not profiles:
+                        output(
+                            "当前没有测试配置。用 /测试 添加 创建用户配置；"
+                            "本命令只保存配置，不会运行测试。"
+                        )
+                    else:
+                        lines = [
+                            f"  {profile.profile_id}: Python {profile.framework}；"
+                            f"工作目录 {profile.cwd!r}；目标 {profile.target!r}"
+                            for profile in profiles
+                        ]
+                        output(
+                            "用户测试配置（只含框架与工作区相对路径；"
+                            "没有任意 argv 或 shell 命令）：\n" + "\n".join(lines)
+                        )
+                    continue
+
+                if subcommand in {"添加", "add"}:
+                    profile_id = detail.strip() or input_fn("测试配置 ID> ").strip()
+                    framework = input_fn("测试框架（unittest/pytest）> ").strip()
+                    cwd = input_fn("工作目录（工作区相对路径）> ").strip()
+                    target = input_fn("测试目标（工作区相对路径）> ").strip()
+                    profile = test_profile_store.add(profile_id, framework, cwd, target)
+                    output(
+                        f"已保存测试配置 {_safe_terminal_text(profile.profile_id)!r}："
+                        f"Python {profile.framework}，cwd={_safe_terminal_text(profile.cwd)!r}，"
+                        f"target={_safe_terminal_text(profile.target)!r}。当前只保存配置，不会运行。"
+                    )
+                    continue
+
+                if subcommand in {"移除", "remove"}:
+                    profile_id = detail.strip()
+                    if not profile_id:
+                        output("用法：/测试 移除 <ID>")
+                        continue
+                    profile = test_profile_store.get(profile_id)
+                    try:
+                        answer = input_fn(
+                            f"确认移除测试配置 {_safe_terminal_text(profile.profile_id)!r}？[y/N] "
+                        )
+                    except (EOFError, KeyboardInterrupt):
+                        output("已取消；测试配置未改变。")
+                        continue
+                    if not _is_affirmative_answer(answer):
+                        output("已取消；测试配置未改变。")
+                        continue
+                    test_profile_store.remove(profile_id)
+                    output(f"已移除测试配置 {_safe_terminal_text(profile.profile_id)!r}。")
+                    continue
+
+                output("用法：/测试 [列表|添加 [ID]|移除 <ID>]")
+            except (EOFError, KeyboardInterrupt):
+                output("已取消测试配置输入；没有保存或运行测试。")
+            except TestProfileError as exc:
+                output(f"测试配置未更改：{exc}")
             continue
         if command in {"/模式", "/mode"}:
             if argument.strip() in {"计划", "plan"}:
