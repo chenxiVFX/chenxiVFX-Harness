@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -134,6 +135,19 @@ class WorkspaceError(RuntimeError):
     pass
 
 
+class WorkspaceConflictError(WorkspaceError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        current_bytes: bytes | None,
+        current_mode: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.current_bytes = current_bytes
+        self.current_mode = current_mode
+
+
 def _safe_terminal_display_length(text: str) -> int:
     """Measure the escaped rendering used by the CLI approval panel."""
     visible_length = 0
@@ -166,6 +180,8 @@ class WritePreview:
     target: Path
     existed: bool
     before_bytes: bytes | None
+    before_mode: int | None
+    before_token: tuple[int, ...] | None
     before_content: str
     new_content: str
     diff: str
@@ -421,11 +437,20 @@ class Workspace:
         return stat.S_ISLNK(info.st_mode)
 
     def _read_snapshot(self, target: Path) -> bytes | None:
+        data, _info = self._read_snapshot_state(target)
+        return data
+
+    def _read_snapshot_state(
+        self,
+        target: Path,
+        *,
+        validate_utf8: bool = True,
+    ) -> tuple[bytes | None, os.stat_result | None]:
         if self._supports_dir_fd_operations():
             try:
                 parent_fd, name = self._open_parent_directory_fd(target)
             except FileNotFoundError:
-                return None
+                return None, None
             except OSError:
                 raise WorkspaceError("拒绝通过链接或工作区外路径读取文件。") from None
             try:
@@ -434,7 +459,7 @@ class Workspace:
                 try:
                     descriptor = os.open(name, flags, dir_fd=parent_fd)
                 except FileNotFoundError:
-                    return None
+                    return None, None
                 except OSError:
                     raise WorkspaceError("目标不是普通文件，或文件路径在访问期间发生变化。") from None
                 try:
@@ -454,30 +479,42 @@ class Workspace:
                         chunks.append(chunk)
                         remaining -= len(chunk)
                     data = b"".join(chunks)
+                    final_info = os.fstat(descriptor)
                 finally:
                     os.close(descriptor)
             finally:
                 os.close(parent_fd)
             if len(data) > READ_LIMIT_BYTES:
                 raise WorkspaceError("文件超过 64 KiB 安全上限。")
-            try:
-                data.decode("utf-8")
-            except UnicodeDecodeError:
-                raise WorkspaceError("当前仅支持 UTF-8 文本文件。") from None
-            return data
+            if self._stat_token(info) != self._stat_token(final_info):
+                raise WorkspaceConflictError(
+                    "读取期间文件发生变化；请重新读取后再操作。",
+                    current_bytes=data,
+                    current_mode=stat.S_IMODE(final_info.st_mode),
+                )
+            if validate_utf8:
+                try:
+                    data.decode("utf-8")
+                except UnicodeDecodeError:
+                    raise WorkspaceError("当前仅支持 UTF-8 文本文件。") from None
+            return data, final_info
 
-        if not target.exists():
-            return None
         try:
             self._assert_no_reparse_points(target)
-            if not target.is_file():
-                raise WorkspaceError("目标路径不是普通文件。")
-            info = target.stat()
-            if getattr(info, "st_nlink", 1) > 1:
-                raise WorkspaceError("拒绝访问含多个硬链接的文件，避免越过工作区边界。")
-            if info.st_size > READ_LIMIT_BYTES:
-                raise WorkspaceError("文件超过 64 KiB 安全上限。")
-            data = target.read_bytes()
+            try:
+                handle = target.open("rb")
+            except FileNotFoundError:
+                return None, None
+            with handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise WorkspaceError("目标路径不是普通文件。")
+                if getattr(info, "st_nlink", 1) > 1:
+                    raise WorkspaceError("拒绝访问含多个硬链接的文件，避免越过工作区边界。")
+                if info.st_size > READ_LIMIT_BYTES:
+                    raise WorkspaceError("文件超过 64 KiB 安全上限。")
+                data = handle.read(READ_LIMIT_BYTES + 1)
+                final_info = os.fstat(handle.fileno())
             self._assert_no_reparse_points(target)
         except WorkspaceError:
             raise
@@ -485,11 +522,32 @@ class Workspace:
             raise WorkspaceError(f"读取文件失败：{type(exc).__name__}") from None
         if len(data) > READ_LIMIT_BYTES:
             raise WorkspaceError("文件超过 64 KiB 安全上限。")
-        try:
-            data.decode("utf-8")
-        except UnicodeDecodeError:
-            raise WorkspaceError("当前仅支持 UTF-8 文本文件。") from None
-        return data
+        if self._stat_token(info) != self._stat_token(final_info):
+            raise WorkspaceConflictError(
+                "读取期间文件发生变化；请重新读取后再操作。",
+                current_bytes=data,
+                current_mode=stat.S_IMODE(final_info.st_mode),
+            )
+        if validate_utf8:
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError:
+                raise WorkspaceError("当前仅支持 UTF-8 文本文件。") from None
+        return data, final_info
+
+    @staticmethod
+    def _stat_token(info: os.stat_result | None) -> tuple[int, ...] | None:
+        if info is None:
+            return None
+        return (
+            int(info.st_dev),
+            int(info.st_ino),
+            int(info.st_mode),
+            int(info.st_size),
+            int(getattr(info, "st_nlink", 1)),
+            int(getattr(info, "st_mtime_ns", int(info.st_mtime * 1_000_000_000))),
+            int(getattr(info, "st_ctime_ns", int(info.st_ctime * 1_000_000_000))),
+        )
 
     def read_text(self, relative_path: str) -> str:
         target = self.resolve(relative_path)
@@ -509,14 +567,23 @@ class Workspace:
     ) -> str:
         old_lines = before.splitlines(keepends=True) if before_exists else []
         new_lines = after.splitlines(keepends=True)
-        return "".join(
-            difflib.unified_diff(
-                old_lines,
-                new_lines,
-                fromfile=f"a/{path}" if before_exists else "/dev/null",
-                tofile=f"b/{path}" if after_exists else "/dev/null",
-            )
+        generated = difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile=f"a/{path}" if before_exists else "/dev/null",
+            tofile=f"b/{path}" if after_exists else "/dev/null",
+            lineterm="\n",
         )
+        output: list[str] = []
+        for index, line in enumerate(generated):
+            output.append(line)
+            if (
+                index >= 2
+                and line.startswith((" ", "+", "-"))
+                and not line.endswith(("\n", "\r"))
+            ):
+                output.append("\n\\ No newline at end of file\n")
+        return "".join(output)
 
     def preview_write(self, relative_path: str, content: str) -> WritePreview:
         if not isinstance(content, str):
@@ -531,8 +598,8 @@ class Workspace:
         target = self._resolve_write_target(relative_path)
         if not target.parent.is_dir():
             raise WorkspaceError("目标文件的父目录必须已存在。")
-        before_bytes = self._read_snapshot(target)
-        return self._build_write_preview(relative_path, target, content, before_bytes)
+        before_bytes, before_info = self._read_snapshot_state(target)
+        return self._build_write_preview(relative_path, target, content, before_bytes, before_info)
 
     def preview_patch(
         self,
@@ -555,7 +622,7 @@ class Workspace:
         target = self._resolve_write_target(relative_path)
         if not target.parent.is_dir():
             raise WorkspaceError("目标文件的父目录必须已存在。")
-        before_bytes = self._read_snapshot(target)
+        before_bytes, before_info = self._read_snapshot_state(target)
         if before_bytes is None:
             raise WorkspaceError("精确补丁只允许修改已存在的普通文件。")
         actual_sha256 = hashlib.sha256(before_bytes).hexdigest()
@@ -573,7 +640,7 @@ class Workspace:
         if occurrences != 1:
             raise WorkspaceError("旧文本出现多次；为避免误改，本次补丁已拒绝。")
         updated_text = before_text.replace(old_text, new_text, 1)
-        preview = self._build_write_preview(relative_path, target, updated_text, before_bytes)
+        preview = self._build_write_preview(relative_path, target, updated_text, before_bytes, before_info)
         try:
             diff_size = len(preview.diff.encode("utf-8"))
         except UnicodeEncodeError:
@@ -603,6 +670,7 @@ class Workspace:
         target: Path,
         content: str,
         before_bytes: bytes | None,
+        before_info: os.stat_result | None,
     ) -> WritePreview:
         try:
             new_bytes = content.encode("utf-8")
@@ -619,12 +687,21 @@ class Workspace:
             self._validate_writable_text(before_content)
         canonical_path = target.relative_to(self.root).as_posix()
         diff = self._diff(canonical_path, before_content, content, before_exists=existed)
+        before_mode = stat.S_IMODE(before_info.st_mode) if before_info is not None else None
+        if os.name != "nt" and before_mode is not None and before_mode & 0o7000:
+            diff = (
+                f"POSIX 权限位：{before_mode:04o} → {before_mode & 0o777:04o}"
+                "（替换时清除 setuid/setgid/sticky 特殊位）\n"
+                + diff
+            )
         return WritePreview(
             path=relative_path,
             canonical_path=canonical_path,
             target=target,
             existed=existed,
             before_bytes=before_bytes,
+            before_mode=before_mode,
+            before_token=self._stat_token(before_info),
             before_content=before_content,
             new_content=content,
             diff=diff,
@@ -735,7 +812,134 @@ class Workspace:
             if self._is_reparse_point(current):
                 raise WorkspaceError("路径包含 symlink/junction；操作已取消。")
 
-    def _atomic_write_bytes(self, target: Path, data: bytes) -> None:
+    def _read_snapshot_at(
+        self,
+        parent_fd: int,
+        name: str,
+    ) -> tuple[bytes | None, os.stat_result | None, int | None]:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return None, None, None
+        except OSError:
+            raise WorkspaceError("目标不是普通文件，或路径在替换前发生变化。") from None
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise WorkspaceError("目标路径不是普通文件。")
+            if getattr(info, "st_nlink", 1) > 1:
+                raise WorkspaceError("拒绝访问含多个硬链接的文件，避免越过工作区边界。")
+            if info.st_size > READ_LIMIT_BYTES:
+                raise WorkspaceError("文件超过 64 KiB 安全上限。")
+            chunks: list[bytes] = []
+            remaining = READ_LIMIT_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(8192, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            final_info = os.fstat(descriptor)
+            if len(data) > READ_LIMIT_BYTES:
+                raise WorkspaceError("文件超过 64 KiB 安全上限。")
+            if self._stat_token(info) != self._stat_token(final_info):
+                raise WorkspaceConflictError(
+                    "替换前读取目标时文件仍在变化；未覆盖该文件。",
+                    current_bytes=data,
+                    current_mode=stat.S_IMODE(final_info.st_mode),
+                )
+            return data, final_info, descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _copy_posix_acl(source_fd: int, destination_fd: int) -> None:
+        if os.name == "nt":
+            return
+        if not all(hasattr(os, name) for name in ("listxattr", "getxattr", "setxattr", "removexattr")):
+            raise WorkspaceError("当前平台无法核对并保留 POSIX ACL；为避免改变访问范围，写入已取消。")
+        try:
+            source_attrs = os.listxattr(source_fd)
+            destination_attrs = os.listxattr(destination_fd)
+        except OSError as exc:
+            if exc.errno in {errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}:
+                return
+            raise WorkspaceError("无法核对现有 POSIX ACL；为避免改变访问范围，写入已取消。") from None
+        source_acl = {name for name in source_attrs if "acl" in name.casefold()}
+        destination_acl = {name for name in destination_attrs if "acl" in name.casefold()}
+        try:
+            for name in destination_acl - source_acl:
+                os.removexattr(destination_fd, name)
+            for name in source_acl:
+                os.setxattr(destination_fd, name, os.getxattr(source_fd, name))
+        except OSError:
+            raise WorkspaceError("无法保留现有 POSIX ACL；目标文件未替换。") from None
+
+    @staticmethod
+    def _copy_windows_dacl(source: Path, destination: Path) -> None:
+        if os.name != "nt":
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.WinDLL("Advapi32", use_last_error=True)
+        get_file_security = advapi32.GetFileSecurityW
+        set_file_security = advapi32.SetFileSecurityW
+        get_file_security.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        get_file_security.restype = wintypes.BOOL
+        set_file_security.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.LPVOID]
+        set_file_security.restype = wintypes.BOOL
+        dacl_information = 0x00000004
+        required = wintypes.DWORD(0)
+        get_file_security(str(source), dacl_information, None, 0, ctypes.byref(required))
+        if required.value <= 0:
+            raise WorkspaceError("无法读取目标 Windows DACL；目标文件未替换。")
+        descriptor = ctypes.create_string_buffer(required.value)
+        if not get_file_security(
+            str(source), dacl_information, descriptor, required.value, ctypes.byref(required)
+        ):
+            raise WorkspaceError("无法读取目标 Windows DACL；目标文件未替换。")
+        if not set_file_security(str(destination), dacl_information, descriptor):
+            raise WorkspaceError("无法保留目标 Windows DACL；目标文件未替换。")
+
+    def _snapshot_matches(
+        self,
+        data: bytes | None,
+        info: os.stat_result | None,
+        expected_bytes: bytes | None,
+        expected_mode: int | None,
+        expected_token: tuple[int, ...] | None,
+    ) -> bool:
+        if data != expected_bytes:
+            return False
+        if info is None:
+            return expected_mode is None and expected_token is None
+        if expected_mode is not None and stat.S_IMODE(info.st_mode) != expected_mode:
+            return False
+        if expected_token is not None and self._stat_token(info) != expected_token:
+            return False
+        return True
+
+    def _atomic_write_bytes(
+        self,
+        target: Path,
+        data: bytes,
+        *,
+        guarded: bool = False,
+        expected_before_bytes: bytes | None = None,
+        expected_before_mode: int | None = None,
+        expected_before_token: tuple[int, ...] | None = None,
+    ) -> None:
         if not target.parent.is_dir():
             raise WorkspaceError("目标文件的父目录必须已存在。")
         if self._supports_dir_fd_operations():
@@ -749,11 +953,58 @@ class Workspace:
                 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
                 flags |= getattr(os, "O_CLOEXEC", 0)
                 descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
-                with os.fdopen(descriptor, "wb") as handle:
-                    descriptor = None
+                with os.fdopen(descriptor, "wb", closefd=False) as handle:
                     handle.write(data)
                     handle.flush()
                     os.fsync(handle.fileno())
+                source_fd: int | None = None
+                if guarded:
+                    current_bytes, current_info, source_fd = self._read_snapshot_at(parent_fd, name)
+                    if not self._snapshot_matches(
+                        current_bytes,
+                        current_info,
+                        expected_before_bytes,
+                        expected_before_mode,
+                        expected_before_token,
+                    ):
+                        if source_fd is not None:
+                            os.close(source_fd)
+                        raise WorkspaceConflictError(
+                            "最后一次版本检查发现并发文件变化；没有替换目标。",
+                            current_bytes=current_bytes,
+                            current_mode=stat.S_IMODE(current_info.st_mode) if current_info else None,
+                        )
+                    if source_fd is not None:
+                        try:
+                            self._copy_posix_acl(source_fd, descriptor)
+                        finally:
+                            os.close(source_fd)
+                        source_fd = None
+                    if expected_before_mode is not None:
+                        os.fchmod(descriptor, expected_before_mode & 0o777)
+                    os.fsync(descriptor)
+                    # Recheck after ACL/mode preparation. Only rename follows this
+                    # comparison; generic filesystems do not offer a portable CAS.
+                    current_bytes, current_info, source_fd = self._read_snapshot_at(parent_fd, name)
+                    if not self._snapshot_matches(
+                        current_bytes,
+                        current_info,
+                        expected_before_bytes,
+                        expected_before_mode,
+                        expected_before_token,
+                    ):
+                        if source_fd is not None:
+                            os.close(source_fd)
+                        raise WorkspaceConflictError(
+                            "原子替换前检测到并发文件变化；没有替换目标。",
+                            current_bytes=current_bytes,
+                            current_mode=stat.S_IMODE(current_info.st_mode) if current_info else None,
+                        )
+                    if source_fd is not None:
+                        os.close(source_fd)
+                if descriptor is not None:
+                    os.close(descriptor)
+                    descriptor = None
                 # os.rename is the POSIX replace operation and explicitly
                 # supports directory-relative descriptors on supported builds.
                 os.rename(
@@ -782,20 +1033,58 @@ class Workspace:
 
         self._assert_no_reparse_points(target)
         temporary_name: str | None = None
+        temporary_path: Path | None = None
+        descriptor: int | None = None
         try:
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=".harness-tmp-", suffix=".tmp", dir=target.parent
             )
-            with os.fdopen(descriptor, "wb") as handle:
+            temporary_path = Path(temporary_name)
+            with os.fdopen(descriptor, "wb", closefd=False) as handle:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
+            if guarded and expected_before_bytes is not None:
+                if os.name == "nt":
+                    self._copy_windows_dacl(target, temporary_path)
+                else:
+                    with target.open("rb") as source_handle:
+                        self._copy_posix_acl(source_handle.fileno(), descriptor)
+                if expected_before_mode is not None:
+                    os.chmod(temporary_path, expected_before_mode & 0o777)
             self._assert_no_reparse_points(target)
+            if guarded:
+                current_bytes, current_info = self._read_snapshot_state(target, validate_utf8=False)
+                if not self._snapshot_matches(
+                    current_bytes,
+                    current_info,
+                    expected_before_bytes,
+                    expected_before_mode,
+                    expected_before_token,
+                ):
+                    raise WorkspaceConflictError(
+                        "原子替换前检测到并发文件变化；没有替换目标。",
+                        current_bytes=current_bytes,
+                        current_mode=stat.S_IMODE(current_info.st_mode) if current_info else None,
+                    )
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
             os.replace(temporary_name, target)
             temporary_name = None
+            temporary_path = None
+        except WorkspaceConflictError:
+            raise
+        except WorkspaceError:
+            raise
         except OSError as exc:
             raise WorkspaceError(f"原子写入失败：{type(exc).__name__}") from None
         finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
             if temporary_name is not None:
                 try:
                     os.unlink(temporary_name)
@@ -808,20 +1097,75 @@ class Workspace:
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self._atomic_write_bytes(target, encoded)
 
-    def _unlink_workspace_file(self, target: Path) -> None:
+    @staticmethod
+    def _conflict_snapshot(error: WorkspaceConflictError) -> dict[str, Any]:
+        current = error.current_bytes
+        return {
+            "captured_ns": time.time_ns(),
+            "existed": current is not None,
+            "sha256": hashlib.sha256(current).hexdigest() if current is not None else None,
+            "bytes_base64": base64.b64encode(current).decode("ascii") if current is not None else None,
+            "mode": error.current_mode,
+        }
+
+    def _unlink_workspace_file(
+        self,
+        target: Path,
+        *,
+        guarded: bool = False,
+        expected_before_bytes: bytes | None = None,
+        expected_before_mode: int | None = None,
+        expected_before_token: tuple[int, ...] | None = None,
+    ) -> None:
         if self._supports_dir_fd_operations():
             try:
                 parent_fd, name = self._open_parent_directory_fd(target)
             except FileNotFoundError:
                 raise WorkspaceError("撤销目标路径在操作期间发生变化。") from None
             try:
+                if guarded:
+                    current_bytes, current_info, descriptor = self._read_snapshot_at(parent_fd, name)
+                    try:
+                        if not self._snapshot_matches(
+                            current_bytes,
+                            current_info,
+                            expected_before_bytes,
+                            expected_before_mode,
+                            expected_before_token,
+                        ):
+                            raise WorkspaceConflictError(
+                                "撤销删除前发现并发文件变化；未删除目标。",
+                                current_bytes=current_bytes,
+                                current_mode=(
+                                    stat.S_IMODE(current_info.st_mode) if current_info else None
+                                ),
+                            )
+                    finally:
+                        if descriptor is not None:
+                            os.close(descriptor)
                 os.unlink(name, dir_fd=parent_fd)
+            except WorkspaceConflictError:
+                raise
             except OSError as exc:
                 raise WorkspaceError(f"撤销时删除新文件失败：{type(exc).__name__}") from None
             finally:
                 os.close(parent_fd)
             return
         self._assert_no_reparse_points(target)
+        if guarded:
+            current_bytes, current_info = self._read_snapshot_state(target, validate_utf8=False)
+            if not self._snapshot_matches(
+                current_bytes,
+                current_info,
+                expected_before_bytes,
+                expected_before_mode,
+                expected_before_token,
+            ):
+                raise WorkspaceConflictError(
+                    "撤销删除前发现并发文件变化；未删除目标。",
+                    current_bytes=current_bytes,
+                    current_mode=stat.S_IMODE(current_info.st_mode) if current_info else None,
+                )
         try:
             target.unlink()
         except OSError as exc:
@@ -836,8 +1180,7 @@ class Workspace:
         if not preview.changed:
             return None
 
-        current_target = self._revalidate_write_preview(preview)
-
+        _raise_if_cancelled(cancellation_event)
         backup_dir = self._backup_dir(create=True)
         assert backup_dir is not None
         backup_id = f"{time.time_ns()}-{uuid.uuid4().hex}"
@@ -848,12 +1191,15 @@ class Workspace:
             "created_ns": time.time_ns(),
             "path": preview.canonical_path,
             "before_exists": preview.existed,
+            "before_mode": preview.before_mode,
             "before_base64": (
                 base64.b64encode(preview.before_bytes).decode("ascii")
                 if preview.before_bytes is not None
                 else None
             ),
             "after_sha256": hashlib.sha256(new_bytes).hexdigest(),
+            "state": "pending",
+            "conflict_snapshot": None,
             "undone": False,
         }
         backup_path = backup_dir / f"{backup_id}.json"
@@ -862,22 +1208,60 @@ class Workspace:
             _raise_if_cancelled(cancellation_event)
             current_target = self._revalidate_write_preview(preview)
             _raise_if_cancelled(cancellation_event)
-            self._atomic_write_bytes(current_target, new_bytes)
+            self._atomic_write_bytes(
+                current_target,
+                new_bytes,
+                guarded=True,
+                expected_before_bytes=preview.before_bytes,
+                expected_before_mode=preview.before_mode,
+                expected_before_token=preview.before_token,
+            )
+        except WorkspaceConflictError as exc:
+            record["state"] = "conflict"
+            record["conflict_snapshot"] = self._conflict_snapshot(exc)
+            try:
+                self._atomic_write_json(backup_path, record)
+            except (OSError, WorkspaceError):
+                pass
+            raise WorkspaceConflictError(
+                f"检测到并发文件变化，目标未被替换；原始与冲突快照保留在备份 {backup_id}。",
+                current_bytes=exc.current_bytes,
+                current_mode=exc.current_mode,
+            ) from None
         except (WorkspaceError, ProviderCancelled):
             try:
                 self._unlink_workspace_file(backup_path)
             except (OSError, WorkspaceError):
                 pass
             raise
+        record["state"] = "committed"
+        try:
+            self._atomic_write_json(backup_path, record)
+        except (OSError, WorkspaceError):
+            # The pending manifest is enough to identify the committed version by
+            # after_sha256 if the process or filesystem failed during this update.
+            pass
         return backup_id
 
     def _revalidate_write_preview(self, preview: WritePreview) -> Path:
         current_target = self._resolve_write_target(preview.path)
         if current_target != preview.target:
             raise WorkspaceError("审批后目标路径发生变化；为防止写错文件，本次操作已取消。")
-        current_bytes = self._read_snapshot(current_target)
-        if current_bytes != preview.before_bytes:
-            raise WorkspaceError("审批预览后文件发生变化；请重新请求并检查新的差异。")
+        current_bytes, current_info = self._read_snapshot_state(
+            current_target, validate_utf8=False
+        )
+        if not self._snapshot_matches(
+            current_bytes,
+            current_info,
+            preview.before_bytes,
+            preview.before_mode,
+            preview.before_token,
+        ):
+            raise WorkspaceConflictError(
+                "审批预览后文件或权限信息发生变化；请重新请求并检查新的差异。",
+                current_bytes=current_bytes,
+                current_mode=stat.S_IMODE(current_info.st_mode) if current_info else None,
+            )
         return current_target
 
     def _load_backups(self) -> list[tuple[Path, dict[str, Any]]]:
@@ -889,7 +1273,7 @@ class Workspace:
             for path in backup_dir.glob("*.json"):
                 if self._is_reparse_point(path):
                     raise WorkspaceError(f"拒绝读取链接形式的撤销备份：{path.name}")
-                if path.stat().st_size > WRITE_LIMIT_BYTES * 2:
+                if path.stat().st_size > WRITE_LIMIT_BYTES * 4:
                     raise WorkspaceError(f"撤销备份超过安全大小上限：{path.name}")
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if (
@@ -905,11 +1289,24 @@ class Workspace:
                     or not isinstance(data.get("before_exists"), bool)
                     or not isinstance(data.get("after_sha256"), str)
                     or re.fullmatch(r"[0-9a-f]{64}", data.get("after_sha256", "")) is None
+                    or data.get("state", "committed") not in ("pending", "committed", "conflict")
+                    or (
+                        "before_mode" in data
+                        and data.get("before_mode") is not None
+                        and (
+                            type(data.get("before_mode")) is not int
+                            or not 0 <= data["before_mode"] <= 0o7777
+                        )
+                    )
                     or (
                         data.get("before_exists")
                         and not isinstance(data.get("before_base64"), str)
                     )
                     or (not data.get("before_exists") and data.get("before_base64") is not None)
+                    or (
+                        data.get("conflict_snapshot") is not None
+                        and not isinstance(data.get("conflict_snapshot"), dict)
+                    )
                 ):
                     raise WorkspaceError(f"撤销备份格式无效：{path.name}")
                 if data.get("before_exists"):
@@ -920,6 +1317,35 @@ class Workspace:
                         raise WorkspaceError(f"撤销备份格式无效：{path.name}") from None
                     if len(before_bytes) > READ_LIMIT_BYTES:
                         raise WorkspaceError(f"撤销备份超过安全大小上限：{path.name}")
+                conflict = data.get("conflict_snapshot")
+                if conflict is not None:
+                    if (
+                        not isinstance(conflict.get("existed"), bool)
+                        or type(conflict.get("captured_ns")) is not int
+                        or conflict.get("captured_ns", -1) < 0
+                        or (
+                            conflict.get("mode") is not None
+                            and (
+                                type(conflict.get("mode")) is not int
+                                or not 0 <= conflict["mode"] <= 0o7777
+                            )
+                        )
+                    ):
+                        raise WorkspaceError(f"冲突快照格式无效：{path.name}")
+                    if conflict["existed"]:
+                        if not isinstance(conflict.get("bytes_base64"), str):
+                            raise WorkspaceError(f"冲突快照格式无效：{path.name}")
+                        try:
+                            conflict_bytes = base64.b64decode(conflict["bytes_base64"], validate=True)
+                        except (KeyError, ValueError):
+                            raise WorkspaceError(f"冲突快照格式无效：{path.name}") from None
+                        if (
+                            len(conflict_bytes) > READ_LIMIT_BYTES
+                            or hashlib.sha256(conflict_bytes).hexdigest() != conflict.get("sha256")
+                        ):
+                            raise WorkspaceError(f"冲突快照格式无效：{path.name}")
+                    elif conflict.get("bytes_base64") is not None or conflict.get("sha256") is not None:
+                        raise WorkspaceError(f"冲突快照格式无效：{path.name}")
                 records.append((path, data))
         except WorkspaceError:
             raise
@@ -939,9 +1365,25 @@ class Workspace:
 
         active: tuple[Path, dict[str, Any]] | None = None
         for entry in reversed(self._load_backups()):
-            if not entry[1].get("undone", False):
-                active = entry
-                break
+            record = entry[1]
+            if record.get("undone", False) or record.get("state", "committed") == "conflict":
+                continue
+            if record.get("state") == "pending":
+                relative_path = record.get("path")
+                target_hash = record.get("after_sha256")
+                try:
+                    pending_target = self.resolve(relative_path) if isinstance(relative_path, str) else None
+                    pending_bytes = self._read_snapshot(pending_target) if pending_target is not None else None
+                except WorkspaceError:
+                    pending_bytes = None
+                if (
+                    pending_bytes is None
+                    or not isinstance(target_hash, str)
+                    or hashlib.sha256(pending_bytes).hexdigest() != target_hash
+                ):
+                    continue
+            active = entry
+            break
         if active is None:
             return "没有可撤销的 Harness 文件写入。"
 
@@ -951,7 +1393,7 @@ class Workspace:
         if not isinstance(relative_path, str) or not isinstance(backup_id, str):
             raise WorkspaceError("撤销备份缺少有效路径或编号。")
         target = self.resolve(relative_path)
-        current_bytes = self._read_snapshot(target)
+        current_bytes, current_info = self._read_snapshot_state(target)
         expected_hash = record.get("after_sha256")
         if current_bytes is None or not isinstance(expected_hash, str):
             raise WorkspaceError("撤销被阻止：当前文件与最新备份不匹配。")
@@ -987,13 +1429,56 @@ class Workspace:
             return "用户拒绝本次撤销；文件未修改。"
 
         current_target = self.resolve(relative_path)
-        latest_bytes = self._read_snapshot(current_target)
-        if current_target != target or latest_bytes != current_bytes:
-            raise WorkspaceError("审批后文件发生变化；为防止覆盖新内容，本次撤销已取消。")
-        if before_exists:
-            self._atomic_write_bytes(target, restore_bytes)
-        else:
-            self._unlink_workspace_file(target)
+        latest_bytes, latest_info = self._read_snapshot_state(
+            current_target, validate_utf8=False
+        )
+        if current_target != target or not self._snapshot_matches(
+            latest_bytes,
+            latest_info,
+            current_bytes,
+            stat.S_IMODE(current_info.st_mode) if current_info else None,
+            self._stat_token(current_info),
+        ):
+            conflict = WorkspaceConflictError(
+                "审批后文件或权限信息发生变化；为防止覆盖新内容，本次撤销已取消。",
+                current_bytes=latest_bytes,
+                current_mode=stat.S_IMODE(latest_info.st_mode) if latest_info else None,
+            )
+            record["conflict_snapshot"] = self._conflict_snapshot(conflict)
+            try:
+                self._atomic_write_json(backup_path, record)
+            except (OSError, WorkspaceError):
+                pass
+            raise conflict
+        try:
+            if before_exists:
+                self._atomic_write_bytes(
+                    target,
+                    restore_bytes,
+                    guarded=True,
+                    expected_before_bytes=current_bytes,
+                    expected_before_mode=stat.S_IMODE(current_info.st_mode) if current_info else None,
+                    expected_before_token=self._stat_token(current_info),
+                )
+            else:
+                self._unlink_workspace_file(
+                    target,
+                    guarded=True,
+                    expected_before_bytes=current_bytes,
+                    expected_before_mode=stat.S_IMODE(current_info.st_mode) if current_info else None,
+                    expected_before_token=self._stat_token(current_info),
+                )
+        except WorkspaceConflictError as exc:
+            record["conflict_snapshot"] = self._conflict_snapshot(exc)
+            try:
+                self._atomic_write_json(backup_path, record)
+            except (OSError, WorkspaceError):
+                pass
+            raise WorkspaceConflictError(
+                f"撤销时发现并发文件变化，目标未被替换或删除；快照保留在备份 {backup_id}。",
+                current_bytes=exc.current_bytes,
+                current_mode=exc.current_mode,
+            ) from None
         record["undone"] = True
         record["undone_ns"] = time.time_ns()
         self._atomic_write_json(backup_path, record)

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import json
 import io
 import hashlib
 import os
+import stat
 import shutil
 import select
 import signal
@@ -65,6 +67,7 @@ from cvfx_harness.tools import (
     PATH_COMPLETION_LIMIT,
     TOOL_SCHEMAS,
     Workspace,
+    WorkspaceConflictError,
     WorkspaceError,
     run_tool,
 )
@@ -272,6 +275,113 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), source)
         self.assertEqual(undo_requests[0].operation, "undo")
 
+    def test_diff_marks_missing_final_newline_without_joining_changed_lines(self) -> None:
+        target = self.root / "no-final-newline.txt"
+        target.write_bytes(b"before")
+        requests: list[ActionRequest] = []
+        run_tool(
+            self.workspace,
+            self.write_call("no-final-newline.txt", "after\n"),
+            approve_action=self.approve(requests),
+        )
+        diff = requests[0].diff
+        self.assertIn("-before\n\\ No newline at end of file\n+after\n", diff)
+        self.assertNotIn("-before+after", diff)
+
+    def test_diff_eof_marker_handles_content_that_looks_like_a_header(self) -> None:
+        diff = Workspace._diff("header-like.txt", "--old", "++new\n")
+        self.assertIn("---old\n\\ No newline at end of file\n+++new\n", diff)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission-bit semantics are tested on POSIX")
+    def test_write_patch_and_undo_preserve_ordinary_permission_bits(self) -> None:
+        target = self.root / "executable.txt"
+        target.write_bytes(b"before")
+        target.chmod(0o755)
+        source = target.read_bytes()
+        run_tool(
+            self.workspace,
+            self.patch_call("executable.txt", source, "before", "patched"),
+            approve_action=self.approve(),
+        )
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+        self.workspace.undo_last(approve_action=self.approve())
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+
+        run_tool(
+            self.workspace,
+            self.write_call("executable.txt", "rewritten"),
+            approve_action=self.approve(),
+        )
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+        self.workspace.undo_last(approve_action=self.approve())
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+
+    @unittest.skipIf(os.name == "nt", "setuid/sticky mode bits are POSIX-only")
+    def test_write_approval_discloses_and_clears_special_mode_bits(self) -> None:
+        target = self.root / "special-mode.txt"
+        target.write_bytes(b"before")
+        target.chmod(0o4755)
+        if not (stat.S_IMODE(target.stat().st_mode) & 0o4000):
+            self.skipTest("filesystem did not retain synthetic setuid mode bit")
+        requests: list[ActionRequest] = []
+        run_tool(
+            self.workspace,
+            self.write_call("special-mode.txt", "after"),
+            approve_action=self.approve(requests),
+        )
+        self.assertIn("4755 → 0755", requests[0].diff)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+
+    def test_commit_detects_last_moment_editor_change_and_keeps_recovery_snapshot(self) -> None:
+        target = self.root / "last-moment-race.txt"
+        target.write_bytes(b"before")
+        original_write = self.workspace._atomic_write_bytes
+
+        def concurrent_editor(target_path: Path, data: bytes, **kwargs: object) -> None:
+            if target_path == target and kwargs.get("guarded"):
+                target.write_bytes(b"concurrent-editor-change")
+            original_write(target_path, data, **kwargs)
+
+        with patch.object(Workspace, "_atomic_write_bytes", side_effect=concurrent_editor):
+            with self.assertRaisesRegex(WorkspaceConflictError, "并发文件变化"):
+                run_tool(
+                    self.workspace,
+                    self.write_call("last-moment-race.txt", "after"),
+                    approve_action=self.approve(),
+                )
+        self.assertEqual(target.read_bytes(), b"concurrent-editor-change")
+        backups = list((self.root / ".harness" / "backups").glob("*.json"))
+        self.assertEqual(len(backups), 1)
+        record = json.loads(backups[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["state"], "conflict")
+        snapshot = base64.b64decode(record["conflict_snapshot"]["bytes_base64"])
+        self.assertEqual(snapshot, b"concurrent-editor-change")
+        self.assertEqual(base64.b64decode(record["before_base64"]), b"before")
+        self.assertIn("没有可撤销", self.workspace.undo_last(approve_action=self.approve()))
+
+    def test_undo_detects_editor_change_after_approval_and_keeps_snapshot(self) -> None:
+        target = self.root / "undo-race.txt"
+        target.write_bytes(b"before")
+        run_tool(
+            self.workspace,
+            self.write_call("undo-race.txt", "after"),
+            approve_action=self.approve(),
+        )
+
+        def edit_during_undo(_request: ActionRequest) -> bool:
+            target.write_bytes(b"editor-during-undo")
+            return True
+
+        with self.assertRaisesRegex(WorkspaceConflictError, "审批后文件或权限信息发生变化"):
+            self.workspace.undo_last(approve_action=edit_during_undo)
+        self.assertEqual(target.read_bytes(), b"editor-during-undo")
+        records = self.workspace._load_backups()
+        conflict = records[-1][1]["conflict_snapshot"]
+        self.assertEqual(
+            base64.b64decode(conflict["bytes_base64"]),
+            b"editor-during-undo",
+        )
+
     def test_read_file_returns_raw_sha256_for_explicit_patch_precondition(self) -> None:
         target = self.root / "versioned.txt"
         source = b"\xef\xbb\xbf\xe4\xb8\xad\xe6\x96\x87\r\n"
@@ -348,14 +458,42 @@ class WorkspaceTests(unittest.TestCase):
             target.write_bytes(b"concurrent change")
             return True
 
-        with self.assertRaisesRegex(WorkspaceError, "審批预览后文件发生变化|审批预览后文件发生变化|预览后文件发生变化"):
+        with self.assertRaisesRegex(WorkspaceError, "检测到并发文件变化"):
             run_tool(
                 self.workspace,
                 self.patch_call("race-patch.txt", source, "before", "after"),
                 approve_action=change_during_approval,
             )
         self.assertEqual(target.read_bytes(), b"concurrent change")
-        self.assertFalse((self.root / ".harness" / "backups").exists())
+        backups = list((self.root / ".harness" / "backups").glob("*.json"))
+        self.assertEqual(len(backups), 1)
+        record = json.loads(backups[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["state"], "conflict")
+        self.assertEqual(
+            base64.b64decode(record["conflict_snapshot"]["bytes_base64"]),
+            b"concurrent change",
+        )
+
+    def test_binary_editor_conflict_is_preserved_as_recovery_evidence(self) -> None:
+        target = self.root / "binary-race.txt"
+        target.write_bytes(b"before")
+
+        def change_during_approval(_request: ActionRequest) -> bool:
+            target.write_bytes(b"\xff\x00binary editor change")
+            return True
+
+        with self.assertRaisesRegex(WorkspaceConflictError, "并发文件变化"):
+            run_tool(
+                self.workspace,
+                self.write_call("binary-race.txt", "after"),
+                approve_action=change_during_approval,
+            )
+        self.assertEqual(target.read_bytes(), b"\xff\x00binary editor change")
+        record = self.workspace._load_backups()[0][1]
+        self.assertEqual(
+            base64.b64decode(record["conflict_snapshot"]["bytes_base64"]),
+            b"\xff\x00binary editor change",
+        )
 
     def test_patch_refuses_diff_that_expands_past_safe_terminal_preview_limit(self) -> None:
         target = self.root / "format-heavy.txt"
@@ -845,7 +983,7 @@ class WorkspaceTests(unittest.TestCase):
             file.write_text("changed during approval", encoding="utf-8")
             return True
 
-        with self.assertRaisesRegex(WorkspaceError, "预览后文件发生变化"):
+        with self.assertRaisesRegex(WorkspaceError, "并发文件变化|预览后文件.*发生变化"):
             run_tool(self.workspace, self.write_call("race.txt", "after"), approve_action=change_during_approval)
         self.assertEqual(file.read_text(encoding="utf-8"), "changed during approval")
 
@@ -859,7 +997,7 @@ class WorkspaceTests(unittest.TestCase):
             original(target, value)
 
         with patch.object(Workspace, "_atomic_write_json", side_effect=mutate_during_backup):
-            with self.assertRaisesRegex(WorkspaceError, "预览后文件发生变化"):
+            with self.assertRaisesRegex(WorkspaceError, "并发文件变化|预览后文件.*发生变化"):
                 run_tool(
                     self.workspace,
                     self.write_call("backup-race.txt", "after"),
@@ -880,7 +1018,7 @@ class WorkspaceTests(unittest.TestCase):
         original = self.workspace._atomic_write_bytes
         swapped = False
 
-        def swap_parent_then_write(target: Path, data: bytes) -> None:
+        def swap_parent_then_write(target: Path, data: bytes, **kwargs: object) -> None:
             nonlocal swapped
             if target == preview.target and not swapped:
                 os.rename(directory, self.root / "docs-original")
@@ -890,7 +1028,7 @@ class WorkspaceTests(unittest.TestCase):
                     os.rename(self.root / "docs-original", directory)
                     self.skipTest(f"本机策略不允许创建 symlink fixture：{type(exc).__name__}")
                 swapped = True
-            original(target, data)
+            original(target, data, **kwargs)
 
         try:
             with patch.object(self.workspace, "_atomic_write_bytes", side_effect=swap_parent_then_write):
