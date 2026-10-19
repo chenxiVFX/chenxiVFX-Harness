@@ -55,10 +55,7 @@ jobs:
 
       - name: Run offline tests (Linux)
         if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -o pipefail
-          python -m unittest discover -s tests -v 2>&1 | tee "$RUNNER_TEMP/offline-tests.log"
+        run: python -m unittest discover -s tests -v
 
       - name: Run offline tests (Windows)
         if: runner.os == 'Windows'
