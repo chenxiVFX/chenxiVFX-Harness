@@ -13,7 +13,7 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Dimension, HSplit, Layout, VSplit, Window
-from prompt_toolkit.layout.containers import Float, FloatContainer, ConditionalContainer
+from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.styles import Style
@@ -108,6 +108,7 @@ class TerminalUI:
         self._request_ready = threading.Event()
         self._status = "启动中"
         self._notice = ""
+        self._resetting_input = False
         self._prompt = ""
         self._approval_text = ""
         self._approval_choice_yes = False
@@ -122,12 +123,27 @@ class TerminalUI:
             complete_while_typing=True,
             wrap_lines=True,
             focus_on_click=True,
-            read_only=Condition(lambda: self._pending is None),
+            read_only=Condition(
+                lambda: not self._resetting_input
+                and (self._pending is None or self._pending.approval)
+            ),
             height=Dimension(min=1, max=4),
             style="class:input",
         )
         self._input_buffer = self.input_area.buffer
         self._input_buffer.on_text_changed += self._on_input_text_changed
+        self._input_area_container = ConditionalContainer(
+            self.input_area,
+            Condition(lambda: self._pending is None or not self._pending.approval),
+        )
+        self._approval_input_hint = ConditionalContainer(
+            Window(
+                FormattedTextControl("选择审批按钮后按 Enter 确认"),
+                height=1,
+                style="class:prompt",
+            ),
+            Condition(lambda: self._pending is not None and self._pending.approval),
+        )
         self.output_area = TextArea(
             text="",
             multiline=True,
@@ -136,7 +152,7 @@ class TerminalUI:
             focus_on_click=True,
             wrap_lines=True,
             scrollbar=True,
-            height=Dimension(min=4, weight=1),
+            height=Dimension(min=1, weight=1),
             style="class:transcript",
         )
         self._approval_area = TextArea(
@@ -172,16 +188,37 @@ class TerminalUI:
             ),
             Condition(lambda: bool(self._approval_text)),
         )
+        self._completion_menu = CompletionsMenu(max_height=8, scroll_offset=1)
+        self._completion_window = self._completion_menu.content
+        self._completion_menu_row = VSplit(
+            [
+                self._completion_menu,
+                Window(width=Dimension(weight=1), style="bg:#000000"),
+            ]
+        )
+        self._input_top_separator = Window(
+            char="─", height=1, style="class:input.separator"
+        )
+        self._prompt_window = Window(
+            FormattedTextControl(lambda: self._prompt_label()),
+            height=1,
+            style="class:prompt",
+        )
+        self._input_bottom_separator = Window(
+            char="─", height=1, style="class:input.separator"
+        )
+        self._status_window = Window(
+            FormattedTextControl(lambda: self._status_line()),
+            height=1,
+            style="class:status",
+        )
         input_block = HSplit(
             [
-                Window(char="─", height=1, style="class:input.separator"),
-                Window(
-                    FormattedTextControl(lambda: self._prompt_label()),
-                    height=1,
-                    style="class:prompt",
-                ),
-                self.input_area,
-                Window(char="─", height=1, style="class:input.separator"),
+                self._input_top_separator,
+                self._prompt_window,
+                self._input_area_container,
+                self._approval_input_hint,
+                self._input_bottom_separator,
             ]
         )
         content = HSplit(
@@ -192,30 +229,15 @@ class TerminalUI:
                     style="class:header",
                 ),
                 self.output_area,
+                self._completion_menu_row,
                 self._approval_container,
                 input_block,
-                Window(
-                    FormattedTextControl(lambda: self._status_line()),
-                    height=1,
-                    style="class:status",
-                ),
+                self._status_window,
             ]
         )
         self._bindings = self._build_key_bindings()
         self._application = Application(
-            layout=Layout(
-                FloatContainer(
-                    content=content,
-                    floats=[
-                        Float(
-                            xcursor=True,
-                            ycursor=True,
-                            content=CompletionsMenu(max_height=8, scroll_offset=1),
-                        )
-                    ],
-                ),
-                focused_element=self.input_area,
-            ),
+            layout=Layout(content, focused_element=self.input_area),
             key_bindings=self._bindings,
             style=Style.from_dict(
                 {
@@ -230,6 +252,7 @@ class TerminalUI:
                     "approval.heading": "bold fg:#f5d76e",
                     "button": "fg:#9aa0aa bg:#000000",
                     "button.focused": "fg:#c6a0f6 bg:#000000 bold",
+                    "completion-menu": "bg:#000000",
                     "completion-menu.completion": "fg:#f2f2f2 bg:#263849",
                     "completion-menu.completion.current": "fg:#1b1722 bg:#c6a0f6 bold",
                     "completion-menu.meta.completion": "fg:#9fb3c8 bg:#263849",
@@ -327,9 +350,10 @@ class TerminalUI:
                     if self._pending is None:
                         self._status = "运行中"
                 elif kind == "input" and isinstance(value, _InputRequest):
-                    self._pending = value
+                    self._clear_input_buffer()
                     self._prompt = _safe_text(value.prompt).strip()
-                    self._input_buffer.text = ""
+                    if value.approval:
+                        self._prompt = _APPROVAL_PROMPT.sub("", self._prompt).rstrip()
                     self._notice = ""
                     if value.approval:
                         self._status = "等待审批"
@@ -342,12 +366,17 @@ class TerminalUI:
                             self._approval_text = self._prompt
                         self._approval_area.text = self._approval_text
                     else:
+                        self._application.layout.focus(self.input_area)
                         self._cancel_event.clear()
                         self._cancel_requested = False
                         self._approval_choice_yes = False
                         self._approval_text = ""
                         self._approval_area.text = ""
                         self._status = "等待输入"
+                    self._application.layout.focus(
+                        self._approval_no_button if value.approval else self.input_area
+                    )
+                    self._pending = value
                     self._request_ready.set()
                 elif kind == "done":
                     self._worker_result = value if type(value) is int else 2
@@ -519,17 +548,14 @@ class TerminalUI:
         request = self._pending
         if request is None:
             return
-        value = self._input_buffer.text
-        if request.approval and ("\n" in value or "\r" in value):
-            self._notice = "审批回答必须是单行；多行粘贴不会批准操作。"
-            self._input_buffer.text = ""
-            return
-        if request.approval and not value and self._approval_choice_yes:
-            value = "是"
-        if not request.approval and value:
-            self._append_transcript(f"\n你> {_safe_text(value)}\n")
-        elif request.approval:
-            self._append_transcript(f"\n审批回答：{_safe_text(value) or '（空，拒绝）'}\n")
+        if request.approval:
+            value = "是" if self._approval_choice_yes else ""
+            choice = "是（本次）" if self._approval_choice_yes else "否（默认拒绝）"
+            self._append_transcript(f"\n审批选择：{choice}\n")
+        else:
+            value = self._input_buffer.text
+            if value:
+                self._append_transcript(f"\n你> {_safe_text(value)}\n")
         self._resolve_pending(value=value)
 
     def _resolve_pending(
@@ -544,7 +570,7 @@ class TerminalUI:
             return
         request.value = None if eof else value
         request.error = error
-        self._input_buffer.text = ""
+        self._clear_input_buffer()
         self._pending = None
         self._prompt = ""
         self._approval_text = ""
@@ -553,6 +579,13 @@ class TerminalUI:
         self._request_ready.clear()
         self._status = "运行中"
         request.completed.set()
+
+    def _clear_input_buffer(self) -> None:
+        self._resetting_input = True
+        try:
+            self._input_buffer.text = ""
+        finally:
+            self._resetting_input = False
 
     def _request_cancel(self) -> None:
         self._cancel_requested = True

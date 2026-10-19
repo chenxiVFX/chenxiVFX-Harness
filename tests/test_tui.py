@@ -29,9 +29,13 @@ from cvfx_harness.tui import CommandCompleter, TerminalUI, terminal_supports_tui
 
 
 class PromptToolkitTests(unittest.TestCase):
-    def _run_ui(self, worker, send_keys) -> tuple[TerminalUI, int]:
+    def _run_ui(self, worker, send_keys, *, output=None) -> tuple[TerminalUI, int]:
         with create_pipe_input() as pipe:
-            ui = TerminalUI(worker, input=pipe, output=DummyOutput())
+            ui = TerminalUI(
+                worker,
+                input=pipe,
+                output=DummyOutput() if output is None else output,
+            )
             errors: list[BaseException] = []
 
             def sender() -> None:
@@ -267,7 +271,7 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertEqual(received, ["保留的输入"])
         self.assertNotIn("已清空草稿", ui._notice)
 
-    def test_approval_input_rejects_pasted_newline_and_stays_default_deny(self) -> None:
+    def test_approval_paste_cannot_override_default_deny(self) -> None:
         received: list[str] = []
 
         def worker(ui: TerminalUI) -> int:
@@ -276,22 +280,22 @@ class PromptToolkitTests(unittest.TestCase):
 
         def send(pipe, ui: TerminalUI) -> None:
             pasted = "是\n不要批准".encode("utf-8")
-            pipe.send_bytes(b"\x1b[200~" + pasted + b"\x1b[201~\r")
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline:
-                if "单行" in ui._notice:
-                    break
-                time.sleep(0.01)
-            else:
-                self.fail("multiline approval paste was not rejected")
+            pipe.send_bytes(b"\x1b[200~" + pasted + b"\x1b[201~")
+            time.sleep(0.05)
+            self.assertIsNotNone(ui._pending)
+            self.assertTrue(ui._pending.approval)
+            self.assertEqual(ui._input_buffer.text, "")
+            self.assertTrue(ui.input_area.buffer.read_only())
+            self.assertNotIn("[y/N]", ui._prompt)
+            self.assertFalse(ui._approval_choice_yes)
             pipe.send_text("\r")
 
         ui, result = self._run_ui(worker, send)
         self.assertEqual(result, 0)
         self.assertEqual(received, [""])
-        self.assertIn("审批回答必须是单行", ui._notice)
+        self.assertIn("审批选择：否（默认拒绝）", ui._transcript)
 
-    def test_approval_yes_is_only_selected_until_explicit_enter(self) -> None:
+    def test_approval_yes_is_only_selected_until_focused_enter(self) -> None:
         received: list[str] = []
 
         def worker(ui: TerminalUI) -> int:
@@ -300,6 +304,9 @@ class PromptToolkitTests(unittest.TestCase):
 
         def send(pipe, ui: TerminalUI) -> None:
             self.assertTrue(ui._approval_choice_yes is False)
+            self.assertIn("确认写入文件？", ui._prompt)
+            self.assertNotIn("[y/N]", ui._prompt)
+            self.assertTrue(ui._application.layout.has_focus(ui._approval_no_button))
             pipe.send_text("\t")
             time.sleep(0.05)
             self.assertTrue(ui._approval_choice_yes)
@@ -310,6 +317,64 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(received, ["是"])
         self.assertIn("当前选择：是", ui._notice)
+
+    def test_enter_after_focus_moves_to_transcript_does_not_confirm_approval(self) -> None:
+        received: list[str] = []
+
+        def worker(ui: TerminalUI) -> int:
+            received.append(ui.input("确认写入文件？[y/N] "))
+            return 0
+
+        def send(pipe, ui: TerminalUI) -> None:
+            self.assertIsNotNone(ui._pending)
+            self.assertTrue(ui._pending.approval)
+            ui._application.layout.focus(ui.output_area)
+            self.assertTrue(ui._application.layout.has_focus(ui.output_area))
+            pipe.send_text("\r")
+            time.sleep(0.05)
+            self.assertIsNotNone(ui._pending, "Enter in the transcript must not confirm")
+            self.assertFalse(ui._approval_choice_yes)
+            ui._application.layout.focus(ui._approval_yes_button)
+            ui._approval_yes_button.handler()
+            self.assertIsNotNone(ui._pending, "mouse selection alone must not confirm")
+            pipe.send_text("\r")
+
+        ui, result = self._run_ui(worker, send)
+        self.assertEqual(result, 0)
+        self.assertEqual(received, ["是"])
+
+    def test_rapid_repeated_enter_cannot_reapprove_next_default_deny_request(self) -> None:
+        received: list[str] = []
+
+        def worker(ui: TerminalUI) -> int:
+            received.append(ui.input("确认第一次操作？[y/N] "))
+            received.append(ui.input("确认第二次操作？[y/N] "))
+            return 0
+
+        def send(pipe, ui: TerminalUI) -> None:
+            self.assertIsNotNone(ui._pending)
+            self.assertTrue(ui._pending.approval)
+            first_request = ui._pending
+            pipe.send_text("\t")
+            self._wait_until(
+                lambda: ui._approval_choice_yes,
+                "Tab did not select the one-time approval option",
+            )
+            pipe.send_bytes(b"\r\r")
+            self._wait_until(
+                lambda: ui._pending is not None
+                and ui._pending is not first_request
+                and ui._pending.approval,
+                "second approval did not become pending",
+            )
+            self.assertFalse(ui._approval_choice_yes, "each approval must reset to default deny")
+            pipe.send_text("\r")
+
+        ui, result = self._run_ui(worker, send)
+        self.assertEqual(result, 0)
+        self.assertEqual(received, ["是", ""])
+        self.assertEqual(ui._transcript.count("审批选择：是（本次）"), 1)
+        self.assertEqual(ui._transcript.count("审批选择：否（默认拒绝）"), 1)
 
     def test_mouse_approval_handler_only_selects_and_never_submits(self) -> None:
         received: list[str] = []
@@ -325,7 +390,6 @@ class PromptToolkitTests(unittest.TestCase):
             ui._approval_no_button.handler()
             self.assertFalse(ui._approval_choice_yes)
             self.assertIsNotNone(ui._pending, "mouse selection alone must not reject")
-            ui._input_buffer.text = ""
             ui._submit_input()
 
         ui, result = self._run_ui(worker, send)
@@ -380,6 +444,63 @@ class PromptToolkitTests(unittest.TestCase):
                 self.assertLessEqual(wcswidth(line), columns)
                 if columns >= 90:
                     self.assertIn("点击切换", line)
+
+    def test_completion_menu_is_clipped_above_prompt_at_varied_terminal_sizes(self) -> None:
+        class SizedDummyOutput(DummyOutput):
+            def __init__(self, rows: int, columns: int) -> None:
+                self.rows = rows
+                self.columns = columns
+
+            def get_size(self):
+                return Size(rows=self.rows, columns=self.columns)
+
+        for rows, columns in ((9, 20), (10, 24), (12, 36), (16, 64), (24, 80), (30, 100)):
+            with self.subTest(rows=rows, columns=columns):
+                def send(pipe, ui: TerminalUI) -> None:
+                    self._wait_until(
+                        lambda: ui._pending is not None,
+                        "input prompt did not become ready",
+                    )
+                    pipe.send_text("/")
+                    self._wait_until(
+                        lambda: ui._input_buffer.complete_state is not None
+                        and ui._application.renderer.last_rendered_screen is not None,
+                        "completion menu did not render",
+                    )
+                    time.sleep(0.03)
+                    screen = ui._application.renderer.last_rendered_screen
+                    self.assertIsNotNone(screen)
+                    positions = screen.visible_windows_to_write_positions
+                    menu = positions.get(ui._completion_window)
+                    prompt = positions.get(ui._prompt_window)
+                    top_separator = positions.get(ui._input_top_separator)
+                    status = positions.get(ui._status_window)
+                    self.assertIsNotNone(menu, "completion menu must remain visible")
+                    self.assertIsNotNone(prompt)
+                    self.assertIsNotNone(top_separator)
+                    self.assertIsNotNone(status)
+                    self.assertGreater(menu.height, 0)
+                    self.assertLessEqual(menu.ypos + menu.height, top_separator.ypos)
+                    self.assertLessEqual(menu.ypos + menu.height, prompt.ypos)
+                    self.assertEqual(status.ypos, rows - 1)
+                    menu_text = "\n".join(
+                        "".join(screen.data_buffer[y][x].char for x in range(columns))
+                        for y in range(menu.ypos, menu.ypos + menu.height)
+                    )
+                    prompt_text = "".join(
+                        screen.data_buffer[prompt.ypos][x].char
+                        for x in range(columns)
+                    )
+                    self.assertIn("/帮助", menu_text)
+                    self.assertIn("你 [执行]>", prompt_text)
+                    ui._resolve_pending(value="")
+
+                ui, result = self._run_ui(
+                    lambda current: (current.input("你 [执行]> "), 0)[1],
+                    send,
+                    output=SizedDummyOutput(rows, columns),
+                )
+                self.assertEqual(result, 0)
 
     def test_cli_streaming_cancel_restores_input_and_keeps_busy_draft_separate(self) -> None:
         with tempfile.TemporaryDirectory(prefix="cvfx-tui-agent-stream-") as workspace:
@@ -538,10 +659,19 @@ class PromptToolkitTests(unittest.TestCase):
                         lambda: ui._pending is not None and ui._pending.approval,
                         "Agent did not present its write approval in the TUI",
                     )
+                    self.assertTrue(ui.input_area.buffer.read_only())
+                    self.assertNotIn("[y/N]", ui._prompt)
 
                 submit_prompt("请求第一次合成写入")
                 wait_for_approval()
                 self.assertFalse(ui._approval_choice_yes)
+                pasted = "是\n不要批准".encode("utf-8")
+                pipe.send_bytes(b"\x1b[200~" + pasted + b"\x1b[201~")
+                time.sleep(0.05)
+                self.assertIsNotNone(ui._pending, "pasted text must not submit approval")
+                self.assertFalse(ui._approval_choice_yes)
+                self.assertEqual(ui._input_buffer.text, "")
+                self.assertEqual(committed_paths, [])
                 pipe.send_bytes(b"\r")
                 self._wait_until(
                     lambda: ui._pending is not None and not ui._pending.approval,
@@ -553,13 +683,19 @@ class PromptToolkitTests(unittest.TestCase):
                 submit_prompt("请求第二次合成写入")
                 wait_for_approval()
                 self.assertFalse(ui._approval_choice_yes)
-                pipe.send_bytes(b"\t")
-                self._wait_until(
-                    lambda: ui._approval_choice_yes,
-                    "Tab did not select the one-time approval option",
-                )
+                ui._application.layout.focus(ui.output_area)
+                pipe.send_bytes(b"\r")
+                time.sleep(0.05)
+                self.assertIsNotNone(ui._pending, "Enter outside approval controls must not approve")
+                self.assertEqual(committed_paths, [])
+                ui._approval_yes_button.handler()
+                self.assertTrue(ui._approval_choice_yes)
                 self.assertIsNotNone(ui._pending, "selection alone must not approve")
                 pipe.send_bytes(b"\r")
+                time.sleep(0.05)
+                self.assertIsNotNone(ui._pending, "mouse selection only must not confirm")
+                ui._application.layout.focus(ui._approval_yes_button)
+                pipe.send_bytes(b"\r\r")
                 self._wait_until(
                     lambda: ui._pending is not None
                     and not ui._pending.approval
@@ -576,7 +712,8 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(provider.calls, 4)
         self.assertEqual(committed_paths, ["合成文件.txt"])
-        self.assertIn("审批回答：（空，拒绝）", ui._transcript)
+        self.assertIn("审批选择：否（默认拒绝）", ui._transcript)
+        self.assertIn("审批选择：是（本次）", ui._transcript)
         self.assertIn("拒绝后仍可继续的合成答复。", ui._transcript)
         self.assertIn("获批写入后的合成答复。", ui._transcript)
 
