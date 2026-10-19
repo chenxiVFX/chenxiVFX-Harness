@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,6 +20,7 @@ from cvfx_harness.agent import Agent
 from cvfx_harness.cli import parse_references, run_console
 from cvfx_harness.providers import (
     AssistantTurn,
+    DEEPSEEK_API_KEY_ENV,
     MockProvider,
     OpenAICompatibleProvider,
     ProviderCancelled,
@@ -94,13 +96,26 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaises(WorkspaceError):
             self.workspace.resolve(f"../{outside.name}/secret.txt")
 
-    def test_case_insensitive_windows_path_resolution(self) -> None:
+    def test_path_case_resolution_matches_platform_semantics(self) -> None:
         target = self.root / "资料" / "ReadMe.TXT"
         target.parent.mkdir()
         target.write_text("大小写路径", encoding="utf-8")
         resolved = self.workspace.resolve("资料/readme.txt")
-        self.assertEqual(resolved, target.resolve())
-        self.assertEqual(self.workspace.read_text("资料/README.txt"), "大小写路径")
+        if os.name == "nt":
+            # Windows 上 Harness 需将大小写变体解析回真实目录项。
+            self.assertEqual(resolved, target.resolve())
+            self.assertEqual(self.workspace.read_text("资料/README.txt"), "大小写路径")
+            return
+
+        # POSIX 上保留输入大小写；是否能打开变体由实际文件系统决定。
+        if (target.parent / "README.TXT").exists():
+            self.assertEqual(self.workspace.read_text("资料/README.txt"), "大小写路径")
+        else:
+            self.assertEqual(resolved.name, "readme.txt")
+            self.assertNotEqual(resolved, target.resolve())
+            with self.assertRaises(WorkspaceError):
+                self.workspace.read_text("资料/README.txt")
+        self.assertEqual(self.workspace.read_text("资料/ReadMe.TXT"), "大小写路径")
 
     def test_sensitive_credentials_and_internal_state_paths_are_blocked(self) -> None:
         blocked = (
@@ -138,7 +153,7 @@ class WorkspaceTests(unittest.TestCase):
 
     @unittest.skipUnless(
         os.name == "nt" and _LINK_TESTS_ENABLED,
-        "Windows link-creation integration tests are opt-in; current session received OS access denials",
+        "Windows link integration requires Windows and explicit opt-in; the OS may deny fixture creation",
     )
     def test_directory_junction_escape_is_rejected(self) -> None:
         outside = self.root.parent / f"{self.root.name}-junction-target"
@@ -171,7 +186,7 @@ class WorkspaceTests(unittest.TestCase):
 
     @unittest.skipUnless(
         os.name == "nt" and _LINK_TESTS_ENABLED,
-        "Windows link-creation integration tests are opt-in; current session received OS access denials",
+        "Windows link integration requires Windows and explicit opt-in; the OS may deny fixture creation",
     )
     def test_directory_symlink_escape_is_rejected(self) -> None:
         outside = self.root.parent / f"{self.root.name}-symlink-target"
@@ -189,7 +204,7 @@ class WorkspaceTests(unittest.TestCase):
 
     @unittest.skipUnless(
         os.name == "nt" and _LINK_TESTS_ENABLED,
-        "Windows link-creation integration tests are opt-in; current session received OS access denials",
+        "Windows link integration requires Windows and explicit opt-in; the OS may deny fixture creation",
     )
     def test_hard_link_with_external_name_is_rejected(self) -> None:
         outside = self.root.parent / f"{self.root.name}-hardlink-secret.txt"
@@ -576,6 +591,145 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("TEST_KEY_ONLY", captured["body"])
         self.assertIn("deepseek-flash", captured["body"])
 
+    def test_openai_request_uses_local_simulated_http_service(self) -> None:
+        captured: dict[str, object] = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                size = int(self.headers.get("Content-Length", "0"))
+                captured["authorization"] = self.headers.get("Authorization")
+                captured["path"] = self.path
+                captured["body"] = self.rfile.read(size)
+                response = json.dumps(
+                    {
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "本地模拟服务已响应"}
+                        }],
+                        "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12},
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                # 本地 HTTP fixture 不输出请求头或请求内容。
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        test_key = "LOCAL_TEST_ONLY_NEVER_OUTPUT"
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", test_key, "deepseek-flash"
+            )
+            turn = provider.complete(
+                [{"role": "user", "content": "合成离线请求"}], [], max_tokens=32
+            )
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+        self.assertEqual(turn.content, "本地模拟服务已响应")
+        self.assertEqual(turn.usage.total_tokens, 12)
+        self.assertEqual(captured["authorization"], f"Bearer {test_key}")
+        self.assertEqual(captured["path"], "/chat/completions")
+        self.assertNotIn(test_key, captured["body"].decode("utf-8"))
+
+    def test_deepseek_network_secret_uses_fixed_host_without_disclosure(self) -> None:
+        test_key = "TEST_SECRET_ONLY_NEVER_OUTPUT"
+        provider = provider_from_environment(
+            "openai",
+            "deepseek-flash",
+            environment={DEEPSEEK_API_KEY_ENV: test_key},
+        )
+        captured: dict[str, str] = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, _size):
+                return b'{"choices":[{"message":{"role":"assistant","content":"stub"}}]}'
+
+        def fake_urlopen(request, timeout):
+            del timeout
+            captured["url"] = request.full_url
+            captured["authorization"] = request.get_header("Authorization") or ""
+            captured["body"] = request.data.decode("utf-8")
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            self.assertEqual(
+                provider.complete([{"role": "user", "content": "合成测试"}], []).content,
+                "stub",
+            )
+
+        self.assertEqual(captured["url"], "https://api.deepseek.com/chat/completions")
+        self.assertEqual(captured["authorization"], f"Bearer {test_key}")
+        self.assertNotIn(test_key, captured["body"])
+        self.assertNotIn(test_key, repr(provider))
+
+    def test_deepseek_network_secret_rejects_other_hosts(self) -> None:
+        test_key = "TEST_SECRET_ONLY_NEVER_OUTPUT"
+        rejected_urls = (
+            "https://example.invalid",
+            "https://api.deepseek.com:444",
+            "http://api.deepseek.com",
+        )
+        for base_url in rejected_urls:
+            with self.subTest(base_url=base_url):
+                with self.assertRaisesRegex(
+                    ProviderError, "仅允许 HTTPS api.deepseek.com"
+                ) as caught:
+                    provider_from_environment(
+                        "openai",
+                        "deepseek-flash",
+                        environment={
+                            DEEPSEEK_API_KEY_ENV: test_key,
+                            "HARNESS_BASE_URL": base_url,
+                        },
+                    )
+                self.assertNotIn(test_key, str(caught.exception))
+
+    def test_mock_provider_never_looks_up_deepseek_secret(self) -> None:
+        class RecordingEnvironment(dict[str, str]):
+            looked_up: list[str] = []
+
+            def get(self, key: str, default: str | None = None):
+                self.looked_up.append(key)
+                return super().get(key, default)
+
+        environment = RecordingEnvironment({DEEPSEEK_API_KEY_ENV: "TEST_SECRET_ONLY"})
+        provider = provider_from_environment("mock", environment=environment)
+        self.assertIsInstance(provider, MockProvider)
+        self.assertEqual(environment.looked_up, [])
+
+    def test_openai_configuration_does_not_display_key(self) -> None:
+        test_key = "TEST_SECRET_ONLY_NEVER_OUTPUT"
+        provider = provider_from_environment(
+            "openai",
+            "deepseek-flash",
+            environment={DEEPSEEK_API_KEY_ENV: test_key},
+        )
+        with make_test_temp(prefix="provider-config-") as temp:
+            inputs = iter(["/配置", "/退出"])
+            outputs: list[str] = []
+            args = SimpleNamespace(workspace=temp, provider="openai", model=None)
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                rc = run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append)
+        self.assertEqual(rc, 0)
+        text = "\n".join(outputs)
+        self.assertIn(DEEPSEEK_API_KEY_ENV, text)
+        self.assertNotIn(test_key, text)
+
     def test_openai_tool_turn_roundtrips_reasoning_content_without_live_http(self) -> None:
         provider = OpenAICompatibleProvider(
             "https://api.deepseek.com", "TEST_KEY_ONLY", "deepseek-flash"
@@ -728,10 +882,9 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaisesRegex(ProviderError, "未提供 API 密钥"):
             OpenAICompatibleProvider("https://api.deepseek.com", "", "deepseek-flash")
 
-    def test_provider_factory_never_reads_environment_api_key(self) -> None:
-        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "TEST_KEY_ONLY"}):
-            with self.assertRaisesRegex(ProviderError, "未提供 API 密钥"):
-                provider_from_environment("openai", "deepseek-flash")
+    def test_provider_factory_missing_key_does_not_send_request(self) -> None:
+        with self.assertRaisesRegex(ProviderError, "未提供 API 密钥"):
+            provider_from_environment("openai", "deepseek-flash", environment={})
 
 
 if __name__ == "__main__":

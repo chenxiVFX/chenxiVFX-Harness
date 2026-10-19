@@ -7,7 +7,8 @@
 | Windows 中文 CLI、帮助与 UTF-8 | 已实现 / 离线可测 | PowerShell 启动脚本、中文命令、UTF-8 I/O；Windows Python 3.13 本机运行 |
 | Mock provider | 已实现 / 离线可测 | 默认离线，不发请求、不读密钥 |
 | OpenAI 兼容 Chat Completions | 已实现 / 离线可测 | stdlib HTTP、`reasoning_content` 工具往返、usage、`max_tokens` 上限、429 不重试、脱敏错误和边界取消；真实 DeepSeek API 未测 |
-| 安全 API 密钥输入与受限真实 smoke | 待实现 | CLI 不读取密钥环境变量；云端迭代需加入隐藏终端输入，单次合成短文本、无工具、最多 128 tokens 的 smoke；不得复用聊天中提供的密钥 |
+| DeepSeek API key 读取 | 已实现 / 离线可测 | OpenAI 模式读取 `DEEPSEEK_API_KEY`，只允许 HTTPS `api.deepseek.com:443`；Mock 不查询该值，配置页不显示。Codex Cloud Network secret 的 Bearer 头代理替换仍未真实验证 |
+| 受限真实 DeepSeek smoke | 待用户配置并确认 | 用户自行在 Codex Cloud Network secrets 添加 `DEEPSEEK_API_KEY`，Allowed domains 限定 `api.deepseek.com`；最多 128 tokens、合成短文本、无工具；本轮没有真实 API 调用 |
 | Anthropic provider / 更多供应商 | 待实现 | 尚无独立协议适配；当前用户要求的 `deepseek-flash` 只配置了兼容接口 |
 | 工作区文件引用与读写 | 已实现 / 离线可测 | 路径与敏感路径检查，单次人工审批，写入差异预览、撤销备份 |
 | junction / symlink / hard link 逃逸 | 部分实现 / 未实测 | 检测逻辑和普通路径回归在；本机策略拒绝创建链接，逃逸集成测试跳过 |
@@ -33,13 +34,20 @@
 - 检查点只接收用户手写文本并预览脱敏结果，不从工具结果或主会话自动拼接内容；取消确认不落盘。
 - 远端 Git 同步仍受 DNS/HTTPS 解析失败限制；本地中文提交会保留，不强推。
 
+## 本轮迭代验收记录（2026-10-19）
+
+- Debian 13 / Python 3.12 云端：按实际平台文件系统区分路径大小写断言；Windows 分支仍要求 Harness 解析回磁盘目录项实际大小写，POSIX 分支验证 Harness 保留输入大小写并按实际卷行为读文件。
+- OpenAI provider 仅在选择 OpenAI 模式时读取 `DEEPSEEK_API_KEY`，该环境密钥限定 HTTPS `api.deepseek.com:443`；Mock 不查询该变量。认证值不出现在 `/配置`、消息体或 provider 的默认表示中。
+- 用合成值、stub 响应及 `127.0.0.1` 本地 HTTP fixture 验证了请求构造与响应解析；没有读取本任务环境的密钥值、没有配置凭据、没有访问外部 API。
+- Codex Cloud Network secret 文档说明 placeholder 由 HTTPS 443 代理按 Allowed domains 替换；DeepSeek 对 Bearer Authorization 头的代理兼容性尚未由本项目验证。用户保存环境配置后需 Republish，并在新 task 中验证。
+- `compileall` 与中文 mock CLI 冒烟通过；`python3 -m unittest discover -s tests -v` 共 53 项，50 项通过，3 项 Windows 链接创建测试按策略跳过，无失败。
+- Windows Python 3.13 本轮未运行；Debian 下 3 项 Windows 专属链接创建测试因平台/opt-in 条件跳过，没有尝试创建链接。
+
 ## 当前恢复点
 
-- 分支 `main`；第四轮实现已生成中文本地提交，工作树在保全后保持干净。任务目录中仓库外有经 `git bundle verify` 校验的完整历史 bundle。
-- 仓库最初经授权克隆尝试失败，随后只在新建独立目录中依据 GitHub 公共页面确认的空仓库状态启动；无其他项目文件被改动。
-- 当前工作树为目标仓库唯一开发目标。`.harness/`、`.test-tmp/` 和 Python 缓存均忽略，不放入版本控制。
-- Git 工作区 owner 与执行身份不同；每条 Git 命令仅用一次性 `-c safe.directory=<本仓库绝对路径>`。不修改全局 Git 配置。
-- 本机 `git ls-remote` 仍报 `getaddrinfo() thread failed to start`。GitHub 授权连接器确认仓库可 push，但 `main` ref 查询返回 409 `Git Repository is empty`。连接器没有 Git pack push 能力；使用文件/对象 API 创建快照会改变原有提交链，因此未走该路径。网络恢复后用普通非强推 Git 同步并核验远端 SHA。
+- 当前迭代基于 `main` / `origin/main` 的 `73d9bf5`；本轮提交及远端状态以 `main` / `origin/main` 指针核对。产品代码变更经测试后以中文提交，只允许普通快进推送。
+- 本轮只更改 Harness 源码、测试和说明文档；`.harness/`、`.test-tmp/` 和 Python 缓存均忽略，不放入版本控制。
+- 本轮没有新增 Windows 链接集成测试，也没有调整系统链接权限；需在允许创建链接的 Windows 环境继续验收。
 
 ## 风险与未验证项
 

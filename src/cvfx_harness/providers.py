@@ -5,11 +5,14 @@ import os
 import threading
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from .usage import ProviderUsage, estimate_tokens
+
+DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 
 
 class ProviderError(RuntimeError):
@@ -118,7 +121,7 @@ class OpenAICompatibleProvider:
             raise ProviderError("仅允许 HTTPS；HTTP 只对本机回环地址开放。")
 
         self.endpoint = self._chat_endpoint(base_url)
-        self.api_key = api_key
+        self._api_key = api_key
         self.model = model
         self.timeout = timeout
 
@@ -156,7 +159,7 @@ class OpenAICompatibleProvider:
             self.endpoint,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             headers={
-                "Authorization": f"Bearer {self.api_key}",
+                "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json; charset=utf-8",
                 "Accept": "application/json",
             },
@@ -239,15 +242,38 @@ def provider_from_environment(
     *,
     api_key_override: str | None = None,
     base_url_override: str | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> Provider:
-    model = model_override or os.environ.get("HARNESS_MODEL", "deepseek-flash")
+    """从当前进程配置创建提供商；测试可传入隔离的配置映射。"""
+    settings = os.environ if environment is None else environment
     if provider_name == "mock":
-        return MockProvider(model=model if model_override else "mock")
+        return MockProvider(model=model_override or "mock")
     if provider_name == "openai":
-        base_url = base_url_override or os.environ.get("HARNESS_BASE_URL", "https://api.deepseek.com")
-        # Do not silently consume a process-wide credential. A later interactive
-        # hidden-input flow must pass the one-shot value explicitly.
-        api_key = api_key_override or ""
+        model = model_override or settings.get("HARNESS_MODEL", "deepseek-flash")
+        base_url = base_url_override or settings.get("HARNESS_BASE_URL", "https://api.deepseek.com")
+        # 云端 Network secret 以 DEEPSEEK_API_KEY 提供占位符；仅 OpenAI 模式读取。
+        # 这个变量只允许用于 DeepSeek 主机，避免把占位符或凭据发往其他站点。
+        api_key = (
+            api_key_override
+            if api_key_override is not None
+            else settings.get(DEEPSEEK_API_KEY_ENV, "")
+        )
+        if api_key_override is None and api_key:
+            try:
+                parsed = urlsplit(base_url)
+                port = parsed.port
+            except ValueError:
+                parsed = None
+                port = None
+            if (
+                parsed is None
+                or parsed.scheme != "https"
+                or (parsed.hostname or "").casefold() != "api.deepseek.com"
+                or port not in {None, 443}
+            ):
+                raise ProviderError(
+                    f"使用 {DEEPSEEK_API_KEY_ENV} 时仅允许 HTTPS api.deepseek.com 的 443 端口。"
+                )
         return OpenAICompatibleProvider(
             base_url=base_url,
             api_key=api_key,

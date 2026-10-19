@@ -2,7 +2,7 @@
 
 ## 运行边界
 
-项目使用 Python 3.11+ 标准库，提供 Windows PowerShell 启动脚本。默认 Mock provider；真实 HTTP 只会在用户显式选择 OpenAI 兼容 provider 并配置密钥时调用。没有 shell 执行工具、自动文件写权限或常驻后台服务。
+项目使用 Python 3.11+ 标准库，提供 Windows PowerShell 启动脚本。默认 Mock provider；Mock 不查询 DeepSeek 密钥变量。真实 HTTP 只会在用户显式选择 OpenAI 兼容 provider 并提供凭据时调用。没有 shell 执行工具、自动文件写权限或常驻后台服务。
 
 ```text
 终端 UTF-8 输入
@@ -47,7 +47,10 @@ Agent 的 system message 在每个请求、恢复和压缩后保持固定文本�
 - 子代理仅从 CLI 明确列出的任务创建；工具层逐项展示确切任务文本并要求审批。每个 child 新建独立的 system/user 消息列表，不继承父会话、文件引用、工具结果、目标或工具 schema。仅有 `MockProvider.complete_subagent` 被开放；每项一次调用、输入最多 512 估算 tokens、输出最多 256 估算 tokens、超时 5 秒、最多 3 项、深度 0。
 - 取消事件、预算和状态按 child 独立。失败、超时、取消、拒绝或预算耗尽不阻止其他已批准 child；结果只生成 JSON 编码的不可信汇总，不加入父 Agent 上下文，不调用文件/命令工具。
 - OpenAI 兼容请求支持请求前和响应后的取消检查；标准库 `urlopen` 阻塞期间只能依靠请求超时，不能承诺即时中断。429 不自动重试；记录 provider 返回的 Token 用量，不估算货币成本，也不把价格写入代码。
-- CLI 不从环境变量读取 API 密钥；当前尚无隐藏输入入口，因此 OpenAI 模式在联网前安全失败。真实 API 接入应先完成交互式隐藏输入与用户明确批准的受限 smoke 测试。
+- OpenAI 兼容 CLI 只在该 provider 启动时读取 `DEEPSEEK_API_KEY`；环境密钥限定 HTTPS `api.deepseek.com:443`，不能通过 `HARNESS_BASE_URL` 转发到其他主机。`/配置` 不显示值，密钥只作为 Bearer 认证头，不加入对话、存档或 Harness 日志。Mock 不查询密钥变量。
+- Codex Cloud Network secret 可把 `DEEPSEEK_API_KEY` placeholder 交给程序，再由 HTTPS 代理向允许的 DeepSeek 目标替换真实值；官方文档没有确认本适配器 Bearer 头的端到端兼容性，本项目尚未使用真实密钥验证。普通环境变量会直接对 task 代码可见，云端应由用户自行选择 Network secret 并限定 Allowed domains。
+- 本地回环 HTTP fixture 验证请求/响应、密钥只在认证头、错误不披露请求认证值；这些结果不代表真实 DeepSeek API 或云端代理已验收。真实 API smoke 仍需要用户完成环境配置并单独确认测试范围。
+- OpenAI 兼容请求支持请求前和响应后的取消检查；标准库 `urlopen` 阻塞期间只能依靠请求超时，不能承诺即时中断。429 不自动重试；记录 provider 返回的 Token 用量，不估算货币成本，也不把价格写入代码。
 
 ## 语义假设
 

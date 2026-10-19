@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from .agent import Agent
-from .providers import ProviderError, provider_from_environment
+from .providers import DEEPSEEK_API_KEY_ENV, ProviderError, provider_from_environment
 from .sessions import SessionError, SessionStore
 from .subagents import DelegationPlanError, build_delegation_plan, run_bounded_subagents
 from .tools import ActionRequest, Workspace, WorkspaceError
@@ -237,7 +237,7 @@ def run_console(
                 f"工作区：{_safe_terminal_text(str(workspace.root))}\n"
                 f"会话目录：{_safe_terminal_text(str(workspace.root / '.harness' / 'sessions'))}\n"
                 f"Token 预算提示：{agent.token_budget}\n"
-                "密钥：仅可能从当前进程环境读取；此界面不展示、不写入会话\n"
+                f"OpenAI 密钥变量：{DEEPSEEK_API_KEY_ENV}；仅 OpenAI 模式读取，不展示或写入会话\n"
                 "Shell：禁用"
             )
             continue

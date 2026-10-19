@@ -57,9 +57,11 @@ Token 数由本地字符启发式估算，不是提供商 tokenizer 的精确数
 
 ## DeepSeek OpenAI 兼容模式
 
-适配器默认端点为 `https://api.deepseek.com/chat/completions`，模型默认为 `deepseek-flash`；可用 `HARNESS_BASE_URL` 和 `HARNESS_MODEL` 覆盖端点与模型。当前 CLI 尚未提供密钥的隐藏输入界面，因此不会从环境变量读取 `DEEPSEEK_API_KEY`，OpenAI 模式会在发出网络请求前报缺少密钥。请勿把密钥放在命令行参数、环境变量、项目文件或聊天中。隐藏输入和受限 smoke 请求留待云端迭代完成后，再由用户在本地交互终端提供密钥。
+适配器默认端点为 `https://api.deepseek.com/chat/completions`，模型默认为 `deepseek-flash`；可用 `HARNESS_BASE_URL` 和 `HARNESS_MODEL` 覆盖端点与模型。选择 OpenAI 模式后，程序只读取 `DEEPSEEK_API_KEY`；Mock 模式不会查询这个变量。环境密钥只允许发往 `https://api.deepseek.com:443`。`/配置` 会显示变量名，不显示值；认证头不会进入模型消息、会话或 Harness 日志。请勿把密钥放进命令行、项目文件、聊天或 Git。
 
-本轮开发和测试不执行 API 请求，也不要求密钥。请求头和响应正文不会写入会话或 Harness 日志；端点配置可在 `/配置` 查看。HTTP 429 会报错且不自动重试；适配器只统计 provider 返回的 Token usage，不核算费用。取消信号会在发送前和收到响应后检查；标准库阻塞中的 HTTP 请求只能由配置的超时结束，不能保证即时中断。不要把密钥写入仓库、`.env`、命令行参数或测试输出。
+本地 CLI 尚无隐藏输入界面；若直接使用普通环境变量，原值会进入 Harness 进程。若以后要在 Codex Cloud 使用 DeepSeek，用户可自行在该环境的 **Network secrets** 中添加变量 `DEEPSEEK_API_KEY`，Allowed domains 设为 `api.deepseek.com`。[Codex Cloud 官方说明](https://learn.chatgpt.com/docs/environments/cloud-environments)指出，Network secret 会以 placeholder 交给程序，并由代理在允许目标的 HTTPS 443 请求中替换原值，不把原始值放入本地进程或文件；普通 Environment variable 的值对 task 可见。保存环境改动后需要 Republish 并新建 task。网络密钥须使用自己的 Key，不能与同名直接环境变量冲突。
+
+云端文档描述的是通用 HTTPS 代理替换，本项目尚未用真实 DeepSeek 密钥确认代理能否替换本适配器的 Bearer Authorization 头。本轮只用合成值和本机回环 HTTP 服务测试协议行为，没有调用真实 DeepSeek、读取或配置任何密钥，也没有验证真实网络代理兼容性。真实请求仍须由用户配置后另行确认；受限 smoke 应使用合成短文本、无工具、最多 128 tokens。HTTP 429 不自动重试；适配器只统计 provider 返回的 Token usage，不核算费用。取消信号会在发送前和收到响应后检查；标准库阻塞中的 HTTP 请求只能由配置的超时结束，不能保证即时中断。
 
 ## 权限与边界
 
@@ -77,4 +79,4 @@ python -m unittest discover -s tests -v
 .\run.ps1 --help
 ```
 
-测试只使用本地临时工作区、模拟提供商和 stub HTTP 响应，不读取真实密钥或访问 API。链接集成用例默认跳过。
+测试只使用本地临时工作区、模拟提供商、loopback HTTP fixture 和 stub HTTP 响应，不读取实际环境密钥或访问外部 API。链接集成用例默认跳过。
