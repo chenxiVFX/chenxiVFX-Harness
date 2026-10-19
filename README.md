@@ -50,6 +50,8 @@ Enter 提交当前输入，Ctrl+J 插入换行；TUI 生成期间会暂停输入
 
 从对应 Actions 运行页面下载 `windows-x64-cvfx-harness-py312` 文件，解压后可运行 `cvfx-harness.exe --help` 或 `cvfx-harness.exe --workspace . --provider mock`。单文件启动时会把依赖解压到系统临时目录，启动会比源码或目录包慢一些，且需要临时目录可写。包中包含可执行文件、中文说明、第三方许可证通知和 SHA-256 校验文件；CI 构建不打包仓库文档、配置或工作区文件。构建与自检仅使用 Mock 和合成输入，不连接真实模型。这个未签名包只是试验，不是正式发布；Windows 可能显示 SmartScreen 或 Defender 提示，请保持系统保护开启并遵循组织策略。Actions 文件保留 14 天，不上传到发布页或包注册表。
 
+从下载、核对 SHA-256、离线启动、配置非敏感模型设置，到单次文件审批、运行 Python 测试、保存会话并退出的首次使用流程，见[Windows 单文件包快速入门](QUICKSTART-zh-CN.md)。包内的 `README-standalone-zh-CN.txt` 也包含可独立阅读的精简步骤。
+
 ## 可用命令
 
 在交互提示符输入 `/帮助` 查看完整说明。
@@ -107,7 +109,7 @@ Enter 提交当前输入，Ctrl+J 插入换行；TUI 生成期间会暂停输入
 
 ## 工作区配置
 
-运行设置保存在工作区 `.harness/config/settings.json`，该目录由 `.gitignore` 排除且模型文件工具无法读取。配置只接收非敏感字段，不接受 API Key 或其他凭据。优先级从低到高为：内置默认值、工作区配置、`HARNESS_*` 环境变量、命令行参数。支持的环境变量为 `HARNESS_PROVIDER`、`HARNESS_MODEL`、`HARNESS_BASE_URL`、`HARNESS_TOKEN_BUDGET` 和 `HARNESS_MAX_OUTPUT_TOKENS`。
+运行设置保存在工作区 `.harness/config/settings.json`，模型文件工具无法读取。配置只接收非敏感字段，不接受 API Key 或其他凭据。Harness 不会为任意工作区修改 `.gitignore`；若项目由 Git 管理，请自行确认 `.harness/` 已被该项目忽略，避免提交本地设置或未加密会话。优先级从低到高为：内置默认值、工作区配置、`HARNESS_*` 环境变量、命令行参数。支持的环境变量为 `HARNESS_PROVIDER`、`HARNESS_MODEL`、`HARNESS_BASE_URL`、`HARNESS_TOKEN_BUDGET` 和 `HARNESS_MAX_OUTPUT_TOKENS`。
 
 建议在 TUI 或纯文本交互中使用 `/配置 编辑`。它会先展示当前生效值和来源，再逐项收集工作区层设置，最后展示完整候选与高优先级覆盖后的生效值：
 
@@ -169,7 +171,7 @@ Token 数由本地字符启发式估算，不是提供商 tokenizer 的精确数
 
 Anthropic SSE 使用与现有 provider 相同的有界 UTF-8/SSE 解析器：跨网络块处理中文和 LF/CRLF 边界，限制 4 MiB 响应、2 MiB 助手内容、512 KiB 单行/事件、16,384 个事件及最多 120 秒总时限；响应读取时约每 250 ms 检查取消。只有收到完整 `message_stop` 才返回工具调用；错误或截断响应不会触发该轮工具。标准 `input_tokens` / `output_tokens` 字段若出现会用于统计，但 DeepSeek 尚未在该兼容指南中明示这两个响应字段；usage 缺失或无效时按该请求完整 `max_tokens` 额度保守扣除，不推测缓存命中。终端输出沿用控制字符可见转义与疑似凭据脱敏；网络错误不显示原始异常、请求头、URL 或响应体。非流式 `complete()` 存在，但它仅在发送前和收到响应后检查取消，CLI 使用有界 SSE。
 
-本地协议回归使用 loopback 合成 HTTP fixture 与离线测试。另做过有限范围的真实用户流程核对：OpenAI 兼容 SSE 对一个精确批准的合成文件执行写入并逐字节读回；只读子代理仅获准读取一个合成文件，结果被收取并加入父对话的不可信、不可存档上下文；Anthropic 兼容 SSE 完成基础合成文本对话并返回 usage。流程没有使用项目文件、用户数据或私人聊天，也没有执行生成代码。它们只覆盖上述路径，不构成完整产品验收；逐请求用量留在私有账本，不提交到仓库。
+本地协议回归使用 loopback 合成 HTTP fixture 与离线测试。历史提交 [`5e5a9ca`](https://github.com/chenxiVFX/chenxiVFX-Harness/commit/5e5a9ca2fcc840ec19004cb96d43c1ce75e594b2) 有一次范围有限的真实 DeepSeek 合成端到端核验：在临时合成工作区经单独读取审批、核对后批准唯一的一行补丁，再运行一次合成 smoke 测试，退出码为 0；没有触碰真实项目或生成测试代码。另做过有限范围的兼容流程核对：OpenAI 兼容 SSE 对一个精确批准的合成文件执行写入并逐字节读回；只读子代理仅获准读取一个合成文件，结果被收取并加入父对话的不可信、不可存档上下文；Anthropic 兼容 SSE 完成基础合成文本对话并返回 usage。这些只证明所列单次路径，不构成当前所有 provider、所有工具组合或真实项目验收；没有把私人逐请求用量或日志放入仓库。
 
 ### 有界 SSE 流式交互
 

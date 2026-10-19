@@ -178,32 +178,48 @@ def _write_artifact_readme(path: Path) -> None:
     path.write_text(
         """chenxiVFX Harness · Windows x64 单文件试验包
 
-运行要求：Windows x64；此包内含所需 Python 运行时，无需安装系统 Python。
+此包是 Windows x64 试验构建，不是正式 Release；内含运行 Harness 所需的 Python，无需为 Harness 安装系统 Python。
 
-Harness 本身可以在没有系统 Python 的 Windows 上启动。用户若配置并运行 unittest/pytest，
-必须另外通过 /测试 添加选择并校验一个外部 Python 可执行文件绝对路径；测试将由该解释器运行。
-Harness 不会安装 Python 或 pytest，也不会把 pytest 打包进 Harness。
+首次试用：从你核对过的成功 GitHub Actions 运行下载 artifact，解压后在此目录打开 PowerShell。
+先按清单核对可执行文件，再指定一个已存在的项目目录：
 
-PowerShell 示例：
-  .\\cvfx-harness.exe --help
-  .\\cvfx-harness.exe --workspace . --provider mock
+  $expected = ((Get-Content .\\SHA256SUMS.txt -Raw).Trim() -split '\\s+')[0]
+  $actual = (Get-FileHash .\\cvfx-harness.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($actual -ne $expected) { throw 'cvfx-harness.exe 的 SHA-256 不匹配' }
+  $workspace = 'D:\\Projects\\My Project'
+  if (-not (Test-Path -LiteralPath $workspace -PathType Container)) { throw '工作区目录不存在' }
+  .\\cvfx-harness.exe --workspace "$workspace" --provider mock
 
-默认 mock 模式完全离线，不读取密钥或访问网络。此试验的构建与自检也只使用
-Mock 和合成输入；真实模型连接不在本试验范围内。
+Mock 完全离线，不读取密钥或连接模型。输入“你好”试用中文，再用 /状态核对工作区，/退出结束。
+在 Mock 会话中可用 /配置 编辑 保存非敏感的提供商、模型与端点；选择 openai 表示 DeepSeek OpenAI
+兼容接口。设置保存在工作区 .harness/config/settings.json，不包含密钥；Harness 不会修改项目 .gitignore。
+提供商/模型/端点在下次启动生效。真实 DeepSeek 请求需要在启动前
+由你信任的安全密钥注入方式向进程提供 DEEPSEEK_API_KEY；不要把密钥粘贴到聊天、命令行或配置。
+本地包没有 Windows Credential Manager 集成，普通环境变量会进入进程并对该进程可见。没有安全
+注入方式时请继续使用 Mock。真实模式重启时不要带 --provider mock。
 
-SHA256SUMS.txt 列出可执行文件 SHA-256。可用以下命令核对：
-  Get-FileHash .\\cvfx-harness.exe -Algorithm SHA256
+需要修改文件时，核对目标路径和完整差异后再批准；TUI 默认拒绝，选“是”并按 Enter 才批准一次。
+若模型需先读取文件，读取也会单独审批。没有永久授权。
+
+项目测试只支持 unittest 和 pytest。运行 Harness 无需外部 Python；运行项目测试时用 /测试 添加 <ID>
+选择一个外部 python.exe，再用 /测试 运行 <ID>。不能选择本 Harness EXE。pytest 必须已在所选
+解释器中安装，Harness 不会安装 Python、pytest 或项目依赖。每次运行都要核对解释器、参数和工作目录
+并审批。测试代码以当前用户权限运行，不是 OS 沙箱，可访问该用户能访问的文件与网络；只运行你信任的项目测试。
+
+可用 /保存 首次试用 保存安全的普通对话，然后 /退出。会话是工作区 .harness/sessions/ 中未加密的
+JSON；不要存入敏感信息。提交项目之前，确认项目自身的 .gitignore 已忽略 .harness/。
 
 交互式终端会使用全屏中文界面。输入区中 Enter 提交、Ctrl+J 换行、Ctrl+C 清空草稿或
 取消当前请求；Esc 先关闭建议，再取消输入/请求。审批默认“否”，选择“是”并按 Enter
 才会授权单次操作；鼠标点击 Yes 只切换选项，不会直接批准。命令菜单只提供固定命令，
 不会扫描工作区路径。中文 IME 行为依赖终端，未完成 Windows Terminal、PowerShell、
-ConPTY 与各输入法组合的人工兼容验收。
+ConPTY 与各输入法组合的人工兼容验收。无法使用全屏输入时，可添加 --plain 启动纯文本界面。
 
 THIRD_PARTY_NOTICES.txt 包含随包依赖的许可证通知。
 
 此 CI 文件未签名，Windows 可能显示 SmartScreen 或 Defender 提示。请保持系统
-保护开启，并按组织策略处理；不要为运行本文件关闭系统保护。
+保护开启，并按组织策略处理；不要为运行本文件关闭系统保护。SHA256SUMS.txt 可检测下载/解压损坏；
+验证来源时还应核对成功的 workflow 运行及其 artifact。
 
 此单文件包是体验试验，不是正式发布。对应 GitHub Actions 文件会在 14 天后过期。
 """,
