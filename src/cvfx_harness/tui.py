@@ -206,7 +206,6 @@ class TerminalUI:
                             xcursor=True,
                             ycursor=True,
                             content=CompletionsMenu(max_height=8, scroll_offset=1),
-                            hide_when_covering_content=True,
                         )
                     ],
                 ),

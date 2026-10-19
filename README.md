@@ -38,6 +38,8 @@ Enter 提交当前输入，Ctrl+J 插入换行；Ctrl+C 首次清空草稿，再
 
 启用 TTY 全屏渲染后，终端的 Unicode 字符宽度、鼠标能力与输入法组合仍取决于宿主。当前项目在 CI 中使用 prompt_toolkit 的合成输入和 Linux PTY 验证键位、布局启动/退出；Windows runner 使用其 Win32 输入模拟验证。尚未完成 Windows Terminal、PowerShell/ConPTY 和各中文 IME 组合的人工兼容验收。
 
+查看 [实际 Linux PTY 合成会话录屏](evidence/tui-synthetic-session.cast)，其中包含主界面、命令候选高亮、多行草稿和默认拒绝审批；回放说明见 [证据说明](evidence/README.md)。
+
 ### Windows 独立程序试验
 
 仓库的 `Windows standalone packaging experiment` Actions 工作流会在 Windows x64 runner 上构建一个含 Python 运行时的单文件 `.exe`，随后在不依赖系统 Python 的子进程环境中检查 `--help`、离线 Mock 中文交互和含中文/空格的工作区路径。构建工具仅用于 CI，版本和 Windows 轮子哈希锁定在 [`packaging/windows-build-requirements.txt`](packaging/windows-build-requirements.txt)；应用的 TUI 运行依赖固定在 `pyproject.toml`。

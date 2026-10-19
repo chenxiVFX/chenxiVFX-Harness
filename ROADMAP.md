@@ -186,7 +186,9 @@
 - 审批面板显示动作预览，默认拒绝；键盘/鼠标只切换“是/否”，必须另按 Enter 才会给当前操作单次授权。多行粘贴拒绝；模型/工具输出会转义终端控制字符、遮蔽疑似凭据并限制缓冲输出长度。
 - TUI 把输入桥接到既有 CLI Agent/工具循环，沿用预算、目录/文件逐项审批、计划拦截和取消事件；没有增加 shell 或模型代码执行。PTY 与合成按键用于验证渲染入口和操作流程，不等同 Windows Terminal/ConPTY 或真实中文输入法验收。
 - 交互组件测试、隔离合成键盘自检和 POSIX PTY 测试只使用本地合成内容与 Mock；Windows standalone workflow 会在打包 EXE 内运行 TUI 合成键盘自检。中文 IME 和终端缩放/鼠标差异仍待人工兼容测试。
-- Linux / Python 3.12 离线回归：177 项，176 通过、1 项 Windows-only junction 跳过；editable install、自检、TUI 合成键盘自检、`compileall` 与 `git diff --check` 通过。Windows/Linux × Python 3.11/3.12 四格 CI 全部通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39240749409)）；Windows standalone EXE 构建、归档审查、帮助/Mock/TUI 自检和短期 artifact 上传通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39240749626)）。没有真实模型请求或凭据读取；测试不等同完整产品验收。
+- 实际 Linux PTY 录屏展示主界面、状态栏、细分隔线、命令候选高亮、多行草稿和默认拒绝审批，见 [证据说明](evidence/README.md)。录屏、POSIX PTY 测试均启动真实 TUI，仅使用本地合成文本与 Mock；不是 Windows Terminal/ConPTY 或中文输入法人工验收。
+- 录屏前发现候选浮层被 `hide_when_covering_content` 隐藏，移除此布局选项后真实 PTY 可见候选与简介；新增 POSIX PTY 回归，验证出现 `/帮助`、简介、选择 `/命令` 并退出。另测试鼠标开关、输入/输出点击聚焦、滚动条、当前候选高亮样式，以及审批按钮点击只切换选择、不提交审批。
+- Linux / Python 3.12 离线回归：179 项，178 通过、1 项 Windows-only junction 跳过；editable install、自检、TUI 合成键盘自检、`compileall` 与 `git diff --check` 通过。Windows/Linux × Python 3.11/3.12 与 Windows standalone 本轮 CI 待推送后记录。没有真实模型请求或凭据读取；测试不等同完整产品验收。
 
 ## 参考项目复用边界
 

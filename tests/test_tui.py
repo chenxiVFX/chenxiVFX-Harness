@@ -299,6 +299,27 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(received, [""])
 
+    def test_mouse_scroll_focus_and_current_candidate_style_are_configured(self) -> None:
+        from prompt_toolkit.layout.margins import ScrollbarMargin
+
+        with create_pipe_input() as pipe:
+            ui = TerminalUI(lambda _ui: 0, input=pipe, output=DummyOutput())
+            self.assertTrue(ui._application.mouse_support())
+            self.assertTrue(ui.input_area.control.focus_on_click())
+            self.assertTrue(ui.output_area.control.focus_on_click())
+            self.assertTrue(
+                any(
+                    isinstance(margin, ScrollbarMargin)
+                    for margin in ui.output_area.window.right_margins
+                )
+            )
+            current_style = ui._application.style.get_attrs_for_style_str(
+                "class:completion-menu.completion.current"
+            )
+            self.assertEqual(current_style.bgcolor, "c6a0f6")
+            self.assertEqual(current_style.color, "1b1722")
+            self.assertTrue(current_style.bold)
+
     def test_escape_closes_completion_without_submitting_or_cancelling(self) -> None:
         received: list[str] = []
 
@@ -440,6 +461,60 @@ class PromptToolkitTests(unittest.TestCase):
                 self.assertEqual(process.wait(timeout=2), 0)
                 self.assertIn("会话".encode("utf-8"), output)
                 self.assertIn("Enter".encode("utf-8"), output)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=2)
+                os.close(master_fd)
+
+    @unittest.skipUnless(os.name == "posix", "PTY key handling is POSIX-specific")
+    def test_real_posix_pty_shows_completion_menu_and_accepts_selected_command(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-menu-pty-") as workspace:
+            environment = {
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "TERM": "xterm-256color",
+            }
+            master_fd, slave_fd = pty.openpty()
+            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+            process = subprocess.Popen(
+                [sys.executable, "-m", "cvfx_harness", "--workspace", workspace, "--provider", "mock"],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=environment,
+                close_fds=True,
+            )
+            os.close(slave_fd)
+            transcript = bytearray()
+
+            def read_until(marker: bytes, *, start: int = 0, timeout: float = 8.0) -> None:
+                deadline = time.monotonic() + timeout
+                while marker not in transcript[start:]:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self.fail(f"PTY timed out waiting for {marker!r}")
+                    ready, _, _ = select.select([master_fd], [], [], min(remaining, 0.1))
+                    if not ready:
+                        continue
+                    try:
+                        transcript.extend(os.read(master_fd, 8192))
+                    except OSError:
+                        break
+
+            try:
+                read_until("你[执行]> ".encode("utf-8"))
+                menu_start = len(transcript)
+                os.write(master_fd, b"/")
+                read_until("/帮助".encode("utf-8"), start=menu_start)
+                read_until("显示完整说明".encode("utf-8"), start=menu_start)
+                os.write(master_fd, b"\x1b[B\x1b[B\t\r")
+                read_until("命令：".encode("utf-8"), start=menu_start)
+                self.assertIn("/命令".encode("utf-8"), transcript[menu_start:])
+                os.write(master_fd, "/退出\r".encode("utf-8"))
+                self.assertEqual(process.wait(timeout=8), 0)
             finally:
                 if process.poll() is None:
                     process.terminate()
