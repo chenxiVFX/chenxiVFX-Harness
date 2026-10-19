@@ -2032,7 +2032,7 @@ class AgentTests(unittest.TestCase):
 
         def delayed_local_answer(_request: QuestionnaireRequest) -> QuestionnaireResult:
             started = time.monotonic()
-            time.sleep(0.06)
+            time.sleep(0.15)
             callback_elapsed.append(time.monotonic() - started)
             return QuestionnaireResult("submitted", (UserQuestionAnswer("q1", "继续"),))
 
@@ -2044,7 +2044,7 @@ class AgentTests(unittest.TestCase):
                 ask_user=delayed_local_answer,
             )
             self.assertEqual(agent.ask("开始离线 fixture"), "离线 fixture 已继续。")
-        self.assertGreaterEqual(callback_elapsed[0], 0.05)
+        self.assertGreaterEqual(callback_elapsed[0], 0.1)
         self.assertEqual(len(provider.durations), 2)
         self.assertTrue(all(duration < 0.025 for duration in provider.durations))
 
