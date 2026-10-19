@@ -16,9 +16,15 @@ import time
 import unittest
 import urllib.request
 if os.name == "posix":
+    import fcntl
     import pty
+    import struct
+    import termios
 else:
+    fcntl = None
     pty = None
+    struct = None
+    termios = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -68,6 +74,8 @@ def cli_subprocess_env(workspace: str) -> dict[str, str]:
         "PYTHONUTF8": "1",
         "PYTHONIOENCODING": "utf-8",
     })
+    if os.name == "posix":
+        env.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TERM": "xterm-256color"})
     return env
 
 
@@ -1224,6 +1232,8 @@ class CliTests(unittest.TestCase):
         with make_test_temp(prefix="cli-pty-") as temp:
             (Path(temp) / "approval.txt").write_text("合成审批文件", encoding="utf-8")
             master_fd, slave_fd = pty.openpty()
+            if fcntl is not None and termios is not None and struct is not None:
+                fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
             process = subprocess.Popen(
                 [
                     sys.executable, "-m", "cvfx_harness", "--workspace", temp,
@@ -1272,6 +1282,11 @@ class CliTests(unittest.TestCase):
                 start = len(transcript)
                 os.write(master_fd, "请丢弃此草稿\r".encode("utf-8"))
                 read_until("请丢弃此草稿".encode("utf-8"), start=start)
+                # Wait until readline has accepted the line and returned to the
+                # multiline prompt. Sending SIGINT as soon as the terminal echoes
+                # the text races with readline consuming the trailing carriage
+                # return, which can turn the interrupted line into an empty line.
+                read_until("多行> ".encode("utf-8"), start=start)
                 interrupt_start = len(transcript)
                 process.send_signal(signal.SIGINT)
                 read_until("已丢弃多行草稿".encode("utf-8"), start=interrupt_start)
