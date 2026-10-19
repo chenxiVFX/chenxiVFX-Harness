@@ -306,7 +306,7 @@ class Workspace:
                     try:
                         if self._is_reparse_point(candidate_path):
                             continue
-                        info = entry.stat(follow_symlinks=False)
+                        info = candidate_path.stat(follow_symlinks=False)
                     except (OSError, WorkspaceError):
                         continue
                     is_directory = stat.S_ISDIR(info.st_mode)
