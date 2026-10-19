@@ -38,6 +38,7 @@ from cvfx_harness.cli import (
     MAX_MULTILINE_INPUT_BYTES,
     _StreamingSecretRedactor,
     _collect_multiline_input,
+    _completion_matches,
     _safe_terminal_text,
     parse_references,
     run_console,
@@ -1121,6 +1122,14 @@ class AgentTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_tab_completion_is_limited_to_commands_and_fixed_enum_values(self) -> None:
+        self.assertEqual(_completion_matches("/帮", "/帮"), ("/帮助",))
+        self.assertEqual(_completion_matches("/模式 计", "计"), ("计划",))
+        self.assertEqual(_completion_matches("/模式 执", "执"), ("执行",))
+        self.assertEqual(_completion_matches("/模式 ", ""), ("计划", "执行"))
+        self.assertEqual(_completion_matches("/目标 私密路径", "私密路径"), ())
+        self.assertEqual(_completion_matches("/模式 计划 ", ""), ())
+
     def test_cli_keyboard_interrupt_cancels_request_without_exit_or_replay(self) -> None:
         class InterruptOnceProvider:
             label = "interrupt fixture"
@@ -1265,7 +1274,7 @@ class CliTests(unittest.TestCase):
 
             try:
                 read_until("你[执行]> ".encode("utf-8"))
-                self.assertIn("TTY Tab 命令补全已启用".encode("utf-8"), transcript)
+                self.assertIn("TTY Tab 命令与固定选项补全已启用".encode("utf-8"), transcript)
                 interrupt_start = len(transcript)
                 process.send_signal(signal.SIGINT)
                 read_until("已取消当前输入".encode("utf-8"), start=interrupt_start)
@@ -1276,6 +1285,15 @@ class CliTests(unittest.TestCase):
                 os.write(master_fd, b"\x1b[A\r")
                 read_until("你[执行]> ".encode("utf-8"), start=start)
                 self.assertEqual(bytes(transcript).count("命令：".encode("utf-8")), 1)
+
+                mode_start = len(transcript)
+                os.write(master_fd, "/模式 计\t\r".encode("utf-8"))
+                read_until("已切换到计划模式。".encode("utf-8"), start=mode_start)
+                read_until("你[计划]> ".encode("utf-8"), start=mode_start)
+                mode_start = len(transcript)
+                os.write(master_fd, "/模式 执\t\r".encode("utf-8"))
+                read_until("已切换到执行模式。".encode("utf-8"), start=mode_start)
+                read_until("你[执行]> ".encode("utf-8"), start=mode_start)
 
                 os.write(master_fd, "/多行\r".encode("utf-8"))
                 read_until("多行> ".encode("utf-8"), start=len(transcript))

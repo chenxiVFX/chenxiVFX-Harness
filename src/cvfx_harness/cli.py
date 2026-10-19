@@ -45,6 +45,7 @@ _CLI_COMMANDS = (
     "/恢复", "/会话", "/多行", "/压缩", "/统计", "/预算", "/配置", "/子代理",
     "/撤销", "/退出",
 )
+_CLI_ENUM_ARGUMENTS = {"/模式": ("计划", "执行")}
 
 
 def _safe_terminal_text(text: str) -> str:
@@ -319,7 +320,7 @@ def _help_text() -> str:
 
 文件引用：在提问中写 @相对路径，或用 @{包含空格的相对路径}。
 多行提问以换行符合并，最多 64 KiB UTF-8；Ctrl+C 或 /取消 会丢弃草稿，EOF 会结束会话且不提交。
-可用 TTY 若提供 Python readline，则 Tab 只补全命令名；输入历史（包括审批回答）不会保存或重放。
+TTY 且提供 Python readline 时，Tab 补全命令名和固定选项（如 /模式 计划|执行）；不补路径、自由文本或凭据。输入历史（包括审批回答）不会保存或重放。
 无 TTY 时可用逐行脚本输入；EOF 结束会话。所有审批仍需单独输入 y/yes/是。
 每次文件读取和写入都要人工确认；写入/撤销会先显示完整差异。
 目录列表只返回名称和类型，每次也要人工确认；不读取目录项文件内容。
@@ -330,8 +331,21 @@ OpenAI 兼容模式使用有界 SSE 流式文本；工具片段完整校验后�
 """
 
 
+def _completion_matches(line: str, text: str) -> tuple[str, ...]:
+    """Return known command names and fixed, non-sensitive enum values only."""
+    if not line.startswith("/"):
+        return ()
+    if " " not in line:
+        return tuple(candidate for candidate in _CLI_COMMANDS if candidate.startswith(text))
+    command, _, argument = line.partition(" ")
+    choices = _CLI_ENUM_ARGUMENTS.get(command)
+    if choices is None or " " in argument:
+        return ()
+    return tuple(candidate for candidate in choices if candidate.startswith(text))
+
+
 def _configure_command_line_editing(*, enabled: bool) -> tuple[bool, Callable[[], None]]:
-    """Enable command-only Tab completion without retaining any entered line."""
+    """Enable safe fixed-token Tab completion without retaining entered lines."""
     if not enabled:
         return False, lambda: None
     try:
@@ -348,9 +362,7 @@ def _configure_command_line_editing(*, enabled: bool) -> tuple[bool, Callable[[]
 
     def complete_command(text: str, state: int) -> str | None:
         line = readline.get_line_buffer()
-        if not line.startswith("/") or " " in line:
-            return None
-        matches = [candidate for candidate in _CLI_COMMANDS if candidate.startswith(text)]
+        matches = _completion_matches(line, text)
         return matches[state] if state < len(matches) else None
 
     readline.set_completer(complete_command)
@@ -530,7 +542,7 @@ def run_console(
     input_fn = history_free_input
     if is_tty_input:
         if command_completion:
-            output("TTY Tab 命令补全已启用；不保存输入历史。")
+            output("TTY Tab 命令与固定选项补全已启用；不保存输入历史。")
         else:
             output("当前 Python 终端未提供 Tab 补全；可用 /命令 查找，不保存输入历史。")
 
@@ -556,7 +568,7 @@ def run_console(
             continue
         if command in {"/命令", "/commands"}:
             output("可用命令：\n" + "  " + "\n  ".join(_CLI_COMMANDS))
-            output("输入 /帮助 查看参数；TTY 可用时，Tab 只补全命令名。")
+            output("输入 /帮助 查看参数；TTY 可用时，Tab 补全命令名和固定选项，不补路径或自由文本。")
             continue
         if command in {"/提交", "/cancel", "/取消"}:
             output("/提交 和 /取消 只在 /多行 输入期间使用。")

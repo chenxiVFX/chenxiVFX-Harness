@@ -88,7 +88,7 @@
 ## 中文 CLI 多行输入与交互发现（2026-10-19）
 
 - 增加 `/命令` 命令发现和 `/多行` 输入；逐行合并为单条请求，单独一行 `/提交` 发送、`/取消` 或 Ctrl+C 丢弃，最大 64 KiB UTF-8。多行中的 `/退出`、`/撤销` 等文本按普通提示处理，不派发 CLI 动作。
-- TTY 且 Python `readline` 可用时仅对命令名启用 Tab 补全；不补参数、不接受快捷执行。自动历史关闭，并在每次输入/审批后清空进程内 readline history；不写 history 文件。无 readline 的 Windows TTY 用 `/命令` 发现命令。
+- TTY 且 Python `readline` 可用时，Tab 补全命令名和固定枚举值（当前 `/模式 计划|执行`）；不补路径、自由文本或凭据，也不接受快捷执行。自动历史关闭，并在每次输入/审批后清空进程内 readline history；不写 history 文件。无 readline 的 Windows TTY 用 `/命令` 发现命令。
 - Ctrl+C 取消当前输入/多行草稿/模型请求并回到提示符；EOF 结束会话，多行未提交时丢弃，审批输入 EOF 默认拒绝。非 TTY 可逐行脚本化，不会等待额外终端交互。
 - 文件引用继续支持 `@{含空格的相对路径}`，多行内容中同样适用；读取和写入仍逐项审批。
 - 回归覆盖真实 CLI subprocess（脚本化 Unicode、多行、带空格文件路径、取消、EOF）和 POSIX PTY（Tab、Ctrl+C、无输入历史）；Windows 的 PTY 功能不适用，跨平台 subprocess 用例由 CI 执行。测试不等同于完整产品验收。
