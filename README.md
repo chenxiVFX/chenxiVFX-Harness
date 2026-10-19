@@ -121,13 +121,13 @@ Token 数由本地字符启发式估算，不是提供商 tokenizer 的精确数
 
 ## DeepSeek Anthropic 兼容模式
 
-`--provider deepseek-anthropic` 使用 DeepSeek 官方记录的 Anthropic-compatible API 入口 `https://api.deepseek.com/anthropic`，内部只请求 `/v1/messages`；模型限制为 `deepseek-flash` 和 `deepseek-v4-pro`。选择该模式时 Harness 只读取 `DEEPSEEK_API_KEY` 并通过 `x-api-key` 请求头发送，不会读取 `ANTHROPIC_API_KEY`。固定目标 HTTPS 使用标准证书校验，HTTP 重定向不会跟随。官方 Claude 服务、Claude 账号、Claude 模型别名、自定义主机和其他 API 路径均不支持。详情参见 [DeepSeek Anthropic API 指南](https://api-docs.deepseek.com/guides/anthropic_api/)；DeepSeek 文档说明了兼容功能，但没有枚举其 SSE 事件序列和 usage 响应字段，因此事件序列按[Anthropic 官方 SSE 规范](https://platform.claude.com/docs/en/build-with-claude/streaming)实现，尚未由真实 DeepSeek Anthropic 请求验证。
+`--provider deepseek-anthropic` 使用 DeepSeek 官方记录的 Anthropic-compatible API 入口 `https://api.deepseek.com/anthropic`，内部只请求 `/v1/messages`；模型限制为 `deepseek-flash` 和 `deepseek-v4-pro`。选择该模式时 Harness 只读取 `DEEPSEEK_API_KEY` 并通过 `x-api-key` 请求头发送，不会读取 `ANTHROPIC_API_KEY`。固定目标 HTTPS 使用标准证书校验，HTTP 重定向不会跟随。官方 Claude 服务、Claude 账号、Claude 模型别名、自定义主机和其他 API 路径均不支持。详情参见 [DeepSeek Anthropic API 指南](https://api-docs.deepseek.com/guides/anthropic_api/)；DeepSeek 文档说明了兼容功能，但没有枚举其 SSE 事件序列和 usage 响应字段，因此事件序列按[Anthropic 官方 SSE 规范](https://platform.claude.com/docs/en/build-with-claude/streaming)实现。定向远端验收只核对过一次固定合成提示的基础文本对话；工具循环和其他事件组合尚未远端验证。
 
 请求使用 Anthropic Messages 的 `system`、文本消息、工具 schema、`tool_use` / `tool_result` 往返与 `auto` 工具选择。模型侧 thinking 默认关闭（见 [DeepSeek thinking mode 文档](https://api-docs.deepseek.com/guides/thinking_mode/)）；若响应仍含标准 `thinking` 块，Harness 不显示其内容，并在当前内存上下文中原样保留文本和签名供工具轮次使用。只接受文本、带有效签名的 thinking 和标准 `tool_use` 块；图片、多模态、`server_tool_use`、`redacted_thinking`、文档/搜索/MCP 等内容，以及未知 SSE 事件、字段或增量均明确拒绝。DeepSeek 文档列出部分这些 block 为已支持或忽略，但 Harness 当前没有对应本地执行或保真路径，因此不会静默丢弃。通过完整消息结束标记、参数 JSON 与现有 Agent 预算校验后，工具仍逐次走本地审批；只读子代理限定原有精确路径规则。Mock 不会被拿来模拟该 provider；若某个 provider 没有流式能力，CLI 会明确拒绝流式请求。
 
 Anthropic SSE 使用与现有 provider 相同的有界 UTF-8/SSE 解析器：跨网络块处理中文和 LF/CRLF 边界，限制 4 MiB 响应、2 MiB 助手内容、512 KiB 单行/事件、16,384 个事件及最多 120 秒总时限；响应读取时约每 250 ms 检查取消。只有收到完整 `message_stop` 才返回工具调用；错误或截断响应不会触发该轮工具。标准 `input_tokens` / `output_tokens` 字段若出现会用于统计，但 DeepSeek 尚未在该兼容指南中明示这两个响应字段；usage 缺失或无效时按该请求完整 `max_tokens` 额度保守扣除，不推测缓存命中。终端输出沿用控制字符可见转义与疑似凭据脱敏；网络错误不显示原始异常、请求头、URL 或响应体。非流式 `complete()` 存在，但它仅在发送前和收到响应后检查取消，CLI 使用有界 SSE。
 
-本次实现只通过本机 loopback 合成 HTTP fixture 与离线测试；没有请求真实模型服务，也没有读取、设置或输出凭据。测试证明本地协议适配与已有 Agent 循环的组合行为，不证明远端兼容服务的完整产品验收。
+本地协议回归使用 loopback 合成 HTTP fixture 与离线测试。另做过有限范围的真实用户流程核对：OpenAI 兼容 SSE 对一个精确批准的合成文件执行写入并逐字节读回；只读子代理仅获准读取一个合成文件，结果被收取并加入父对话的不可信、不可存档上下文；Anthropic 兼容 SSE 完成基础合成文本对话并返回 usage。流程没有使用项目文件、用户数据或私人聊天，也没有执行生成代码。它们只覆盖上述路径，不构成完整产品验收；逐请求用量留在私有账本，不提交到仓库。
 
 ### 有界 SSE 流式交互
 
@@ -135,7 +135,7 @@ CLI 的 OpenAI 兼容模式和 DeepSeek Anthropic 兼容模式均使用有界 SS
 
 SSE 保留 Python `urllib` 的 HTTP 代理 CONNECT 和 TLS 验证路径，调用线程用 `read1()` 读取，单个 watchdog 在取消或截止时间到达时 shutdown 当前响应 socket，并在退出时停止和 join。正常生成停顿不会触发短超时后重读，真正的读取超时直接终止；未使用 `select`。若响应不提供可用于有界读取的 socket，会明确报错。建连、代理 CONNECT、TLS 和响应头仍依赖网络栈超时，取消需等这些调用返回才能检查；这些阶段不能保证与响应体同样的主动硬截止边界。离线测试通过本机 CONNECT 代理和测试专用证书检查代理隧道、TLS 主机名与证书校验、正常停顿、分块头慢滴、中文、取消与截断；测试证书只为 `sse-fixture.invalid` 使用，客户端仍要求有效证书且开启主机名检查。普通 JSON `complete()` 仍走非流式 `read()`，其取消检查只在发送前和收到响应后执行。
 
-工具调用片段会先在内存中累积并校验，收到协议完整结束标记后才交给既有 Agent 循环；工具仍逐次审批。截断、无效或超限流不会返回不完整工具调用，因此不能触发该轮工具。当前支持 OpenAI 兼容的单候选文本、`reasoning_content` 和函数工具调用，以及 DeepSeek Anthropic 兼容的文本、签名 thinking 与标准工具块；不支持多模态、`logprobs`、未签名/未知增量和其他 Anthropic 内容块。Mock 默认离线且不使用 SSE；请求流式输出的 provider 若没有 `complete_streaming` 会明确拒绝。流式文本可能在完整状态尚未到达前已显示；取消或传输失败后不完整轮次不会写入会话，已显示片段不会自动撤回。控制字符会以可见转义显示，疑似凭据片段在终端输出前脱敏。单元与本机 fixture 测试不等于完整产品验收；本轮 DeepSeek Anthropic 兼容行为也没有在线验证。
+工具调用片段会先在内存中累积并校验，收到协议完整结束标记后才交给既有 Agent 循环；工具仍逐次审批。截断、无效或超限流不会返回不完整工具调用，因此不能触发该轮工具。当前支持 OpenAI 兼容的单候选文本、`reasoning_content` 和函数工具调用，以及 DeepSeek Anthropic 兼容的文本、签名 thinking 与标准工具块；不支持多模态、`logprobs`、未签名/未知增量和其他 Anthropic 内容块。Mock 默认离线且不使用 SSE；请求流式输出的 provider 若没有 `complete_streaming` 会明确拒绝。流式文本可能在完整状态尚未到达前已显示；取消或传输失败后不完整轮次不会写入会话，已显示片段不会自动撤回。控制字符会以可见转义显示，疑似凭据片段在终端输出前脱敏。单元与本机 fixture 测试不等于完整产品验收；Anthropic 在线证据目前只覆盖一次基础合成对话，工具轮次、thinking 和错误/取消事件仍未远端验证。
 
 ## 权限与边界
 
