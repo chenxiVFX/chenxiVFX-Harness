@@ -170,7 +170,7 @@
 - 有界 SSE 使用既有 UTF-8/SSE 解析器，接受 Anthropic `message_start`、content block、`message_delta` 与 `message_stop` 序列；支持 text、`tool_use` 和带签名 `thinking`。请求默认关闭 thinking；若端点仍返回 thinking，不显示且在内存工具上下文保留签名。多模态、redacted/document/search/MCP 内容与未知事件明确拒绝。终端控制字符和疑似凭据沿用既有显示脱敏。
 - DeepSeek 兼容指南未列出 SSE 事件细节或响应 usage 字段；实现按 Anthropic Messages 协议解释事件序列，并仅在返回标准 `input_tokens` / `output_tokens` 时记 usage。该两项均为协议推断，尚未用真实 DeepSeek Anthropic endpoint 验证；缺失/无效 usage 时按请求完整 `max_tokens` 保守预留，不报告缓存命中。远端兼容性仍是未实现验收项。
 - 回归只使用 loopback HTTP fixture 与合成消息，覆盖跨字节中文、固定 URL 路径和无凭据请求、签名 thinking/工具往返、现有文件审批、缺 usage 预留、重定向拒绝、不完整工具流不审批、未知内容/事件、响应大小限制、总时限和取消。未访问真实模型或读取/设置/输出凭据；测试不等于完整产品验收。
-- Linux / Python 3.12 本地离线回归：150 项，149 通过、1 项 Windows-only junction 跳过；loopback fixture 不发送 API 密钥或 Authorization。`compileall`、editable install、安装自检与 `git diff --check` 均通过。四矩阵 CI 在代码推送后记录；全程保持父任务账本 `1222 known + 629 unknown reserve` 不变，没有产生真实模型 usage。
+- Linux / Python 3.12 本地离线回归：150 项，149 通过、1 项 Windows-only junction 跳过；loopback fixture 不发送 API 密钥或 Authorization。`compileall`、editable install、安装自检与 `git diff --check` 均通过。Windows/Linux × Python 3.11/3.12 四矩阵 CI 全部成功（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39225734297)）；全程保持父任务账本 `1222 known + 629 unknown reserve` 不变，没有产生真实模型 usage。CI 和本地回归均不等同完整产品验收。
 
 ## 参考项目复用边界
 
