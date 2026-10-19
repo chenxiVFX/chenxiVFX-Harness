@@ -703,6 +703,29 @@ class AgentTests(unittest.TestCase):
                 agent.ask("你好", on_text_delta=lambda _fragment: None)
             self.assertEqual(agent.turns, [])
 
+    def test_failed_model_request_reserves_its_full_output_allowance(self) -> None:
+        class FailingStreamProvider:
+            label = "offline failure fixture"
+            model = "synthetic"
+
+            def complete_streaming(self, messages, tools, *, cancellation_event=None, max_tokens=2048, on_text_delta):
+                del messages, tools, cancellation_event, max_tokens, on_text_delta
+                raise ProviderStreamError("SSE 网络读取失败。")
+
+        with make_test_temp(prefix="failed-request-budget-") as temp:
+            agent = Agent(
+                FailingStreamProvider(),
+                Workspace(temp),
+                approve_action=lambda _request: self.fail("failed request must not reach approval"),
+                max_output_tokens=256,
+                max_provider_requests=2,
+            )
+            with self.assertRaises(ProviderStreamError):
+                agent.ask("离线 fixture 问题", on_text_delta=lambda _fragment: None)
+            self.assertEqual(agent.usage.requests, 1)
+            self.assertEqual(agent.usage.estimated_output_tokens, 128)
+            self.assertEqual(agent.turns, [])
+
     def test_tool_cycle_passes_result_and_requires_write_approval(self) -> None:
         with make_test_temp() as temp:
             workspace = Workspace(temp)
@@ -1020,6 +1043,27 @@ class CliTests(unittest.TestCase):
         self.assertNotIn(synthetic_secret, combined)
         self.assertNotIn("\x1b", combined)
         self.assertIn("\\x1b", combined)
+
+    def test_cli_stream_error_has_single_terminal_period(self) -> None:
+        class FailingStreamProvider:
+            label = "offline failure fixture"
+            model = "synthetic"
+            stream_timeout = 45.0
+
+            def complete_streaming(self, messages, tools, *, cancellation_event=None, max_tokens=2048, on_text_delta):
+                del messages, tools, cancellation_event, max_tokens, on_text_delta
+                raise ProviderStreamError("SSE 网络读取失败。")
+
+        with make_test_temp(prefix="cli-stream-error-") as temp:
+            args = SimpleNamespace(workspace=temp, provider="openai", model=None)
+            inputs = iter(["离线错误 fixture", "/退出"])
+            outputs: list[str] = []
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=FailingStreamProvider()):
+                result = run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append)
+        self.assertEqual(result, 0)
+        error_line = next(line for line in outputs if "模型流失败" in line)
+        self.assertIn("SSE 网络读取失败。未完成轮次", error_line)
+        self.assertNotIn("失败。。", error_line)
 
     def test_cli_previews_write_and_undo_before_each_confirmation(self) -> None:
         with make_test_temp() as temp:
@@ -1740,6 +1784,37 @@ class ProviderTests(unittest.TestCase):
         text = "\n".join(outputs)
         self.assertIn(DEEPSEEK_API_KEY_ENV, text)
         self.assertNotIn(test_key, text)
+
+    def test_configured_request_timeout_is_a_total_sse_bound(self) -> None:
+        test_key = "SYNTHETIC_TEST_KEY"
+        provider = provider_from_environment(
+            "openai",
+            "deepseek-flash",
+            environment={DEEPSEEK_API_KEY_ENV: test_key},
+            request_timeout_seconds=37,
+        )
+        self.assertIsInstance(provider, OpenAICompatibleProvider)
+        self.assertEqual(provider.timeout, 37)
+        self.assertEqual(provider.stream_timeout, 37)
+        self.assertEqual(provider.endpoint, "https://api.deepseek.com/chat/completions")
+
+    def test_subagent_provider_accepts_bounded_120_second_task_deadline(self) -> None:
+        provider = OpenAICompatibleProvider(
+            "http://127.0.0.1", "", "synthetic-child", timeout=120, stream_timeout=120
+        )
+        turn = AssistantTurn("完成", assistant_message={"role": "assistant", "content": "完成"})
+        with patch.object(provider, "complete_streaming", return_value=turn) as complete_streaming:
+            provider.complete_subagent(
+                [
+                    {"role": "system", "content": "你是只读子代理。"},
+                    {"role": "user", "content": "回答合成测试问题"},
+                ],
+                timeout_seconds=120,
+                max_output_tokens=32,
+                cancellation_event=threading.Event(),
+            )
+        self.assertEqual(complete_streaming.call_args.kwargs["timeout_seconds"], 120)
+        self.assertEqual(complete_streaming.call_args.kwargs["max_tokens"], 32)
 
     def test_openai_tool_turn_roundtrips_reasoning_content_without_live_http(self) -> None:
         provider = OpenAICompatibleProvider(

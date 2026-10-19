@@ -19,6 +19,12 @@ from .config import (
     validate_workspace_config,
 )
 from .providers import (
+    DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS,
+    DEFAULT_SUBAGENT_TIMEOUT_SECONDS,
+    MAX_MODEL_REQUEST_TIMEOUT_SECONDS,
+    MAX_SUBAGENT_TIMEOUT_SECONDS,
+    MIN_MODEL_REQUEST_TIMEOUT_SECONDS,
+    MIN_SUBAGENT_TIMEOUT_SECONDS,
     DEEPSEEK_API_KEY_ENV,
     ProviderCancelled,
     ProviderError,
@@ -54,6 +60,11 @@ def _safe_terminal_text(text: str) -> str:
         else:
             visible.append(char)
     return "".join(visible)
+
+
+def _safe_error_text(error: BaseException) -> str:
+    redacted = redact_likely_secrets(str(error))[0]
+    return _safe_terminal_text(redacted).rstrip("。.!? \t")
 
 
 class _StreamingSecretRedactor:
@@ -130,6 +141,44 @@ def _parse_integer_argument(value: str) -> int:
         raise argparse.ArgumentTypeError("必须是整数；为避免误泄露，输入值不会回显。") from None
 
 
+def _bounded_seconds(value: str, *, minimum: int, maximum: int, label: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{label}必须为 {minimum}–{maximum} 秒的整数。") from None
+    if not minimum <= seconds <= maximum:
+        raise argparse.ArgumentTypeError(f"{label}必须为 {minimum}–{maximum} 秒的整数。")
+    return seconds
+
+
+def _parse_request_timeout(value: str) -> int:
+    return _bounded_seconds(
+        value,
+        minimum=int(MIN_MODEL_REQUEST_TIMEOUT_SECONDS),
+        maximum=int(MAX_MODEL_REQUEST_TIMEOUT_SECONDS),
+        label="单请求总时限",
+    )
+
+
+def _parse_subagent_timeout(value: str) -> int:
+    return _bounded_seconds(
+        value,
+        minimum=int(MIN_SUBAGENT_TIMEOUT_SECONDS),
+        maximum=int(MAX_SUBAGENT_TIMEOUT_SECONDS),
+        label="子代理运行时限",
+    )
+
+
+def _parse_max_model_requests(value: str) -> int:
+    try:
+        attempts = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("每次提问模型请求数必须是 1–4 的整数。") from None
+    if not 1 <= attempts <= 4:
+        raise argparse.ArgumentTypeError("每次提问模型请求数必须是 1–4 的整数。")
+    return attempts
+
+
 def parse_references(
     text: str,
     workspace: Workspace,
@@ -200,6 +249,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="单次提问输出上限（默认 2048，范围 1–65536）；兼容提供商收到对应 max_tokens",
     )
     parser.add_argument(
+        "--max-model-requests",
+        type=_parse_max_model_requests,
+        default=4,
+        help="每次用户提问最多发出的模型请求数（1–4）；不会自动重试",
+        metavar="1–4",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=_parse_request_timeout,
+        default=int(DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS),
+        help="每个模型请求的总时限秒数（5–120）",
+    )
+    parser.add_argument(
+        "--subagent-timeout",
+        type=_parse_subagent_timeout,
+        default=int(DEFAULT_SUBAGENT_TIMEOUT_SECONDS),
+        help="每项子代理任务的运行时限秒数（5–120）；审批与排队等待不计入",
+    )
+    parser.add_argument(
         "--ignore-config",
         action="store_true",
         help="忽略工作区配置文件；用于文件损坏时安全恢复，环境变量和命令行仍生效",
@@ -237,6 +305,7 @@ def _help_text() -> str:
   /子代理 列表 [编号]     查看子任务状态和共享预算
   /子代理 取消 <编号>     请求取消排队中或运行中的子任务
   /子代理 收取 [编号|全部] 将完成结果作为不可信上下文加入主对话
+  /子代理 时限 <5–120>    设置后续子任务运行时限（审批/排队不计，最多 120 秒）
   /撤销              预览并恢复最近一次 Harness 文件写入
   /退出              结束会话
 
@@ -311,6 +380,9 @@ def run_console(
             startup_config.provider,
             startup_config.model,
             base_url_override=startup_config.base_url,
+            request_timeout_seconds=getattr(
+                args, "request_timeout", DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS
+            ),
         )
     except (ConfigError, WorkspaceError, ProviderError) as exc:
         output(f"错误：{exc}")
@@ -326,8 +398,13 @@ def run_console(
         approve_action=approve_action,
         token_budget=startup_config.token_budget,
         max_output_tokens=startup_config.max_output_tokens,
+        max_provider_requests=getattr(args, "max_model_requests", 4),
     )
-    subagent_manager = SubagentManager(provider, workspace)
+    subagent_manager = SubagentManager(
+        provider,
+        workspace,
+        timeout_seconds=getattr(args, "subagent_timeout", DEFAULT_SUBAGENT_TIMEOUT_SECONDS),
+    )
     session_store = SessionStore(workspace)
     plan_store = PlanStore(workspace)
     try:
@@ -339,6 +416,10 @@ def run_console(
         output(f"计划恢复失败：{exc}。本次不会自动执行或覆盖计划存档。")
     output(f"chenxiVFX Harness v0.5.0 | 提供商：{_safe_terminal_text(str(provider.label))}")
     output(f"工作区：{_safe_terminal_text(str(workspace.root))}")
+    output(
+        f"每请求最多 {agent.max_provider_requests} 次；请求总时限 {getattr(provider, 'stream_timeout', DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS):g} 秒；"
+        f"子代理运行时限 {subagent_manager.timeout_seconds:g} 秒（审批与执行前排队不计）。"
+    )
     output("输入 /帮助 查看命令。默认使用离线模拟模型。")
     sse_streaming = callable(getattr(provider, "complete_streaming", None))
     if sse_streaming:
@@ -396,6 +477,8 @@ def run_console(
                     f"上下文预算：{startup_config.token_budget}（{source['token_budget']}）\n"
                     f"输出上限：{startup_config.max_output_tokens}（{source['max_output_tokens']}）\n"
                     f"本轮预算：{agent.token_budget}；本轮输出上限：{agent.max_output_tokens} tokens\n"
+                    f"每次提问最多模型请求：{agent.max_provider_requests}；请求总时限：{getattr(provider, 'stream_timeout', DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS):g} 秒\n"
+                    f"新子任务运行时限：{subagent_manager.timeout_seconds:g} 秒（审批与执行前排队不计）\n"
                     f"OpenAI 密钥变量：{DEEPSEEK_API_KEY_ENV}；仅 OpenAI 模式从环境读取，不展示或写入配置\n"
                     "当前只支持 mock 和 DeepSeek OpenAI 兼容模式；Anthropic 未实现。Shell：禁用"
                 )
@@ -846,6 +929,17 @@ def run_console(
         if command in {"/子代理", "/delegate"}:
             subcommand, _, subargument = argument.strip().partition(" ")
             normalized_subcommand = subcommand.casefold()
+            if normalized_subcommand in {"时限", "timeout"}:
+                try:
+                    seconds = _parse_subagent_timeout(subargument.strip())
+                    subagent_manager.set_timeout(seconds)
+                except (argparse.ArgumentTypeError, DelegationPlanError):
+                    output("用法：/子代理 时限 <5–120 的整数秒>；只影响之后提交的任务。")
+                    continue
+                output(
+                    f"后续子任务运行时限设为 {seconds} 秒；已提交任务不变，审批与执行前排队不计入时限。"
+                )
+                continue
             if normalized_subcommand in {"列表", "list", "状态", "status"}:
                 requested_id = subargument.strip().upper()
                 snapshots = subagent_manager.snapshots()
@@ -855,7 +949,7 @@ def run_console(
                     output("没有匹配的子任务。" if requested_id else "当前没有子任务。")
                 else:
                     lines = [
-                        f"{item.task_id} [{item.status}] {_safe_terminal_text(item.task)}"
+                        f"{item.task_id} [{item.status}] {_safe_terminal_text(item.task)}（限时 {item.timeout_seconds:g}s）"
                         + (f"（输出 {item.result.output_tokens} tokens）" if item.result else "")
                         + ("（已收取）" if item.collected else "")
                         for item in snapshots
@@ -948,7 +1042,11 @@ def run_console(
                 output("已取消子代理审批；没有启动未确认的任务。")
                 continue
             for item in submitted:
-                output(f"{item.task_id}：{item.status}；任务已逐项审批，结果可用 /子代理 列表 查看。")
+                output(
+                    f"{item.task_id}：{item.status}；时限 {item.timeout_seconds:g} 秒，"
+                    "从该任务首个模型请求开始计时，逐项审批与执行前排队不计；"
+                    "结果可用 /子代理 列表 查看。"
+                )
             output(subagent_manager.budget_status())
             continue
         if command in {"/撤销", "/undo"}:
@@ -1003,13 +1101,13 @@ def run_console(
         except ProviderStreamError as exc:
             end_stream_line()
             output(
-                f"模型流失败：{exc}。未完成轮次不会写入会话；未完成的工具调用不会执行。"
+                f"模型流失败：{_safe_error_text(exc)}。未完成轮次不会写入会话；未完成的工具调用不会执行。"
                 "前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。"
             )
             continue
         except ProviderError as exc:
             end_stream_line()
-            output(f"模型请求失败：{exc}。前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。")
+            output(f"模型请求失败：{_safe_error_text(exc)}。前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。")
             continue
         except ProviderCancelled:
             end_stream_line()

@@ -150,25 +150,33 @@ class Agent:
                     (remaining + requests_remaining - 1) // requests_remaining,
                 )
                 estimated_input = estimate_payload_tokens(self.messages, TOOL_SCHEMAS)
-                self.usage.record_request(estimated_input)
-                if on_text_delta is None:
-                    response = self.provider.complete(
-                        self.messages,
-                        TOOL_SCHEMAS,
-                        cancellation_event=cancellation_event,
-                        max_tokens=request_max_tokens,
-                    )
-                else:
+                complete_streaming = None
+                if on_text_delta is not None:
                     complete_streaming = getattr(self.provider, "complete_streaming", None)
                     if not callable(complete_streaming):
                         raise ProviderError("当前提供商不支持 SSE 流式响应。")
-                    response = complete_streaming(
-                        self.messages,
-                        TOOL_SCHEMAS,
-                        cancellation_event=cancellation_event,
-                        max_tokens=request_max_tokens,
-                        on_text_delta=on_text_delta,
-                    )
+                self.usage.record_request(estimated_input)
+                try:
+                    if complete_streaming is None:
+                        response = self.provider.complete(
+                            self.messages,
+                            TOOL_SCHEMAS,
+                            cancellation_event=cancellation_event,
+                            max_tokens=request_max_tokens,
+                        )
+                    else:
+                        response = complete_streaming(
+                            self.messages,
+                            TOOL_SCHEMAS,
+                            cancellation_event=cancellation_event,
+                            max_tokens=request_max_tokens,
+                            on_text_delta=on_text_delta,
+                        )
+                except BaseException:
+                    # A failed or cancelled request may have consumed its full
+                    # provider allowance; reserve it because no usage is available.
+                    self.usage.record_response(request_max_tokens, None)
+                    raise
                 self._raise_if_cancelled(cancellation_event)
                 if not isinstance(response, AssistantTurn):
                     raise ProviderError("模型响应格式无效。")

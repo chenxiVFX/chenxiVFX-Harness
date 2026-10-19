@@ -392,6 +392,7 @@ class CompressionTests(unittest.TestCase):
             outputs: list[str] = []
             prompts: list[str] = []
             inputs = iter([
+                "/子代理 时限 30",
                 "/子代理 提交 --读取 safe.txt -- 检查获批文件",
                 "是",
                 "/子代理 列表",
@@ -408,6 +409,8 @@ class CompressionTests(unittest.TestCase):
             combined = "\n".join(outputs)
             self.assertEqual(rc, 0)
             self.assertIn("read_file: safe.txt", combined)
+            self.assertIn("后续子任务运行时限设为 30 秒", combined)
+            self.assertIn("运行总时限 30 秒", combined)
             self.assertTrue(any("确认授权这些隔离子任务" in prompt for prompt in prompts))
             self.assertIn("S01", combined)
 
@@ -853,6 +856,66 @@ class DelegationTests(unittest.TestCase):
         locked_manager = SubagentManager(provider)
         with self.assertRaises(DelegationPlanError):
             locked_manager.submit(locked_plan, approve_action=lambda _request: self.fail("不应请求审批"))
+
+    def test_subagent_runtime_is_user_configurable_bounded_and_starts_after_approval(self) -> None:
+        from cvfx_harness.subagents import (
+            DEFAULT_CHILD_TIMEOUT_SECONDS,
+            MAX_CHILD_TIMEOUT_SECONDS,
+            DelegationPlanError,
+            SubagentManager,
+            build_delegation_plan,
+        )
+
+        class TimeoutRecordingProvider:
+            def __init__(self):
+                self.received_timeouts = []
+
+            def complete_subagent(self, messages, *, timeout_seconds, max_output_tokens, cancellation_event):
+                del messages, max_output_tokens, cancellation_event
+                self.received_timeouts.append(timeout_seconds)
+                return AssistantTurn("完成", assistant_message={"role": "assistant", "content": "完成"})
+
+        provider = TimeoutRecordingProvider()
+        manager = SubagentManager(provider)
+        self.assertEqual(manager.timeout_seconds, DEFAULT_CHILD_TIMEOUT_SECONDS)
+        self.assertEqual(manager.set_timeout(15), 15)
+        approval_previews = []
+
+        def slow_approval(request):
+            approval_previews.append(request.diff)
+            time.sleep(0.05)
+            return True
+
+        submitted = manager.submit(build_delegation_plan("确认审批不耗运行时限"), approve_action=slow_approval)
+        self.assertEqual(submitted[0].timeout_seconds, 15)
+        self.assertIn("15 秒", approval_previews[0])
+        self.assertIn("审批和执行前排队不计入", approval_previews[0])
+        deadline = time.monotonic() + 2
+        while manager.snapshots()[0].status not in {"completed", "failed", "timed_out"} and time.monotonic() < deadline:
+            threading.Event().wait(0.01)
+        self.assertEqual(manager.snapshots()[0].status, "completed")
+        self.assertEqual(len(provider.received_timeouts), 1)
+        self.assertGreater(provider.received_timeouts[0], 14.9)
+        self.assertIn("每项运行时限 15 秒", manager.budget_status())
+        with self.assertRaises(DelegationPlanError):
+            manager.set_timeout(MAX_CHILD_TIMEOUT_SECONDS + 1)
+
+        from cvfx_harness.cli import build_parser
+
+        parsed = build_parser().parse_args([
+            "--provider", "mock", "--subagent-timeout", "90",
+            "--request-timeout", "45", "--max-model-requests", "2",
+        ])
+        self.assertEqual(parsed.subagent_timeout, 90)
+        self.assertEqual(parsed.request_timeout, 45)
+        self.assertEqual(parsed.max_model_requests, 2)
+        for option, value in (
+            ("--subagent-timeout", "121"),
+            ("--request-timeout", "121"),
+            ("--max-model-requests", "5"),
+        ):
+            with self.assertRaises(SystemExit):
+                build_parser().parse_args([option, value])
 
     def test_subagent_second_round_cannot_start_more_read_calls(self) -> None:
         from cvfx_harness.subagents import SubagentManager, build_delegation_plan

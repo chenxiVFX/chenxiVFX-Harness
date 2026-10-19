@@ -59,7 +59,7 @@ OpenAI 兼容 CLI 通过 `complete_streaming` 使用 `text/event-stream`。SSE �
 - 普通 Python 进程不能提供 OS 级沙箱。若未来加入 shell，须先设计并实测工作区隔离，不能把路径检查误称为进程沙箱。
 - 子代理通过 CLI 明确创建；每项任务启动前都展示任务文本和只读路径并单独审批。Mock 与 OpenAI provider 都使用同一 `complete_subagent` 受限入口；OpenAI 子代理只发送独立的子任务消息和该任务授权范围内返回的读取结果，不复制父上下文。Provider 认证仍只走既有 HTTPS Authorization header。
 - 默认不提供文件工具。提交时可预授权最多 4 个现存工作区相对路径：文件对应 `read_file`，目录对应 `list_directory`；调用前再次通过 `Workspace` 校验，路径必须与授权路径完全匹配。工具 schema 过滤掉 `write_file`，首轮最多 2 个只读调用，第二轮只用于最终答复；没有 shell、递归委派或任意代码入口。子代理只执行最多 2 轮模型请求，深度为 0。
-- 每会话最多 3 项，最多 2 项并发；单项任务最多 240 字符，单轮估算输入最多 512 tokens，全会话最多 3072 估算输入 tokens，每项输出最多 256 tokens，全会话保留输出上限最多 768 tokens，任务时限 5 秒。每个子代理有独立取消事件；排队任务可即时取消，运行任务在 provider 检查点中止。超时、取消、失败、拒绝和预算耗尽为不同终态。
+- 每会话最多 3 项，最多 2 项并发；单项任务最多 240 字符，单请求估算输入最多 512 tokens，全会话最多 3072 估算输入 tokens，每项输出最多 256 tokens，全会话保留输出上限最多 768 tokens。子代理总运行时限默认 60 秒，可设为 5–120 秒，从该任务首个 provider 请求开始；逐项审批和执行前排队不计入。OpenAI 每次 SSE 请求默认受 45 秒总时限限制，可配置为 5–120 秒；时限从建连开始，响应读取期间每 250 ms 检查取消。任务总体 deadline 跨模型/工具轮次共享，每任务最多 2 轮。超时、取消、失败、拒绝和预算耗尽为不同终态。
 - 结果先做疑似凭据脱敏，再 JSON 编码并转义可能伪造的封装标记。用户用 `收取` 后，结果以 `kind=subagent`、`persistable=False` 的 user 消息附加到父 Agent；不自动解析结果内的 `@` 文件引用。父会话的普通引用流程仍会对每个读取请求独立审批，子代理审批不等同父代理文件审批。
 - 非流式 OpenAI 请求在请求前和响应后检查取消；CLI 的 SSE 响应体采用短 socket 读取超时并轮询取消，建连/响应头等待仍由 provider timeout 约束。429 不自动重试；记录 provider 返回的 Token 用量，不估算货币成本，也不把价格写入代码。
 - OpenAI 兼容 CLI 只在该 provider 启动时读取 `DEEPSEEK_API_KEY`；环境密钥限定 HTTPS `api.deepseek.com:443`，不能通过 `HARNESS_BASE_URL` 转发到其他主机。`/配置` 不显示值，密钥只作为 Bearer 认证头，不加入对话、存档或 Harness 日志。Mock 不查询密钥变量。

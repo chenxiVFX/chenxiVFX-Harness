@@ -9,10 +9,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .providers import (
+    DEFAULT_SUBAGENT_TIMEOUT_SECONDS,
+    MAX_SUBAGENT_TIMEOUT_SECONDS,
+    MIN_SUBAGENT_TIMEOUT_SECONDS,
     MAX_SUBAGENT_INPUT_TOKENS,
     MAX_SUBAGENT_OUTPUT_TOKENS,
     MAX_SUBAGENT_TASK_CHARS,
-    MAX_SUBAGENT_TIMEOUT_SECONDS,
     MAX_SUBAGENT_TOOL_CALLS_PER_TURN,
     MAX_SUBAGENT_TURNS,
     AssistantTurn,
@@ -42,7 +44,9 @@ MAX_CHILD_TOOL_CALLS_PER_TURN = MAX_SUBAGENT_TOOL_CALLS_PER_TURN
 MAX_SUBAGENT_READ_PATHS = 4
 DEFAULT_CHILD_INPUT_BUDGET = MAX_SUBAGENT_INPUT_TOKENS
 DEFAULT_CHILD_OUTPUT_BUDGET = MAX_SUBAGENT_OUTPUT_TOKENS
-DEFAULT_CHILD_TIMEOUT_SECONDS = MAX_SUBAGENT_TIMEOUT_SECONDS
+DEFAULT_CHILD_TIMEOUT_SECONDS = DEFAULT_SUBAGENT_TIMEOUT_SECONDS
+MIN_CHILD_TIMEOUT_SECONDS = MIN_SUBAGENT_TIMEOUT_SECONDS
+MAX_CHILD_TIMEOUT_SECONDS = MAX_SUBAGENT_TIMEOUT_SECONDS
 MAX_SHARED_INPUT_BUDGET = MAX_SESSION_TASKS * MAX_CHILD_TURNS * DEFAULT_CHILD_INPUT_BUDGET
 MAX_SHARED_OUTPUT_BUDGET = MAX_SESSION_TASKS * DEFAULT_CHILD_OUTPUT_BUDGET
 MAX_CHILD_OUTPUT_CHARS = 8192
@@ -99,6 +103,7 @@ class SubagentTaskView:
     status: str
     input_tokens: int
     output_limit: int
+    timeout_seconds: float
     collected: bool
     result: SubagentResult | None
 
@@ -118,6 +123,7 @@ class _ManagedTask:
     status: str
     input_tokens: int
     output_limit: int
+    timeout_seconds: float
     read_scopes: tuple[tuple[str, str], ...] = ()
     cancellation_event: threading.Event = field(default_factory=threading.Event)
     result: SubagentResult | None = None
@@ -410,14 +416,33 @@ class SubagentManager:
             raise DelegationPlanError("子代理任务数和并发上限不能由调用方提高或修改。")
         if input_budget != DEFAULT_CHILD_INPUT_BUDGET or output_budget != DEFAULT_CHILD_OUTPUT_BUDGET:
             raise DelegationPlanError("子代理单项预算不能由调用方提高或修改。")
-        if timeout_seconds != DEFAULT_CHILD_TIMEOUT_SECONDS:
-            raise DelegationPlanError("子代理时限不能由调用方提高或修改。")
+        self._validate_timeout(timeout_seconds)
         self.provider = provider
         self.workspace = workspace
+        self.timeout_seconds = float(timeout_seconds)
         self._records: list[_ManagedTask] = []
         self._lock = threading.RLock()
         self._shared_input_used = 0
         self._shared_output_reserved = 0
+
+    @staticmethod
+    def _validate_timeout(timeout_seconds: float) -> float:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not MIN_CHILD_TIMEOUT_SECONDS <= timeout_seconds <= MAX_CHILD_TIMEOUT_SECONDS
+        ):
+            raise DelegationPlanError(
+                f"子代理运行时限必须为 {int(MIN_CHILD_TIMEOUT_SECONDS)}–{int(MAX_CHILD_TIMEOUT_SECONDS)} 秒。"
+            )
+        return float(timeout_seconds)
+
+    def set_timeout(self, timeout_seconds: float) -> float:
+        """Set the bounded runtime for future submissions; running tasks keep their limit."""
+        timeout = self._validate_timeout(timeout_seconds)
+        with self._lock:
+            self.timeout_seconds = timeout
+        return timeout
 
     def submit(
         self,
@@ -457,7 +482,14 @@ class SubagentManager:
                     [schema for schema in TOOL_SCHEMAS if schema["function"]["name"] in {op for _, op in read_scopes}],
                 )
                 record = _ManagedTask(
-                    task_id, index, task, "authorizing", input_tokens, DEFAULT_CHILD_OUTPUT_BUDGET, read_scopes
+                    task_id,
+                    index,
+                    task,
+                    "authorizing",
+                    input_tokens,
+                    DEFAULT_CHILD_OUTPUT_BUDGET,
+                    self.timeout_seconds,
+                    read_scopes,
                 )
                 self._records.append(record)
                 prepared.append((record, input_tokens))
@@ -477,7 +509,12 @@ class SubagentManager:
                             record.index, record.task, "budget_exhausted", input_tokens, record.output_limit
                         )
                     continue
-                approved = authorize_subagent_plan((record.task,), approve_action, read_scopes=read_scopes)
+                approved = authorize_subagent_plan(
+                    (record.task,),
+                    approve_action,
+                    read_scopes=read_scopes,
+                    timeout_seconds=record.timeout_seconds,
+                )
                 with self._lock:
                     if record.status == "cancelled":
                         continue
@@ -592,7 +629,8 @@ class SubagentManager:
             return (
                 f"子任务 {len(self._records)}/{MAX_SESSION_TASKS}；并发 {active}/{MAX_CONCURRENT_CHILDREN}；"
                 f"已使用输入 {self._shared_input_used}/{MAX_SHARED_INPUT_BUDGET}、"
-                f"输出上限 {self._shared_output_reserved}/{MAX_SHARED_OUTPUT_BUDGET} tokens"
+                f"输出上限 {self._shared_output_reserved}/{MAX_SHARED_OUTPUT_BUDGET} tokens；"
+                f"每项运行时限 {self.timeout_seconds:g} 秒（审批与执行前排队不计）"
             )
 
     def _resolve_read_scopes(self, read_paths: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
@@ -668,7 +706,7 @@ class SubagentManager:
                 self.provider,
                 input_budget=DEFAULT_CHILD_INPUT_BUDGET,
                 output_budget=record.output_limit,
-                timeout_seconds=DEFAULT_CHILD_TIMEOUT_SECONDS,
+                timeout_seconds=record.timeout_seconds,
                 cancellation_event=record.cancellation_event,
                 workspace=self.workspace,
                 read_scopes=record.read_scopes,
@@ -708,6 +746,7 @@ class SubagentManager:
             record.status,
             record.input_tokens,
             record.output_limit,
+            record.timeout_seconds,
             record.collected,
             record.result,
         )
@@ -729,8 +768,14 @@ def run_bounded_subagents(
         raise DelegationPlanError("子代理输入预算不得超过本地上限。")
     if not 1 <= output_budget <= DEFAULT_CHILD_OUTPUT_BUDGET:
         raise DelegationPlanError("子代理输出预算不得超过本地上限。")
-    if not 0 < timeout_seconds <= DEFAULT_CHILD_TIMEOUT_SECONDS:
-        raise DelegationPlanError("子代理时限不得超过本地上限。")
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not MIN_CHILD_TIMEOUT_SECONDS <= timeout_seconds <= MAX_CHILD_TIMEOUT_SECONDS
+    ):
+        raise DelegationPlanError(
+            f"子代理运行时限必须为 {int(MIN_CHILD_TIMEOUT_SECONDS)}–{int(MAX_CHILD_TIMEOUT_SECONDS)} 秒。"
+        )
     events = cancellation_events or [threading.Event() for _ in plan.tasks]
     if len(events) != len(plan.tasks) or any(not isinstance(event, threading.Event) for event in events):
         raise DelegationPlanError("每个子代理必须有一个独立取消事件。")
@@ -752,7 +797,9 @@ def run_bounded_subagents(
             results.append(SubagentResult(index, task, "budget_exhausted", "", estimated_input, 0))
             continue
         try:
-            approved = authorize_subagent_plan((task,), approve_action)
+            approved = authorize_subagent_plan(
+                (task,), approve_action, timeout_seconds=timeout_seconds
+            )
         except WorkspaceError as exc:
             raise DelegationPlanError(str(exc)) from None
         if not approved:

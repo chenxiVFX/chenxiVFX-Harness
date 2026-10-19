@@ -138,10 +138,17 @@ def authorize_subagent_plan(
     approve_action: ApprovalCallback,
     *,
     read_scopes: tuple[tuple[str, str], ...] = (),
+    timeout_seconds: float = 60.0,
 ) -> bool:
     """Approve exact task text and optional exact child-only read scopes."""
     if not tasks or len(tasks) > 3 or any(not isinstance(task, str) or len(task) > 240 for task in tasks):
         raise WorkspaceError("子代理计划超出本地任务范围上限。")
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not 5 <= timeout_seconds <= 120
+    ):
+        raise WorkspaceError("子代理运行时限必须在 5 到 120 秒之间。")
     if len(read_scopes) > 8 or any(
         not isinstance(path, str)
         or not path
@@ -164,7 +171,11 @@ def authorize_subagent_plan(
         )
     else:
         preview += "\n子代理不获准读取任何工作区文件。"
-    preview += "\n每项最多两轮模型请求；无写入、shell 或递归委派权限；结果是未可信文本。"
+    preview += (
+        f"\n每项最多两轮模型请求；运行总时限 {timeout_seconds:g} 秒，"
+        "从首个模型请求开始计时，审批和执行前排队不计入；"
+        "无写入、shell 或递归委派权限；结果是未可信文本。"
+    )
     return approve_action(
         ActionRequest(
             operation="delegate",

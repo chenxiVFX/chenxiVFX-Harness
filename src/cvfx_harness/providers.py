@@ -31,7 +31,12 @@ MAX_SUBAGENT_TURNS = 2
 MAX_SUBAGENT_TOOL_CALLS_PER_TURN = 2
 MAX_SUBAGENT_INPUT_TOKENS = 512
 MAX_SUBAGENT_OUTPUT_TOKENS = 256
-MAX_SUBAGENT_TIMEOUT_SECONDS = 5.0
+MIN_SUBAGENT_TIMEOUT_SECONDS = 5.0
+DEFAULT_SUBAGENT_TIMEOUT_SECONDS = 60.0
+MAX_SUBAGENT_TIMEOUT_SECONDS = 120.0
+MIN_MODEL_REQUEST_TIMEOUT_SECONDS = 5.0
+DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS = 45.0
+MAX_MODEL_REQUEST_TIMEOUT_SECONDS = MAX_STREAM_DURATION_SECONDS
 _URL_CREDENTIAL_MARKER = re.compile(
     r"(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|authorization)(?:=|%3d)"
 )
@@ -310,6 +315,12 @@ class OpenAICompatibleProvider:
         timeout: float = 45.0,
         stream_timeout: float = MAX_STREAM_DURATION_SECONDS,
     ) -> None:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not 0 < timeout <= MAX_MODEL_REQUEST_TIMEOUT_SECONDS
+        ):
+            raise ProviderError("模型请求总时限必须在 0 到 120 秒之间。")
         if (
             isinstance(stream_timeout, bool)
             or not isinstance(stream_timeout, (int, float))
@@ -873,6 +884,7 @@ def provider_from_environment(
     *,
     api_key_override: str | None = None,
     base_url_override: str | None = None,
+    request_timeout_seconds: float = DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS,
     environment: Mapping[str, str] | None = None,
 ) -> Provider:
     """从当前进程配置创建提供商；测试可传入隔离的配置映射。"""
@@ -897,5 +909,7 @@ def provider_from_environment(
             base_url=base_url,
             api_key=api_key,
             model=model,
+            timeout=request_timeout_seconds,
+            stream_timeout=request_timeout_seconds,
         )
     raise ProviderError(f"未知模型提供商：{provider_name}")
