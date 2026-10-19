@@ -8,7 +8,7 @@
 | 工作区模型配置与启动优先级 | 已实现 / 离线可测 | `.harness/config/settings.json` 仅存非敏感设置；默认 < 工作区配置 < 环境变量 < CLI；DeepSeek 凭据仍只从环境读取 |
 | Mock provider | 已实现 / 离线可测 | 默认离线，不发请求、不读密钥 |
 | OpenAI 兼容 Chat Completions | 已实现 / 离线可测 | stdlib HTTP、`reasoning_content` 工具往返、usage、`max_tokens` 上限、429 不重试、脱敏错误；CLI 默认 SSE 流式输出，具备大小/时限/事件边界和取消检查 |
-| 有界 SSE 中文流式交互 | 已实现 / 离线可测 | UTF-8 跨块、CRLF/LF 与多行 data；最多 4 MiB 响应、2 MiB 助手文本、512 KiB 行/事件、16,384 个事件、120 秒；工具调用累积并完整校验后沿用 Agent 审批循环；未完成流不执行工具 |
+| 有界 SSE 中文流式交互 | 已实现 / 离线可测 | UTF-8 跨块、CRLF/LF 与多行 data；最多 4 MiB 响应、2 MiB 助手文本、512 KiB 行/事件、16,384 个事件、120 秒；固定安全分类/阶段/HTTP 状态/字节数/耗时；loopback CONNECT/TLS 代理路径有合成 fixture；工具调用累积并完整校验后沿用 Agent 审批循环；未完成流不执行工具 |
 | DeepSeek API key 读取 | 已实现 / 离线可测 | OpenAI 模式读取 `DEEPSEEK_API_KEY`，只允许 HTTPS `api.deepseek.com:443`；Mock 不查询该值，配置页不显示。Network secret 的基本对话与合成目录只读工具闭环均已有限在线验证；其他工具与完整产品流程仍未验收 |
 | 受限真实 DeepSeek smoke | 已完成（有限验收） | 独立新环境通过 `api.deepseek.com:443` 的网络 secret 代理，以 `deepseek-flash` 发起一次、128-token 上限、无工具的合成请求；HTTP 200，答复“连接成功”，usage 输入 36 / 输出 43 / 总计 79。只证明认证与基本对话通路，不证明多轮工具闭环 |
 | 受限真实目录工具闭环 | 已完成（有限验收） | 两次 `api.deepseek.com:443` / `deepseek-flash` 请求，单次 `max_tokens=256`、合计上限 512；仅批准合成 `synthetic/hello.txt` 的只读列表，HTTP 200×2，usage 输入 1022 / 输出 82 / 总计 1104；不代表完整产品通过 |
@@ -136,6 +136,16 @@
 - 子代理共享输入预算实际按本地 token 估算在每次发送前预留，跨任务上限 3072；失败调用仍保留输入预留。输出上限在获批时每项预留 256、总计 768；provider 有 usage 时用其 completion 数校验，usage 缺失时按完整输出额度保守保留。它不是精确的 provider tokenizer 计费。
 - 受限真实验收只尝试了 1 个 `deepseek-flash` SSE 请求，`api.deepseek.com:443`、`max_tokens=128`、单请求总时限 45 秒。CLI 收到“SSE 网络读取失败”，没有获得 usage；按本地输入估算 501 加 128 输出上限，保守记账 629 / 20,000，剩余 19,371。按 usage 缺失即停止的规则，没有重试或继续发出文件/子代理请求；因此中文流式答复、合成文件写回与字节读回、真实 provider 子代理均未通过验收。此次无法判定远端实际扣费或故障根因；临时工作区已清理。未读取或输出密钥值。
 - Linux / Python 3.12 本地离线回归：121 项，120 通过、1 项 Windows-only junction 跳过，另有 70 个子测试通过；包括时限、审批不计时、失败输出额度预留、取消与 SSE 超时 fixture。安装自检、UTF-8 CLI Mock、自测与 `git diff --check` 通过。结果不等同完整产品验收。
+
+## SSE 网络诊断与 CONNECT/TLS 离线回归（2026-10-19）
+
+- 对照普通 JSON `complete()` 后确认：SSE 读取额外依赖 urllib 响应的 `fp.raw._sock`，并以短 socket 超时和 `read1()` 轮询取消；普通路径只用 `read()`。本轮保留系统代理 CONNECT 与标准 TLS 校验，不使用 `select`、不绕过证书、不改网络设置。
+- 增加固定安全诊断字段：分类、阶段、HTTP 状态、收到的响应字节数和耗时。区分建连超时、读取超时、解析错误、缺少结束标记、协议拒绝、TLS 错误、对端断连、连接重置和 HTTP 状态；不包含异常原文、头、URL、响应体或用户内容。成功响应走上下文关闭，HTTP 错误显式关闭；取消与错误路径增加关闭验证。
+- 本机合成夹具包含 HTTP/SSE 分块、慢读、截断、CONNECT 隧道和 HTTPS SSE origin。测试专用证书只由 fixture trust store 信任，且主机名校验及 `CERT_REQUIRED` 保持启用；无 API 凭据或真实服务请求。
+- fixture 找到并修复一处可复现的分类 bug：解析分块后进入下一次读取时，阶段标签未从 `sse_parse` 复位，因而总时限耗尽会被误报为解析错误。此前那次真实 SSE 失败没有阶段诊断，本轮未重放，所以它的根因仍未知。
+- 工具兼容范围：流完整校验后继续走现有 Agent 工具审批循环；未完成/错误 SSE 不会把部分工具调用交给 Agent。Mock、无流式接口 provider、多候选、多模态、logprobs 和未知增量仍明确拒绝。单元测试和本机代理 fixture 不等同完整产品验收。
+- Debian / Python 3.12 本地离线回归：125 项，124 通过、1 项 Windows-only junction 跳过；editable install、安装自检、`compileall` 与 `git diff --check` 通过。Windows/Linux × Python 3.11/3.12 矩阵会在推送后记录。
+- 本轮及后续离线开发没有真实 API 请求。沿用用户提供的账本：已知实际用量 1,222，未明失败请求保留 629 预留，预算占用 1,851 / 2,000,000；失败请求的真实费用仍未知，本分配余量 19,371。
 
 ## 参考项目复用边界
 

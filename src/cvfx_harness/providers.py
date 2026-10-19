@@ -4,6 +4,8 @@ import http.client
 import json
 import os
 import re
+import socket
+import ssl
 import threading
 import time
 import unicodedata
@@ -52,6 +54,70 @@ class ProviderCancelled(RuntimeError):
 
 class ProviderStreamError(ProviderError):
     """A bounded SSE transport or protocol error safe to show in the CLI."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str | None = None,
+        diagnostics: StreamDiagnostics | None = None,
+    ) -> None:
+        self.safe_message = message
+        self.category = category
+        self.diagnostics = diagnostics
+        if diagnostics is not None:
+            http_status = diagnostics.http_status if diagnostics.http_status is not None else "无"
+            message = (
+                f"{message}（分类={diagnostics.category}；阶段={diagnostics.stage}；"
+                f"HTTP={http_status}；已收={diagnostics.received_bytes} bytes；"
+                f"耗时={diagnostics.elapsed_ms} ms）"
+            )
+        super().__init__(message)
+
+
+@dataclass(frozen=True, slots=True)
+class StreamDiagnostics:
+    category: str
+    stage: str
+    http_status: int | None
+    received_bytes: int
+    elapsed_ms: int
+
+
+def _stream_transport_category(error: BaseException, stage: str) -> str:
+    """Map network exceptions to a fixed label without exposing exception text."""
+    reason: BaseException = error
+    if isinstance(error, urllib.error.URLError) and isinstance(error.reason, BaseException):
+        reason = error.reason
+    if isinstance(reason, TimeoutError):
+        return "connect_timeout" if stage in {"connect", "response_headers"} else "read_timeout"
+    if isinstance(reason, ssl.SSLError):
+        return "tls_failure"
+    if isinstance(reason, http.client.RemoteDisconnected):
+        return "remote_disconnect"
+    if isinstance(reason, ConnectionResetError):
+        return "connection_reset"
+    if isinstance(reason, socket.gaierror):
+        return "name_resolution_failure"
+    return "transport_error"
+
+
+def _stream_error_category(error: ProviderStreamError, stage: str) -> str:
+    if error.category is not None:
+        return error.category
+    if "超过" in error.safe_message and "上限" in error.safe_message:
+        return "size_limit"
+    if stage == "protocol" or stage == "response_headers":
+        return "protocol_rejection"
+    if stage == "completion":
+        return "missing_end_marker"
+    if stage == "sse_parse":
+        return "parse_error"
+    if "总时限" in error.safe_message:
+        return "connect_timeout" if stage == "connect" else "read_timeout"
+    if "完成标记前结束" in error.safe_message:
+        return "missing_end_marker"
+    return "transport_error"
 
 
 class _SSEParser:
@@ -478,7 +544,7 @@ class OpenAICompatibleProvider:
                 try:
                     on_text_delta(value)
                 except Exception:
-                    raise ProviderStreamError("无法显示 SSE 流式文本。") from None
+                    raise ProviderStreamError("无法显示 SSE 流式文本。", category="local_output_error") from None
 
         def collect_event(event_name: str, data: str) -> bool:
             nonlocal usage_value, finish_reason
@@ -495,7 +561,7 @@ class OpenAICompatibleProvider:
             try:
                 chunk = json.loads(data)
             except (json.JSONDecodeError, RecursionError):
-                raise ProviderStreamError("SSE 事件 JSON 格式无效。") from None
+                raise ProviderStreamError("SSE 事件 JSON 格式无效。", category="parse_error") from None
             if not isinstance(chunk, dict) or "error" in chunk:
                 raise ProviderStreamError("模型服务返回格式无效的 SSE 事件。")
             if "usage" in chunk:
@@ -581,13 +647,49 @@ class OpenAICompatibleProvider:
                 finish_reason = current_finish_reason
             return False
 
-        parser = _SSEParser(collect_event)
-        deadline = time.monotonic() + stream_timeout
+        stage = "connect"
+        http_status: int | None = None
+        received_bytes = 0
+        started_at = time.monotonic()
+        deadline = started_at + stream_timeout
+
+        def parse_event(event_name: str, data: str) -> bool:
+            nonlocal stage
+            previous_stage = stage
+            stage = "protocol"
+            try:
+                result = collect_event(event_name, data)
+            except Exception:
+                # Preserve the failed phase for the safe diagnostic built by the outer handler.
+                stage = "protocol"
+                raise
+            else:
+                stage = previous_stage
+                return result
+
+        parser = _SSEParser(parse_event)
+
+        def add_diagnostics(error: ProviderStreamError, category: str) -> ProviderStreamError:
+            elapsed_ms = max(0, int((time.monotonic() - started_at) * 1000))
+            status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+            diagnostics = StreamDiagnostics(
+                category=category,
+                stage=stage,
+                http_status=status,
+                received_bytes=received_bytes,
+                elapsed_ms=elapsed_ms,
+            )
+            return ProviderStreamError(error.safe_message, category=category, diagnostics=diagnostics)
+
         try:
             with urllib.request.urlopen(
                 request,
                 timeout=min(self.timeout, stream_timeout),
             ) as response:
+                response_status = getattr(response, "status", None)
+                if type(response_status) is int and 100 <= response_status <= 599:
+                    http_status = response_status
+                stage = "response_headers"
                 headers = getattr(response, "headers", None)
                 content_type = ""
                 if headers is not None:
@@ -602,10 +704,12 @@ class OpenAICompatibleProvider:
                             raise ProviderStreamError("SSE 响应超过 4 MiB 上限。")
                     except ValueError:
                         raise ProviderStreamError("SSE Content-Length 格式无效。") from None
+                stage = "response_body"
                 raw_socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
                 if raw_socket is None:
-                    raise ProviderStreamError("无法建立有界 SSE 网络读取。")
+                    raise ProviderStreamError("无法建立有界 SSE 网络读取。", category="bounded_reader_unavailable")
                 while True:
+                    stage = "response_body"
                     if cancellation_event is not None and cancellation_event.is_set():
                         raise ProviderCancelled("provider stream cancelled")
                     remaining = deadline - time.monotonic()
@@ -620,13 +724,16 @@ class OpenAICompatibleProvider:
                             except OSError:
                                 socket_closed = True
                             if not socket_closed:
-                                raise ProviderStreamError("SSE 网络读取失败。") from None
+                                raise ProviderStreamError("SSE 网络传输配置失败。", category="transport_error") from None
                             # A peer may close after sending Content-Length bytes; buffered
                             # response data can still be consumed and EOF is bounded.
                             raw_socket = None
                     try:
                         chunk = response.read1(8192)
-                    except http.client.IncompleteRead:
+                    except http.client.IncompleteRead as exc:
+                        if isinstance(exc.partial, bytes):
+                            received_bytes += len(exc.partial)
+                        stage = "completion"
                         raise ProviderStreamError("SSE 响应在完成标记前结束。") from None
                     except TimeoutError:
                         if cancellation_event is not None and cancellation_event.is_set():
@@ -634,34 +741,68 @@ class OpenAICompatibleProvider:
                         if time.monotonic() >= deadline:
                             raise ProviderStreamError("SSE 流超过总时限。") from None
                         continue
-                    except (OSError, urllib.error.URLError):
-                        raise ProviderStreamError("SSE 网络读取失败。") from None
+                    except (OSError, urllib.error.URLError) as exc:
+                        category = _stream_transport_category(exc, stage)
+                        message = {
+                            "read_timeout": "SSE 响应读取超时。",
+                            "tls_failure": "SSE TLS 安全传输失败。",
+                            "remote_disconnect": "SSE 对端提前断开连接。",
+                            "connection_reset": "SSE 连接被对端重置。",
+                            "name_resolution_failure": "SSE 主机名解析失败。",
+                            "connect_timeout": "SSE 建连或响应头等待超时。",
+                        }.get(category, "SSE 网络传输失败。")
+                        raise ProviderStreamError(message, category=category) from None
                     except Exception:
-                        raise ProviderStreamError("SSE 网络读取失败。") from None
+                        raise ProviderStreamError("SSE 流读取处理失败。", category="internal_error") from None
                     if cancellation_event is not None and cancellation_event.is_set():
                         raise ProviderCancelled("provider stream cancelled")
                     if time.monotonic() >= deadline:
                         raise ProviderStreamError("SSE 流超过总时限。")
                     if not chunk:
+                        stage = "sse_parse"
                         parser.finish()
+                        stage = "completion"
                         raise ProviderStreamError("SSE 响应在完成标记前结束。")
+                    received_bytes += len(chunk)
+                    stage = "sse_parse"
                     stream_done = parser.feed(chunk)
+                    stage = "response_body"
                     if time.monotonic() >= deadline:
                         raise ProviderStreamError("SSE 流超过总时限。")
                     if stream_done:
+                        stage = "completion"
                         break
         except urllib.error.HTTPError as exc:
             status = exc.code
-            exc.close()
-            raise ProviderStreamError(f"模型服务返回 HTTP {status}。") from None
-        except ProviderStreamError:
-            raise
+            if type(status) is int and 100 <= status <= 599:
+                http_status = status
+            try:
+                exc.close()
+            except Exception:
+                pass
+            stage = "response_headers"
+            status_text = f" HTTP {http_status}" if http_status is not None else ""
+            error = ProviderStreamError(f"模型服务返回{status_text}。", category="http_status")
+            raise add_diagnostics(error, "http_status") from None
+        except ProviderStreamError as exc:
+            raise add_diagnostics(exc, _stream_error_category(exc, stage)) from None
         except ProviderCancelled:
             raise
-        except (urllib.error.URLError, TimeoutError, OSError):
-            raise ProviderStreamError("SSE 连接失败或超时；请检查网络和 Base URL。") from None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            category = _stream_transport_category(exc, stage)
+            message = {
+                "connect_timeout": "SSE 建连或响应头等待超时。",
+                "read_timeout": "SSE 响应读取超时。",
+                "tls_failure": "SSE TLS 安全传输失败。",
+                "remote_disconnect": "SSE 对端提前断开连接。",
+                "connection_reset": "SSE 连接被对端重置。",
+                "name_resolution_failure": "SSE 主机名解析失败。",
+            }.get(category, "SSE 网络传输失败。")
+            error = ProviderStreamError(message, category=category)
+            raise add_diagnostics(error, category) from None
         except Exception:
-            raise ProviderStreamError("SSE 连接或响应处理失败。") from None
+            error = ProviderStreamError("SSE 流处理失败。", category="internal_error")
+            raise add_diagnostics(error, "internal_error") from None
 
         if cancellation_event is not None and cancellation_event.is_set():
             raise ProviderCancelled("provider stream cancelled")

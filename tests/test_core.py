@@ -4,15 +4,19 @@ import json
 import io
 import os
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from email.message import Message
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -54,6 +58,88 @@ def local_http_fixture(handler_function):
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     return server, worker
+
+
+def local_tls_http_fixture(handler_function):
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            size = int(self.headers.get("Content-Length", "0"))
+            request_body = self.rfile.read(size)
+            handler_function(self, request_body)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(fixtures / "sse-loopback-cert.pem", fixtures / "sse-loopback-key.pem")
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    return server, worker
+
+
+def local_connect_proxy_fixture(tls_port: int, hostname: str = "sse-fixture.invalid"):
+    expected_target = f"{hostname}:{tls_port}"
+    targets: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_CONNECT(self) -> None:
+            targets.append(self.path)
+            if self.path != expected_target:
+                self.send_error(403)
+                return
+            try:
+                upstream = socket.create_connection(("127.0.0.1", tls_port), timeout=2.0)
+            except OSError:
+                self.send_error(502)
+                return
+            self.send_response(200, "Connection Established")
+            self.end_headers()
+            self.wfile.flush()
+
+            def pump(source: socket.socket, destination: socket.socket) -> None:
+                try:
+                    while True:
+                        data = source.recv(8192)
+                        if not data:
+                            break
+                        destination.sendall(data)
+                except OSError:
+                    pass
+                try:
+                    destination.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+            try:
+                with upstream:
+                    client_to_origin = threading.Thread(
+                        target=pump, args=(self.connection, upstream), daemon=True
+                    )
+                    client_to_origin.start()
+                    pump(upstream, self.connection)
+                    client_to_origin.join(timeout=2.0)
+            finally:
+                self.close_connection = True
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    return server, worker, targets
+
+
+def local_verified_tls_proxy_opener(proxy_port: int):
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    context = ssl.create_default_context(cafile=fixtures / "sse-loopback-cert.pem")
+    proxy = urllib.request.ProxyHandler({"https": f"http://127.0.0.1:{proxy_port}"})
+    return urllib.request.build_opener(proxy, urllib.request.HTTPSHandler(context=context)), context
 
 
 def fixture_sse_frames(events: list[dict[str, object]], *, done: bool = True) -> bytes:
@@ -1211,6 +1297,238 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(captured["accept"], "text/event-stream")
         self.assertTrue(captured["request"]["stream"])
 
+    def test_sse_streams_through_verified_local_connect_tls_proxy(self) -> None:
+        body = fixture_sse_frames([
+            {"choices": [{"index": 0, "delta": {"content": "经过代理的中文"}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        ])
+        captured: dict[str, object] = {}
+
+        def serve(handler, _request_body: bytes) -> None:
+            captured["authorization"] = handler.headers.get("Authorization")
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            for offset in range(0, len(body), 5):
+                handler.wfile.write(body[offset : offset + 5])
+                handler.wfile.flush()
+                time.sleep(0.002)
+
+        origin, origin_worker = local_tls_http_fixture(serve)
+        proxy, proxy_worker, targets = local_connect_proxy_fixture(origin.server_port)
+        opener, context = local_verified_tls_proxy_opener(proxy.server_port)
+        pieces: list[str] = []
+        try:
+            provider = OpenAICompatibleProvider(
+                "https://localhost", "", "fixture-model", timeout=2, stream_timeout=2
+            )
+            provider.endpoint = f"https://sse-fixture.invalid:{origin.server_port}/chat/completions"
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=lambda request, timeout: opener.open(request, timeout=timeout),
+            ):
+                turn = provider.complete_streaming(
+                    [{"role": "user", "content": "本地合成代理请求"}], [], on_text_delta=pieces.append
+                )
+        finally:
+            proxy.shutdown()
+            proxy_worker.join(timeout=2)
+            proxy.server_close()
+            origin.shutdown()
+            origin_worker.join(timeout=2)
+            origin.server_close()
+
+        self.assertEqual(turn.content, "经过代理的中文")
+        self.assertEqual(pieces, ["经过代理的中文"])
+        self.assertEqual(targets, [f"sse-fixture.invalid:{origin.server_port}"])
+        self.assertIsNone(captured["authorization"])
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_sse_diagnostics_classify_connect_parse_and_protocol_failures_safely(self) -> None:
+        provider = OpenAICompatibleProvider(
+            "http://127.0.0.1:9", "", "fixture-model", timeout=0.2, stream_timeout=0.2
+        )
+        private_text = "synthetic_exception_secret"
+        with patch("urllib.request.urlopen", side_effect=TimeoutError(private_text)):
+            with self.assertRaises(ProviderStreamError) as caught:
+                provider.complete_streaming(
+                    [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
+                )
+        diagnostic = caught.exception.diagnostics
+        self.assertIsNotNone(diagnostic)
+        self.assertEqual(diagnostic.category, "connect_timeout")
+        self.assertEqual(diagnostic.stage, "connect")
+        self.assertIsNone(diagnostic.http_status)
+        self.assertEqual(diagnostic.received_bytes, 0)
+        self.assertNotIn(private_text, str(caught.exception))
+
+        malformed = b"data: {\xff}\n\n"
+
+        def malformed_response(handler, _request_body: bytes) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Length", str(len(malformed)))
+            handler.end_headers()
+            handler.wfile.write(malformed)
+
+        server, worker = local_http_fixture(malformed_response)
+        try:
+            parser_provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "fixture-model", stream_timeout=1
+            )
+            with self.assertRaises(ProviderStreamError) as caught:
+                parser_provider.complete_streaming(
+                    [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
+                )
+            self.assertEqual(caught.exception.diagnostics.category, "parse_error")
+            self.assertEqual(caught.exception.diagnostics.stage, "sse_parse")
+            self.assertEqual(caught.exception.diagnostics.http_status, 200)
+            self.assertEqual(caught.exception.diagnostics.received_bytes, len(malformed))
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+    def test_sse_responses_close_after_parse_failure_and_cancellation(self) -> None:
+        class FakeSocket:
+            def settimeout(self, _timeout: float) -> None:
+                return
+
+            def fileno(self) -> int:
+                return 10
+
+        class TrackingResponse:
+            status = 200
+
+            def __init__(self, on_read=None, chunk: bytes = b"data: {\xff}\n\n") -> None:
+                self.headers = Message()
+                self.headers["Content-Type"] = "text/event-stream"
+                self.headers["Content-Length"] = str(len(chunk))
+                self.fp = SimpleNamespace(raw=SimpleNamespace(_sock=FakeSocket()))
+                self._on_read = on_read
+                self._chunk = chunk
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                self.closed = True
+
+            def read1(self, _size: int) -> bytes:
+                if self._on_read is not None:
+                    self._on_read()
+                chunk, self._chunk = self._chunk, b""
+                return chunk
+
+        provider = OpenAICompatibleProvider(
+            "http://127.0.0.1:9", "", "fixture-model", timeout=1, stream_timeout=1
+        )
+        malformed_response = TrackingResponse()
+        with patch("urllib.request.urlopen", return_value=malformed_response):
+            with self.assertRaises(ProviderStreamError):
+                provider.complete_streaming(
+                    [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
+                )
+        self.assertTrue(malformed_response.closed)
+
+        cancelled = threading.Event()
+        cancellation_response = TrackingResponse(cancelled.set, b"data: [DONE]\n\n")
+        with patch("urllib.request.urlopen", return_value=cancellation_response):
+            with self.assertRaises(ProviderCancelled):
+                provider.complete_streaming(
+                    [{"role": "user", "content": "fixture"}], [], cancellation_event=cancelled,
+                    on_text_delta=lambda _fragment: None,
+                )
+        self.assertTrue(cancellation_response.closed)
+
+    def test_sse_tls_proxy_reports_slow_read_and_disconnect_diagnostics(self) -> None:
+        prefix = fixture_sse_frames([
+            {"choices": [{"index": 0, "delta": {"content": "片段"}, "finish_reason": None}]},
+        ], done=False)
+
+        def slow_response(handler, _request_body: bytes) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Length", str(len(prefix) + 100))
+            handler.end_headers()
+            handler.wfile.write(prefix)
+            handler.wfile.flush()
+            time.sleep(0.5)
+            try:
+                handler.wfile.write(b"x" * 100)
+            except OSError:
+                pass
+
+        origin, origin_worker = local_tls_http_fixture(slow_response)
+        proxy, proxy_worker, _targets = local_connect_proxy_fixture(origin.server_port)
+        opener, _context = local_verified_tls_proxy_opener(proxy.server_port)
+        try:
+            provider = OpenAICompatibleProvider(
+                "https://localhost", "", "fixture-model", timeout=1, stream_timeout=0.15
+            )
+            provider.endpoint = f"https://sse-fixture.invalid:{origin.server_port}/chat/completions"
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=lambda request, timeout: opener.open(request, timeout=timeout),
+            ):
+                with self.assertRaises(ProviderStreamError) as caught:
+                    provider.complete_streaming(
+                        [{"role": "user", "content": "synthetic slow fixture"}], [],
+                        on_text_delta=lambda _fragment: None,
+                    )
+            diagnostic = caught.exception.diagnostics
+            self.assertEqual(diagnostic.category, "read_timeout", str(caught.exception))
+            self.assertEqual(diagnostic.stage, "response_body")
+            self.assertEqual(diagnostic.http_status, 200)
+            self.assertGreater(diagnostic.received_bytes, 0)
+        finally:
+            proxy.shutdown()
+            proxy_worker.join(timeout=2)
+            proxy.server_close()
+            origin.shutdown()
+            origin_worker.join(timeout=2)
+            origin.server_close()
+
+        def disconnected_response(handler, _request_body: bytes) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Length", str(len(prefix)))
+            handler.end_headers()
+            handler.wfile.write(prefix)
+
+        origin, origin_worker = local_tls_http_fixture(disconnected_response)
+        proxy, proxy_worker, _targets = local_connect_proxy_fixture(origin.server_port)
+        opener, _context = local_verified_tls_proxy_opener(proxy.server_port)
+        try:
+            provider = OpenAICompatibleProvider(
+                "https://localhost", "", "fixture-model", timeout=1, stream_timeout=1
+            )
+            provider.endpoint = f"https://sse-fixture.invalid:{origin.server_port}/chat/completions"
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=lambda request, timeout: opener.open(request, timeout=timeout),
+            ):
+                with self.assertRaises(ProviderStreamError) as caught:
+                    provider.complete_streaming(
+                        [{"role": "user", "content": "synthetic disconnect fixture"}], [],
+                        on_text_delta=lambda _fragment: None,
+                    )
+            diagnostic = caught.exception.diagnostics
+            self.assertEqual(diagnostic.category, "missing_end_marker")
+            self.assertEqual(diagnostic.stage, "completion")
+            self.assertEqual(diagnostic.http_status, 200)
+            self.assertEqual(diagnostic.received_bytes, len(prefix))
+        finally:
+            proxy.shutdown()
+            proxy_worker.join(timeout=2)
+            proxy.server_close()
+            origin.shutdown()
+            origin_worker.join(timeout=2)
+            origin.server_close()
+
     def test_openai_subagent_uses_local_fixture_with_only_preapproved_read_tools(self) -> None:
         from cvfx_harness.subagents import SubagentManager, build_delegation_plan
 
@@ -1437,8 +1755,10 @@ class ProviderTests(unittest.TestCase):
                     Workspace(temp),
                     approve_action=lambda request: approvals.append(request) or True,
                 )
-                with self.assertRaisesRegex(ProviderStreamError, "完成标记前结束"):
+                with self.assertRaisesRegex(ProviderStreamError, "完成标记前结束") as caught:
                     agent.ask("列出目录", on_text_delta=lambda _fragment: None)
+                self.assertEqual(caught.exception.diagnostics.category, "missing_end_marker")
+                self.assertEqual(caught.exception.diagnostics.stage, "completion")
                 self.assertEqual(agent.turns, [])
         finally:
             server.shutdown()
@@ -1463,10 +1783,12 @@ class ProviderTests(unittest.TestCase):
             provider = OpenAICompatibleProvider(
                 f"http://127.0.0.1:{server.server_port}", "", "fixture-model", stream_timeout=1.0
             )
-            with self.assertRaisesRegex(ProviderStreamError, "尚未支持"):
+            with self.assertRaisesRegex(ProviderStreamError, "尚未支持") as caught:
                 provider.complete_streaming(
                     [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
                 )
+            self.assertEqual(caught.exception.diagnostics.category, "protocol_rejection")
+            self.assertEqual(caught.exception.diagnostics.stage, "protocol")
         finally:
             server.shutdown()
             worker.join(timeout=2)
@@ -1515,10 +1837,13 @@ class ProviderTests(unittest.TestCase):
             provider = OpenAICompatibleProvider(
                 f"http://127.0.0.1:{server.server_port}", "", "fixture-model", stream_timeout=0.1
             )
-            with self.assertRaises(ProviderStreamError):
+            with self.assertRaises(ProviderStreamError) as caught:
                 provider.complete_streaming(
                     [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
                 )
+            self.assertEqual(caught.exception.diagnostics.category, "read_timeout")
+            self.assertEqual(caught.exception.diagnostics.stage, "response_body")
+            self.assertEqual(caught.exception.diagnostics.http_status, 200)
         finally:
             server.shutdown()
             worker.join(timeout=2)
@@ -1540,10 +1865,13 @@ class ProviderTests(unittest.TestCase):
                 f"http://127.0.0.1:{server.server_port}", "", "fixture-model", stream_timeout=1.0
             )
             with patch("cvfx_harness.providers.MAX_STREAM_RESPONSE_BYTES", 64):
-                with self.assertRaisesRegex(ProviderStreamError, "4 MiB"):
+                with self.assertRaisesRegex(ProviderStreamError, "4 MiB") as caught:
                     provider.complete_streaming(
                         [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
                     )
+            self.assertEqual(caught.exception.diagnostics.category, "size_limit")
+            self.assertEqual(caught.exception.diagnostics.stage, "response_headers")
+            self.assertEqual(caught.exception.diagnostics.http_status, 200)
         finally:
             server.shutdown()
             worker.join(timeout=2)
@@ -1591,6 +1919,9 @@ class ProviderTests(unittest.TestCase):
                     [{"role": "user", "content": "fixture"}], [], on_text_delta=lambda _fragment: None
                 )
             self.assertNotIn(private_body.decode(), str(caught.exception))
+            self.assertEqual(caught.exception.diagnostics.category, "http_status")
+            self.assertEqual(caught.exception.diagnostics.stage, "response_headers")
+            self.assertEqual(caught.exception.diagnostics.http_status, 503)
         finally:
             server.shutdown()
             worker.join(timeout=2)
