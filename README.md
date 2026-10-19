@@ -30,6 +30,12 @@ python -m venv .venv
 
 安装后可运行 `cvfx-harness --workspace . --provider mock` 或 `python -m cvfx_harness`。默认提供商为 `mock`，不会读取密钥或发起网络请求。终端使用 UTF-8；Ctrl+C 取消当前输入、多行草稿或模型请求后返回提示符，不重放输入；EOF 结束会话，未完成的多行草稿不会提交。
 
+### Windows 独立程序试验
+
+仓库的 `Windows standalone packaging experiment` Actions 工作流会在 Windows x64 runner 上构建一个含 Python 运行时的单文件 `.exe`，随后在不依赖系统 Python 的子进程环境中检查 `--help`、离线 Mock 中文交互和含中文/空格的工作区路径。构建工具仅用于 CI，版本和 Windows 轮子哈希锁定在 [`packaging/windows-build-requirements.txt`](packaging/windows-build-requirements.txt)；源码安装仍无第三方运行时依赖。
+
+从对应 Actions 运行页面下载 `windows-x64-cvfx-harness-py312` 文件，解压后可运行 `cvfx-harness.exe --help` 或 `cvfx-harness.exe --workspace . --provider mock`。单文件启动时会把依赖解压到系统临时目录，启动会比源码或目录包慢一些，且需要临时目录可写。包中只有可执行文件、中文说明和 SHA-256 校验文件；CI 构建不打包仓库文档、配置或工作区文件。构建与自检仅使用 Mock 和合成输入，不连接真实模型。这个未签名包只是试验，不是正式发布；Windows 可能显示 SmartScreen 或 Defender 提示，请保持系统保护开启并遵循组织策略。Actions 文件保留 14 天，不上传到发布页或包注册表。
+
 ## 可用命令
 
 在交互提示符输入 `/帮助` 查看完整说明。

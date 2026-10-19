@@ -1,0 +1,73 @@
+name: Windows standalone packaging experiment
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 standalone CLI
+    runs-on: windows-2022
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up pinned build Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.10"
+
+      - name: Install hash-locked build-only packager
+        run: >-
+          python -m pip --isolated install --disable-pip-version-check --require-hashes
+          --only-binary=:all: --index-url https://pypi.org/simple
+          -r packaging/windows-build-requirements.txt
+
+      - name: Build, audit, and smoke-test the standalone executable
+        id: bundle
+        run: >-
+          python scripts/build_windows_bundle.py --output-dir
+          "${{ runner.temp }}\cvfx-harness-artifact"
+
+      - name: Upload tested standalone artifact
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-x64-cvfx-harness-py312
+          path: ${{ runner.temp }}/cvfx-harness-artifact/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Summarize artifact and startup baseline
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          EXE_BYTES: ${{ steps.bundle.outputs.exe_bytes }}
+          EXE_MIB: ${{ steps.bundle.outputs.exe_mib }}
+          EXE_SHA256: ${{ steps.bundle.outputs.exe_sha256 }}
+          ARCHIVE_MEMBERS: ${{ steps.bundle.outputs.archive_members }}
+          HELP_FIRST_MS: ${{ steps.bundle.outputs.help_first_ms }}
+          HELP_MEDIAN_MS: ${{ steps.bundle.outputs.help_median_ms }}
+          HELP_MIN_MS: ${{ steps.bundle.outputs.help_min_ms }}
+          HELP_MAX_MS: ${{ steps.bundle.outputs.help_max_ms }}
+        run: |
+          @(
+            '## Windows standalone CLI experiment'
+            "- Artifact: [download tested files]($env:ARTIFACT_URL) (retained for 14 days)"
+            "- Uploaded artifact archive SHA-256: ``$env:ARTIFACT_DIGEST``"
+            "- Executable: $env:EXE_BYTES bytes ($env:EXE_MIB MiB); SHA-256 ``$env:EXE_SHA256``"
+            "- Internal archive audit: $env:ARCHIVE_MEMBERS entries inspected; no forbidden document/config names found"
+            "- --help start/exit on windows-2022, first observed run: $env:HELP_FIRST_MS ms; 5-run median: $env:HELP_MEDIAN_MS ms; range: $env:HELP_MIN_MS–$env:HELP_MAX_MS ms"
+            '- Smoke checks passed: --help, UTF-8 offline Mock Chinese interaction, and Chinese/space workspace path with Python absent from the child PATH.'
+            '- The build is unsigned; no signing, release, registry upload, or real model request was used.'
+          ) | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
