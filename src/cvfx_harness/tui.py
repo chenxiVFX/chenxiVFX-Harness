@@ -59,6 +59,7 @@ COMMANDS = (
     ("/统计", "查看本地估算和 provider usage"), ("/预算", "设置本地估算阈值"),
     ("/配置", "查看或交互审阅非敏感配置"), ("/测试", "管理固定 Python 测试配置"),
     ("/子代理", "管理隔离子任务"),
+    ("/变更集", "审阅未完成批次或安全恢复"),
     ("/撤销", "预览并撤销写入"), ("/退出", "结束会话"),
 )
 ENUM_COMPLETIONS = {
@@ -68,6 +69,7 @@ ENUM_COMPLETIONS = {
     "/测试": ("列表", "添加", "运行", "移除"),
     "/计划": ("生成", "显示", "修订", "接受", "拒绝", "添加", "执行", "完成", "阻塞", "取消", "重试", "清空"),
     "/压缩": ("撤销",),
+    "/变更集": ("列表", "恢复"),
 }
 _APPROVAL_PROMPT = re.compile(r"\[y/N\]\s*$", re.IGNORECASE)
 
@@ -809,6 +811,10 @@ class TerminalUI:
                             # approval dock keeps just the target and trusted
                             # file fingerprint next to the decision buttons.
                             self._approval_text = "\n".join(patch_context.splitlines()[1:3])
+                        elif patch_context.startswith(("多文件变更集完整审阅", "变更集恢复完整审阅")):
+                            # Keep the decision area compact; the complete
+                            # rolling diff stays in the scrollable transcript.
+                            self._approval_text = "\n".join(patch_context.splitlines()[:2])
                         elif any(marker in context for marker in ("差异", "审批范围")):
                             self._approval_text = _safe_text(context)
                         else:

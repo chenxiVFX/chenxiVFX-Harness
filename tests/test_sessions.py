@@ -618,7 +618,10 @@ class CompressionTests(unittest.TestCase):
             self.assertEqual(before, after)
             self.assertEqual(
                 before,
-                ("ask_user", "read_file", "list_directory", "search_text", "write_file", "patch_file"),
+                (
+                    "ask_user", "read_file", "list_directory", "search_text",
+                    "write_file", "patch_file", "apply_change_set",
+                ),
             )
             self.assertEqual(agent.messages[0], {"role": "system", "content": SYSTEM_PROMPT})
 

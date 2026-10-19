@@ -63,7 +63,7 @@ MAX_MULTILINE_INPUT_BYTES = 64 * 1024
 _CLI_COMMANDS = (
     "/帮助", "/命令", "/状态", "/模式", "/目标", "/计划", "/保存", "/检查点",
     "/恢复", "/会话", "/多行", "/压缩", "/统计", "/预算", "/配置", "/测试", "/子代理",
-    "/撤销", "/退出",
+    "/变更集", "/撤销", "/退出",
 )
 _CLI_ENUM_ARGUMENTS = {
     "/模式": ("计划", "执行"),
@@ -71,6 +71,7 @@ _CLI_ENUM_ARGUMENTS = {
     "/压缩": ("撤销",),
     "/计划": ("生成", "显示", "修订", "接受", "拒绝", "添加", "执行", "完成", "阻塞", "取消", "重试", "清空"),
     "/配置": ("显示", "编辑", "重置", "提供商", "模型", "端点", "预算", "输出上限"),
+    "/变更集": ("列表", "恢复"),
 }
 _STREAM_SECRET_TAIL_CHARS = 16
 _STREAM_SECRET_RUN_CHARS = frozenset(
@@ -486,7 +487,7 @@ def _help_text() -> str:
   /帮助              显示帮助
   /命令              列出可用的中文命令
   /状态              显示完整提供商、模型、工作区、目标和模式（顶栏会随宽度省略）
-  /模式 计划|执行    切换计划或执行模式（计划模式会拦截写入与撤销）
+  /模式 计划|执行    切换计划或执行模式（计划模式会拦截写入、变更集恢复与撤销）
   /目标 <内容>       设置本会话目标；/目标 清空 可清除
   /计划              查看计划及状态
   /计划 生成 [需求]   让模型提出最多 3 步的结构化候选；生成不带工具，尚未执行
@@ -523,6 +524,8 @@ def _help_text() -> str:
   /子代理 取消 <编号>     请求取消排队中或运行中的子任务
   /子代理 收取 [编号|全部] 将完成结果作为不可信上下文加入主对话
   /子代理 时限 <5–120>    设置后续子任务运行时限（审批/排队不计，最多 120 秒）
+  /变更集 列表      查看未完成多文件变更集；启动时不会自动恢复
+  /变更集 恢复 <编号> 显示当前状态与完整恢复差异，单独确认后尝试恢复
   /撤销              预览并恢复最近一次 Harness 文件写入
   /多行              开始多行提问；单独输入 /提交 发送，/取消 丢弃
   /退出              结束会话
@@ -533,6 +536,7 @@ def _help_text() -> str:
 TTY 且提供 Python readline 时，Tab 补全命令名和固定选项（如 /模式 计划|执行）；不补路径、自由文本或凭据。输入历史（包括审批回答）不会保存或重放。
 无 TTY 时可用逐行脚本输入；EOF 结束会话。所有审批仍需单独输入 y/yes/是。
 每次文件读取和写入都要人工确认；写入/撤销会先显示完整差异。
+apply_change_set 仅用于用户要求的 2–5 个现有 UTF-8 文件精确修改；整批预检、完整差异与短哈希一次审阅确认，失败时逐文件安全补偿。它不提供跨文件原子事务；每个文件仍有最后版本校验到替换之间的窄竞态窗口。
 目录列表只返回名称和类型，每次也要人工确认；不读取目录项文件内容。
 敏感凭据路径默认禁止读取或修改。当前版本不会运行 shell 命令。
 工作区配置保存在 .harness/config/settings.json；优先级为默认值、工作区配置、环境变量、命令行。
@@ -848,6 +852,14 @@ def _confirm_action(
             f"{diff}"
         )
         prompt = "确认应用这个精确补丁？[y/N] "
+    elif request.operation == "change_set":
+        review = _safe_untrusted_terminal_text(request.diff) or "（没有可审阅的差异）"
+        output(f"\n多文件变更集完整审阅（编号 {safe_path}）：\n{review}")
+        prompt = "以上所有文件共用这一次审批；确认应用整批变更？[y/N] "
+    elif request.operation == "change_set_recovery":
+        review = _safe_untrusted_terminal_text(request.diff) or "（没有待恢复差异）"
+        output(f"\n变更集恢复完整审阅（编号 {safe_path}）：\n{review}")
+        prompt = "确认按预览仅恢复仍匹配本批写入版本的文件？[y/N] "
     elif request.operation == "write":
         change_kind = (
             "新建文件" if request.file_existed is False
@@ -1029,6 +1041,13 @@ def run_console(
     session_store = SessionStore(workspace)
     plan_store = PlanStore(workspace)
     pending_plan: tuple[PlanDraft, PlanSnapshot] | None = None
+
+    try:
+        pending_change_sets = workspace.describe_incomplete_change_sets()
+        if not pending_change_sets.startswith("没有未完成的多文件变更集"):
+            output(pending_change_sets)
+    except WorkspaceError:
+        output("存在无法安全检查的变更集日志；启动不会自动恢复。请检查工作区 .harness/change-sets/。")
 
     def render_draft(
         draft: PlanDraft,
@@ -2085,6 +2104,34 @@ def run_console(
                     "结果可用 /子代理 列表 查看。"
                 )
             output(subagent_manager.budget_status())
+            continue
+        if command in {"/变更集", "/changeset"}:
+            subcommand, _, subargument = argument.strip().partition(" ")
+            normalized_subcommand = subcommand.casefold()
+            if normalized_subcommand in {"列表", "list"} and not subargument.strip():
+                try:
+                    output(workspace.describe_incomplete_change_sets())
+                except WorkspaceError as exc:
+                    output(f"无法列出未完成变更集：{_safe_error_text(exc)}")
+                continue
+            if normalized_subcommand in {"恢复", "recover"} and subargument.strip():
+                if mode == "计划":
+                    output("计划模式：已拦截变更集恢复；文件未修改。")
+                    continue
+                change_set_id = subargument.strip()
+                try:
+                    output(
+                        workspace.recover_change_set(
+                            change_set_id,
+                            approve_action=approve_action,
+                        )
+                    )
+                except WorkspaceError as exc:
+                    output(f"变更集恢复失败：{_safe_error_text(exc)}")
+                except KeyboardInterrupt:
+                    output("已取消变更集恢复审批；没有继续恢复文件。")
+                continue
+            output("用法：/变更集 列表 | /变更集 恢复 <编号>")
             continue
         if command in {"/撤销", "/undo"}:
             try:

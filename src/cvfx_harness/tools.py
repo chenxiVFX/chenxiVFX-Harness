@@ -50,6 +50,15 @@ SEARCH_QUERY_MAX_CHARS = 200
 SEARCH_GLOB_MAX_CHARS = 256
 SEARCH_GITIGNORE_RULE_LIMIT = 256
 SEARCH_GITIGNORE_PATTERN_MAX_CHARS = 1024
+CHANGE_SET_MIN_FILES = 2
+CHANGE_SET_MAX_FILES = 5
+CHANGE_SET_PAYLOAD_LIMIT_BYTES = 96 * 1024
+CHANGE_SET_DIFF_LIMIT_BYTES = 128 * 1024
+CHANGE_SET_BACKUP_LIMIT_BYTES = 256 * 1024
+CHANGE_SET_JOURNAL_LIMIT_BYTES = 16 * 1024
+CHANGE_SET_LOG_LIMIT = 128
+CHANGE_SET_TERMINAL_LOG_RETENTION = 32
+_CHANGE_SET_DIR = "change-sets"
 _CONTROL_DIR = ".harness"
 _BACKUP_DIR = "backups"
 _SENSITIVE_DIRECTORIES = {
@@ -219,6 +228,42 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_change_set",
+            "description": (
+                "Apply one explicitly reviewed set of 2 to 5 exact replacements to existing UTF-8 workspace files. "
+                "Each file needs the SHA-256 from its latest approved read_file result, a non-empty old_text that occurs "
+                "exactly once, and new_text. The complete set is preflighted and shown together for one explicit approval; "
+                "any stale file aborts the set. No create, delete, rename, directory creation, shell, or test execution. "
+                "A multi-file set is not a cross-file atomic transaction."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "changes": {
+                        "type": "array",
+                        "minItems": CHANGE_SET_MIN_FILES,
+                        "maxItems": CHANGE_SET_MAX_FILES,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "expected_sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+                                "old_text": {"type": "string"},
+                                "new_text": {"type": "string"},
+                            },
+                            "required": ["path", "expected_sha256", "old_text", "new_text"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["changes"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 
@@ -281,6 +326,48 @@ class WritePreview:
     new_content: str
     diff: str
     changed: bool
+
+
+@dataclass(frozen=True)
+class ChangeSetPreview:
+    changes: tuple[WritePreview, ...]
+    file_sha256: tuple[str, ...]
+    diff: str
+    digest: str
+    payload_bytes: int
+    backup_bytes: int
+
+
+@dataclass(frozen=True)
+class ChangeSetFileStatus:
+    path: str
+    status: str
+    backup_id: str
+    before_sha256: str
+    after_sha256: str
+
+
+@dataclass(frozen=True)
+class ChangeSetRecoveryItem:
+    path: str
+    status: str
+    backup_id: str
+    before_sha256: str
+    after_sha256: str
+    current_bytes: bytes | None = None
+    current_info: os.stat_result | None = None
+    current_acl_token: bytes | None = None
+    restore_bytes: bytes | None = None
+    backup_record: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ChangeSetRecoveryPreview:
+    change_set_id: str
+    record: dict[str, Any]
+    items: tuple[ChangeSetRecoveryItem, ...]
+    diff: str
+    digest: str
 
 
 @dataclass(frozen=True)
@@ -1354,6 +1441,117 @@ class Workspace:
             raise WorkspaceError("补丁差异超过 32 KiB 审批显示上限。")
         return preview, actual_sha256
 
+    def preview_change_set(self, changes: Any) -> ChangeSetPreview:
+        """Validate the whole bounded set before producing an approval preview."""
+        if not isinstance(changes, list) or not CHANGE_SET_MIN_FILES <= len(changes) <= CHANGE_SET_MAX_FILES:
+            raise WorkspaceError(
+                f"变更集必须包含 {CHANGE_SET_MIN_FILES}–{CHANGE_SET_MAX_FILES} 个文件。"
+            )
+        try:
+            payload_bytes = len(
+                json.dumps({"changes": changes}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            )
+        except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+            raise WorkspaceError("变更集参数格式无效。") from None
+        if payload_bytes > CHANGE_SET_PAYLOAD_LIMIT_BYTES:
+            raise WorkspaceError(
+                f"变更集输入超过 {CHANGE_SET_PAYLOAD_LIMIT_BYTES // 1024} KiB 上限。"
+            )
+
+        from .sessions import contains_likely_secret
+
+        previews: list[tuple[WritePreview, str]] = []
+        seen_targets: set[str] = set()
+        backup_bytes = 0
+        for index, item in enumerate(changes, 1):
+            if not isinstance(item, dict) or set(item) != {
+                "path", "expected_sha256", "old_text", "new_text"
+            }:
+                raise WorkspaceError(f"变更集第 {index} 项字段无效。")
+            if any(not isinstance(item[name], str) for name in item):
+                raise WorkspaceError(f"变更集第 {index} 项字段类型无效。")
+            path = item["path"]
+            if any(
+                unicodedata.category(char).startswith("C")
+                or unicodedata.category(char) in {"Zl", "Zp"}
+                for char in path
+            ) or contains_likely_secret(path):
+                raise WorkspaceError(f"变更集第 {index} 项路径含控制字符或疑似凭据。")
+            preview, actual_sha256 = self.preview_patch(
+                path,
+                expected_sha256=item["expected_sha256"],
+                old_text=item["old_text"],
+                new_text=item["new_text"],
+            )
+            canonical_key = os.path.normcase(preview.canonical_path).casefold()
+            if canonical_key in seen_targets:
+                raise WorkspaceError("变更集包含重复或平台大小写冲突的文件路径。")
+            seen_targets.add(canonical_key)
+            if not preview.changed:
+                raise WorkspaceError(f"变更集第 {index} 项没有实际变化；整批未审批、未写入。")
+            if preview.before_bytes is None:
+                raise WorkspaceError("变更集只允许修改已存在的普通 UTF-8 文件。")
+            if (
+                contains_likely_secret(preview.before_content)
+                or contains_likely_secret(preview.new_content)
+                or contains_likely_secret(preview.canonical_path)
+            ):
+                raise WorkspaceError(f"变更集第 {index} 项含疑似凭据；整批未审批、未写入。")
+            backup_bytes += len(preview.before_bytes)
+            previews.append((preview, actual_sha256))
+        if backup_bytes > CHANGE_SET_BACKUP_LIMIT_BYTES:
+            raise WorkspaceError(
+                f"变更集原始备份合计超过 {CHANGE_SET_BACKUP_LIMIT_BYTES // 1024} KiB 上限。"
+            )
+
+        previews.sort(key=lambda item: (item[0].canonical_path.casefold(), item[0].canonical_path))
+        digest_data: list[dict[str, Any]] = []
+        rendered = [
+            f"变更集共 {len(previews)} 个现有文件；预检与审批覆盖全部文件，执行按路径排序。"
+        ]
+        diff_bytes = 0
+        for index, (preview, sha256) in enumerate(previews, 1):
+            new_bytes = preview.new_content.encode("utf-8")
+            file_diff = preview.diff
+            diff_bytes += len(file_diff.encode("utf-8"))
+            rendered.append(
+                f"\n[{index}/{len(previews)}] 文件：{preview.canonical_path}\n"
+                f"原文件 SHA-256：{sha256[:16]}…\n"
+                "精确差异（+ 新增，- 删除）：\n"
+                f"{file_diff}"
+            )
+            digest_data.append(
+                {
+                    "path": preview.canonical_path,
+                    "before_sha256": sha256,
+                    "after_sha256": hashlib.sha256(new_bytes).hexdigest(),
+                    "before_mode": preview.before_mode,
+                    "before_token": preview.before_token,
+                    "before_acl_sha256": self._acl_sha256(preview.before_acl_token),
+                    "diff_sha256": hashlib.sha256(file_diff.encode("utf-8")).hexdigest(),
+                }
+            )
+        diff = "".join(rendered)
+        try:
+            complete_diff_bytes = len(diff.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise WorkspaceError("变更集差异不是有效 UTF-8；整批未审批、未写入。") from None
+        if diff_bytes > CHANGE_SET_DIFF_LIMIT_BYTES or complete_diff_bytes > CHANGE_SET_DIFF_LIMIT_BYTES:
+            raise WorkspaceError(
+                f"变更集完整差异超过 {CHANGE_SET_DIFF_LIMIT_BYTES // 1024} KiB 审阅上限；整批未审批、未写入。"
+            )
+        digest_payload = json.dumps(
+            digest_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return ChangeSetPreview(
+            changes=tuple(preview for preview, _sha256 in previews),
+            file_sha256=tuple(sha256 for _preview, sha256 in previews),
+            diff=diff,
+            digest=hashlib.sha256(digest_payload).hexdigest(),
+            payload_bytes=payload_bytes,
+            backup_bytes=backup_bytes,
+        )
+
     @staticmethod
     def _validate_patch_fragment(content: str, label: str) -> None:
         try:
@@ -1439,7 +1637,7 @@ class Workspace:
         return target
 
     def internal_storage_dir(self, name: str, *, create: bool) -> Path | None:
-        if name not in {_BACKUP_DIR, "sessions", "config", "plans"}:
+        if name not in {_BACKUP_DIR, "sessions", "config", "plans", _CHANGE_SET_DIR}:
             raise WorkspaceError("未授权的 Harness 内部存储目录。")
         control = self.root / _CONTROL_DIR
         storage_dir = control / name
@@ -1466,6 +1664,182 @@ class Workspace:
 
     def _backup_dir(self, *, create: bool) -> Path | None:
         return self.internal_storage_dir(_BACKUP_DIR, create=create)
+
+    def _change_set_dir(self, *, create: bool) -> Path | None:
+        return self.internal_storage_dir(_CHANGE_SET_DIR, create=create)
+
+    @staticmethod
+    def _validate_change_set_id(change_set_id: str) -> None:
+        if not isinstance(change_set_id, str) or re.fullmatch(r"[0-9a-f]{32}", change_set_id) is None:
+            raise WorkspaceError("变更集编号无效。")
+
+    def _change_set_path(self, change_set_id: str, *, create: bool = False) -> Path:
+        self._validate_change_set_id(change_set_id)
+        directory = self._change_set_dir(create=create)
+        if directory is None:
+            raise WorkspaceError("没有可读取的变更集日志。")
+        return directory / f"{change_set_id}.json"
+
+    @staticmethod
+    def _validate_change_set_record(record: Any) -> dict[str, Any]:
+        from .sessions import contains_likely_secret
+
+        states = {
+            "applying", "rolling_back", "recovery_required", "recovery_in_progress",
+            "completed", "rolled_back", "recovered",
+        }
+        file_states = {
+            "pending", "applying", "committed", "failed", "restoring",
+            "restore_failed", "restored", "not_applied", "conflict",
+        }
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"version", "id", "created_ns", "updated_ns", "state", "files"}
+            or type(record.get("version")) is not int
+            or record.get("version") != 1
+            or not isinstance(record.get("id"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", record["id"]) is None
+            or type(record.get("created_ns")) is not int
+            or record["created_ns"] < 0
+            or type(record.get("updated_ns")) is not int
+            or record["updated_ns"] < record["created_ns"]
+            or not isinstance(record.get("state"), str)
+            or record.get("state") not in states
+            or not isinstance(record.get("files"), list)
+            or not CHANGE_SET_MIN_FILES <= len(record["files"]) <= CHANGE_SET_MAX_FILES
+        ):
+            raise WorkspaceError("变更集日志格式无效；未自动恢复或执行。")
+        seen: set[str] = set()
+        for item in record["files"]:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {
+                    "path", "before_sha256", "after_sha256", "before_mode", "after_mode",
+                    "before_acl_sha256", "after_acl_permissions_sha256", "backup_id", "status",
+                }
+                or not isinstance(item.get("path"), str)
+                or not item["path"]
+                or any(
+                    unicodedata.category(char).startswith("C")
+                    or unicodedata.category(char) in {"Zl", "Zp"}
+                    for char in item["path"]
+                )
+                or contains_likely_secret(item["path"])
+                or any(
+                    not isinstance(item.get(key), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", item.get(key, "")) is None
+                    for key in ("before_sha256", "after_sha256")
+                )
+                or type(item.get("before_mode")) is not int
+                or not 0 <= item["before_mode"] <= 0o7777
+                or type(item.get("after_mode")) is not int
+                or not 0 <= item["after_mode"] <= 0o777
+                or any(
+                    item.get(key) is not None
+                    and (
+                        not isinstance(item.get(key), str)
+                        or re.fullmatch(r"[0-9a-f]{64}", item.get(key, "")) is None
+                    )
+                    for key in ("before_acl_sha256", "after_acl_permissions_sha256")
+                )
+                or not isinstance(item.get("backup_id"), str)
+                or re.fullmatch(r"[0-9]+-[0-9a-f]{32}", item.get("backup_id", "")) is None
+                or not isinstance(item.get("status"), str)
+                or item.get("status") not in file_states
+            ):
+                raise WorkspaceError("变更集日志中的文件状态无效；未自动恢复或执行。")
+            key = os.path.normcase(item["path"]).casefold()
+            if key in seen:
+                raise WorkspaceError("变更集日志包含重复文件路径；未自动恢复或执行。")
+            seen.add(key)
+        return record
+
+    def _write_change_set_record(self, record: dict[str, Any]) -> None:
+        self._validate_change_set_record(record)
+        encoded = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > CHANGE_SET_JOURNAL_LIMIT_BYTES:
+            raise WorkspaceError("变更集日志超过本地安全上限；没有继续写入。")
+        target = self._change_set_path(record["id"], create=True)
+        record["updated_ns"] = max(time.time_ns(), record["created_ns"])
+        encoded = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > CHANGE_SET_JOURNAL_LIMIT_BYTES:
+            raise WorkspaceError("变更集日志超过本地安全上限；没有继续写入。")
+        self._atomic_write_bytes(target, encoded)
+
+    def _load_change_set_record(self, change_set_id: str) -> dict[str, Any]:
+        path = self._change_set_path(change_set_id, create=False)
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            raise WorkspaceError("没有找到该变更集日志。") from None
+        except OSError as exc:
+            raise WorkspaceError(f"无法检查变更集日志：{type(exc).__name__}") from None
+        if (
+            self._is_reparse_point(path)
+            or not stat.S_ISREG(info.st_mode)
+            or getattr(info, "st_nlink", 1) != 1
+            or info.st_size > CHANGE_SET_JOURNAL_LIMIT_BYTES
+        ):
+            raise WorkspaceError("变更集日志路径或大小无效；未自动恢复或执行。")
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raise WorkspaceError("变更集日志损坏或无法读取；未自动恢复或执行。") from None
+        record = self._validate_change_set_record(record)
+        if record["id"] != change_set_id:
+            raise WorkspaceError("变更集日志编号不匹配；未自动恢复或执行。")
+        for item in record["files"]:
+            try:
+                target = self._resolve_write_target(item["path"])
+                canonical = target.relative_to(self.root).as_posix()
+            except (ValueError, WorkspaceError):
+                raise WorkspaceError("变更集日志路径已越界或不再安全；未自动恢复或执行。") from None
+            if canonical != item["path"]:
+                raise WorkspaceError("变更集日志路径规范已变化；未自动恢复或执行。")
+        return record
+
+    def list_incomplete_change_sets(self) -> list[dict[str, Any]]:
+        directory = self._change_set_dir(create=False)
+        if directory is None:
+            return []
+        records: list[dict[str, Any]] = []
+        try:
+            paths = list(directory.glob("*.json"))
+        except OSError as exc:
+            raise WorkspaceError(f"无法列出变更集日志：{type(exc).__name__}") from None
+        for path in paths:
+            if self._is_reparse_point(path):
+                raise WorkspaceError("拒绝读取链接形式的变更集日志。")
+            if re.fullmatch(r"[0-9a-f]{32}", path.stem) is None:
+                raise WorkspaceError("变更集日志名称无效；未自动恢复或执行。")
+            record = self._load_change_set_record(path.stem)
+            if record["state"] not in {"completed", "rolled_back", "recovered"}:
+                records.append(record)
+        return sorted(records, key=lambda item: (item["created_ns"], item["id"]))
+
+    def _prune_change_set_logs(self) -> None:
+        directory = self._change_set_dir(create=False)
+        if directory is None:
+            return
+        incomplete = self.list_incomplete_change_sets()
+        if len(incomplete) >= CHANGE_SET_LOG_LIMIT:
+            raise WorkspaceError("未完成变更集已达本地上限；请先审阅并处理恢复项。")
+        terminal: list[tuple[Path, dict[str, Any]]] = []
+        try:
+            paths = list(directory.glob("*.json"))
+        except OSError as exc:
+            raise WorkspaceError(f"无法检查变更集日志：{type(exc).__name__}") from None
+        for path in paths:
+            if self._is_reparse_point(path):
+                raise WorkspaceError("拒绝处理链接形式的变更集日志。")
+            record = self._load_change_set_record(path.stem)
+            if record["state"] in {"completed", "rolled_back", "recovered"}:
+                terminal.append((path, record))
+        terminal.sort(key=lambda item: (item[1]["created_ns"], item[1]["id"]))
+        retained_before_new_log = max(0, CHANGE_SET_TERMINAL_LOG_RETENTION - 1)
+        remove_count = max(0, len(terminal) - retained_before_new_log)
+        for path, _record in terminal[:remove_count]:
+            self._unlink_workspace_file(path)
 
     @staticmethod
     def _supports_dir_fd_operations() -> bool:
@@ -2167,14 +2541,30 @@ class Workspace:
         preview: WritePreview,
         *,
         cancellation_event: Any | None = None,
+        backup_id: str | None = None,
+        change_set_id: str | None = None,
+        change_set_index: int | None = None,
+        persist_conflict_snapshot: bool = True,
     ) -> str | None:
         if not preview.changed:
             return None
 
+        if backup_id is None:
+            backup_id = f"{time.time_ns()}-{uuid.uuid4().hex}"
+        if not isinstance(backup_id, str) or re.fullmatch(r"[0-9]+-[0-9a-f]{32}", backup_id) is None:
+            raise WorkspaceError("撤销备份编号无效；没有写入文件。")
+        if change_set_id is not None:
+            self._validate_change_set_id(change_set_id)
+            if type(change_set_index) is not int or not 1 <= change_set_index <= CHANGE_SET_MAX_FILES:
+                raise WorkspaceError("变更集备份序号无效；没有写入文件。")
+        elif change_set_index is not None:
+            raise WorkspaceError("缺少变更集编号；没有写入文件。")
+        if type(persist_conflict_snapshot) is not bool:
+            raise WorkspaceError("冲突快照策略无效；没有写入文件。")
+
         _raise_if_cancelled(cancellation_event)
         backup_dir = self._backup_dir(create=True)
         assert backup_dir is not None
-        backup_id = f"{time.time_ns()}-{uuid.uuid4().hex}"
         new_bytes = preview.new_content.encode("utf-8")
         record: dict[str, Any] = {
             "version": 1,
@@ -2183,6 +2573,7 @@ class Workspace:
             "path": preview.canonical_path,
             "before_exists": preview.existed,
             "before_mode": preview.before_mode,
+            "after_mode": (preview.before_mode & 0o777) if preview.before_mode is not None else None,
             "before_acl_sha256": self._acl_sha256(preview.before_acl_token),
             "after_acl_sha256": (
                 self._acl_sha256(preview.before_acl_token) if preview.existed else None
@@ -2198,6 +2589,9 @@ class Workspace:
             "conflict_snapshot": None,
             "undone": False,
         }
+        if change_set_id is not None:
+            record["change_set_id"] = change_set_id
+            record["change_set_index"] = change_set_index
         backup_path = backup_dir / f"{backup_id}.json"
         self._atomic_write_json(backup_path, record)
         try:
@@ -2215,12 +2609,26 @@ class Workspace:
             )
         except WorkspaceConflictError as exc:
             record["state"] = "conflict"
-            saved = self._persist_conflict_snapshot(backup_path, record, exc)
-            snapshot_status = (
-                f"冲突快照已保留在备份 {backup_id}。"
-                if saved
-                else f"冲突快照写入失败；原始备份 {backup_id} 仍保留。"
-            )
+            if persist_conflict_snapshot:
+                saved = self._persist_conflict_snapshot(backup_path, record, exc)
+            else:
+                try:
+                    self._atomic_write_json(backup_path, record)
+                    saved = True
+                except (OSError, WorkspaceError):
+                    saved = False
+            if persist_conflict_snapshot:
+                snapshot_status = (
+                    f"冲突快照已保留在备份 {backup_id}。"
+                    if saved
+                    else f"冲突快照写入失败；原始备份 {backup_id} 仍保留。"
+                )
+            else:
+                snapshot_status = (
+                    f"原始备份 {backup_id} 已保留，竞争版本内容未写入日志。"
+                    if saved
+                    else f"冲突状态日志写入失败；原始备份 {backup_id} 仍保留。"
+                )
             raise WorkspaceConflictError(
                 f"检测到并发文件变化，目标未被替换；{snapshot_status}",
                 current_bytes=exc.current_bytes,
@@ -2288,13 +2696,558 @@ class Workspace:
             )
         return current_target
 
-    def _load_backups(self) -> list[tuple[Path, dict[str, Any]]]:
+    def _change_set_recovery_preview(
+        self,
+        change_set_id: str,
+        record: dict[str, Any] | None = None,
+    ) -> ChangeSetRecoveryPreview:
+        record = self._load_change_set_record(change_set_id) if record is None else self._validate_change_set_record(record)
+        if record["id"] != change_set_id:
+            raise WorkspaceError("变更集编号不匹配。")
+        backups: dict[str, dict[str, Any]] = {}
+        for entry in record["files"]:
+            matched = self._load_backups(backup_id=entry["backup_id"])
+            if matched:
+                backups[entry["backup_id"]] = matched[0][1]
+        from .sessions import contains_likely_secret
+
+        items: list[ChangeSetRecoveryItem] = []
+        rendered = [
+            f"变更集 {change_set_id} 恢复审阅；只恢复仍与本批写入版本匹配的文件。",
+            "跨文件不是原子事务；未列为待恢复的冲突文件保持原样。",
+        ]
+        digest_items: list[dict[str, Any]] = []
+        for index, entry in enumerate(record["files"]):
+            backup = backups.get(entry["backup_id"])
+            if backup is not None and (
+                backup.get("change_set_id") != change_set_id
+                or backup.get("change_set_index") != index + 1
+                or backup.get("path") != entry["path"]
+                or backup.get("before_exists") is not True
+                or backup.get("state") not in {"pending", "committed", "conflict"}
+                or backup.get("before_mode") != entry["before_mode"]
+                or backup.get("after_mode") != entry["after_mode"]
+                or backup.get("before_acl_sha256") != entry["before_acl_sha256"]
+                or backup.get("after_acl_permissions_sha256") != entry["after_acl_permissions_sha256"]
+                or backup.get("after_sha256") != entry["after_sha256"]
+            ):
+                raise WorkspaceError("变更集备份关联无效；未执行恢复。")
+            try:
+                target = self._resolve_write_target(entry["path"])
+                current_bytes, current_info = self._read_snapshot_state(target, validate_utf8=False)
+                current_acl_token = (
+                    self._windows_dacl_token(target)
+                    if os.name == "nt" and current_info is not None
+                    else None
+                )
+            except WorkspaceError:
+                target = None
+                current_bytes = None
+                current_info = None
+                current_acl_token = None
+            current_sha256 = hashlib.sha256(current_bytes).hexdigest() if current_bytes is not None else None
+            current_mode = stat.S_IMODE(current_info.st_mode) if current_info is not None else None
+            before_bytes: bytes | None = None
+            if backup is not None:
+                encoded_before = backup.get("before_base64")
+                if not isinstance(encoded_before, str):
+                    raise WorkspaceError("变更集备份缺少原文件内容；未执行恢复。")
+                try:
+                    before_bytes = base64.b64decode(encoded_before, validate=True)
+                    before_bytes.decode("utf-8")
+                except (ValueError, UnicodeDecodeError):
+                    raise WorkspaceError("变更集备份内容无效；未执行恢复。") from None
+                if (
+                    len(before_bytes) > READ_LIMIT_BYTES
+                    or hashlib.sha256(before_bytes).hexdigest() != entry["before_sha256"]
+                    or contains_likely_secret(before_bytes.decode("utf-8"))
+                ):
+                    raise WorkspaceError("变更集备份校验失败或含疑似凭据；未执行恢复。")
+
+            status = "conflict"
+            if current_bytes is not None and current_info is not None:
+                if backup is None:
+                    if (
+                        current_sha256 == entry["before_sha256"]
+                        and current_mode == entry["before_mode"]
+                        and self._acl_sha256(current_acl_token) == entry["before_acl_sha256"]
+                    ):
+                        status = "not_applied"
+                elif backup.get("state") != "conflict":
+                    permissions_match = True
+                    if os.name == "nt":
+                        try:
+                            permissions_match = (
+                                self._acl_permissions_sha256(current_acl_token)
+                                == backup.get("after_acl_permissions_sha256")
+                            )
+                        except WorkspaceError:
+                            permissions_match = False
+                    if (
+                        current_sha256 == entry["before_sha256"]
+                        and current_mode == entry["after_mode"]
+                        and permissions_match
+                        and (
+                            backup.get("undone") is True
+                            or entry["status"] in {"restoring", "restore_failed", "restored"}
+                        )
+                    ):
+                        status = "restored"
+                    elif backup.get("undone") is True:
+                        status = "conflict"
+                    else:
+                        after_permissions_match = True
+                        if os.name == "nt":
+                            try:
+                                after_permissions_match = (
+                                    self._acl_permissions_sha256(current_acl_token)
+                                    == entry["after_acl_permissions_sha256"]
+                                )
+                            except WorkspaceError:
+                                after_permissions_match = False
+                        before_permissions_match = (
+                            self._acl_sha256(current_acl_token) == entry["before_acl_sha256"]
+                        )
+                        if (
+                            current_sha256 == entry["after_sha256"]
+                            and current_mode == entry["after_mode"]
+                            and after_permissions_match
+                        ):
+                            status = "will_restore"
+                        elif (
+                            current_sha256 == entry["before_sha256"]
+                            and current_mode == entry["before_mode"]
+                            and before_permissions_match
+                        ):
+                            status = "not_applied"
+
+            restore_bytes = before_bytes if status == "will_restore" else None
+            if status == "will_restore":
+                assert current_bytes is not None and current_info is not None and restore_bytes is not None
+                try:
+                    current_text = current_bytes.decode("utf-8")
+                    restore_text = restore_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    raise WorkspaceError("待恢复文件不再是 UTF-8 文本；未执行恢复。") from None
+                diff = self._diff(entry["path"], current_text, restore_text)
+                rendered.append(f"\n[{index + 1}/{len(record['files'])}] {entry['path']}：待恢复\n{diff}")
+            else:
+                labels = {
+                    "not_applied": "尚未写入，当前仍为审阅的原文件",
+                    "failed": "本文件写入失败，当前仍为原文件",
+                    "restored": "已恢复",
+                    "conflict": "冲突；当前内容或权限与本批版本不符，保持不动",
+                }
+                rendered.append(f"\n[{index + 1}/{len(record['files'])}] {entry['path']}：{labels[status]}")
+            items.append(
+                ChangeSetRecoveryItem(
+                    path=entry["path"],
+                    status=status,
+                    backup_id=entry["backup_id"],
+                    before_sha256=entry["before_sha256"],
+                    after_sha256=entry["after_sha256"],
+                    current_bytes=current_bytes,
+                    current_info=current_info,
+                    current_acl_token=current_acl_token,
+                    restore_bytes=restore_bytes,
+                    backup_record=backup,
+                )
+            )
+            digest_items.append(
+                {
+                    "index": index,
+                    "status": status,
+                    "sha256": current_sha256,
+                    "mode": current_mode,
+                    "stat_token": self._stat_token(current_info),
+                    "acl_sha256": self._acl_sha256(current_acl_token),
+                }
+            )
+        diff = "".join(rendered)
+        if len(diff.encode("utf-8")) > CHANGE_SET_DIFF_LIMIT_BYTES:
+            raise WorkspaceError("变更集恢复差异超过审阅上限；没有执行恢复。")
+        digest = hashlib.sha256(
+            json.dumps(digest_items, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return ChangeSetRecoveryPreview(change_set_id, record, tuple(items), diff, digest)
+
+    @staticmethod
+    def _change_set_result(record: dict[str, Any], prefix: str) -> str:
+        labels = {
+            "pending": "未开始",
+            "applying": "处理中",
+            "committed": "已改",
+            "failed": "失败，未确认写入",
+            "restoring": "恢复中",
+            "restore_failed": "恢复未完成",
+            "restored": "已恢复",
+            "not_applied": "未改",
+            "conflict": "冲突，未覆盖",
+        }
+        states = "；".join(
+            f"{entry['path']}：{labels.get(entry['status'], '状态未知')}"
+            for entry in record["files"]
+        )
+        return f"{prefix} 变更集 {record['id']}；{states}。"
+
+    def _mark_change_set_backup_undone(self, backup_id: str) -> None:
+        backup_dir = self._backup_dir(create=False)
+        if backup_dir is None:
+            raise WorkspaceError("变更集原始备份目录缺失。")
+        backup_path = backup_dir / f"{backup_id}.json"
+        records = self._load_backups(backup_id=backup_id)
+        if not records:
+            raise WorkspaceError("变更集原始备份无法读取。")
+        backup_path, backup = records[0]
+        backup["undone"] = True
+        backup["undone_ns"] = time.time_ns()
+        self._atomic_write_json(backup_path, backup)
+
+    def _execute_change_set_restoration(
+        self,
+        preview: ChangeSetRecoveryPreview,
+        *,
+        explicit: bool,
+        cancellation_event: Any | None = None,
+    ) -> str:
+        record = preview.record
+        fresh = self._change_set_recovery_preview(preview.change_set_id, record)
+        if fresh.digest != preview.digest:
+            return self._change_set_result(record, "恢复预览期间文件状态发生变化，整批恢复已取消；请重新审阅。")
+        candidates = [item for item in fresh.items if item.status == "will_restore"]
+        has_reconciliations = any(
+            item.status == "restored"
+            and item.backup_record is not None
+            and item.backup_record.get("undone") is not True
+            for item in fresh.items
+        )
+        if not candidates and not has_reconciliations:
+            for index, item in enumerate(fresh.items):
+                record["files"][index]["status"] = item.status
+            complete = all(item.status in {"restored", "not_applied"} for item in fresh.items)
+            record["state"] = (
+                ("recovered" if explicit else "rolled_back")
+                if complete
+                else "recovery_required"
+            )
+            try:
+                self._write_change_set_record(record)
+            except WorkspaceError:
+                record["state"] = "recovery_required"
+                return self._change_set_result(record, "没有文件可安全恢复，且无法更新状态日志。")
+            return self._change_set_result(
+                record,
+                "所有文件均未应用或已恢复；没有文件内容写入。"
+                if complete
+                else "没有仍匹配本批写入版本的文件可恢复；冲突文件保持不动。",
+            )
+
+        record["state"] = "recovery_in_progress" if explicit else "rolling_back"
+        for index, item in enumerate(fresh.items):
+            record["files"][index]["status"] = (
+                "restoring" if item.status == "will_restore" else item.status
+            )
+        try:
+            self._write_change_set_record(record)
+        except WorkspaceError:
+            return self._change_set_result(record, "无法更新变更集恢复日志，未开始恢复。")
+
+        for index, item in enumerate(fresh.items):
+            if (
+                item.status == "restored"
+                and item.backup_record is not None
+                and item.backup_record.get("undone") is not True
+            ):
+                try:
+                    self._mark_change_set_backup_undone(item.backup_id)
+                    record["files"][index]["status"] = "restored"
+                    self._write_change_set_record(record)
+                except WorkspaceError:
+                    record["files"][index]["status"] = "restore_failed"
+                    record["state"] = "recovery_required"
+                    try:
+                        self._write_change_set_record(record)
+                    except WorkspaceError:
+                        pass
+                    return self._change_set_result(record, "已恢复文件的备份标记无法更新；停止后续文件操作。")
+
+        stop_reason: str | None = None
+        for item in reversed(fresh.items):
+            index = next(i for i, candidate in enumerate(fresh.items) if candidate.path == item.path)
+            entry = record["files"][index]
+            if item.status != "will_restore":
+                entry["status"] = item.status
+                continue
+            if explicit and cancellation_event is not None and cancellation_event.is_set():
+                entry["status"] = "restore_failed"
+                stop_reason = "用户取消了恢复；未开始的文件保持原样。"
+                try:
+                    record["state"] = "recovery_required"
+                    self._write_change_set_record(record)
+                except WorkspaceError:
+                    pass
+                break
+            try:
+                if item.current_bytes is None or item.current_info is None or item.restore_bytes is None:
+                    raise WorkspaceConflictError(
+                        "恢复预览缺少完整文件版本；目标未修改。",
+                        current_bytes=item.current_bytes,
+                        current_mode=(
+                            stat.S_IMODE(item.current_info.st_mode)
+                            if item.current_info is not None else None
+                        ),
+                        current_acl_token=item.current_acl_token,
+                    )
+                target = self._resolve_write_target(item.path)
+                self._atomic_write_bytes(
+                    target,
+                    item.restore_bytes,
+                    guarded=True,
+                    expected_before_bytes=item.current_bytes,
+                    expected_before_mode=stat.S_IMODE(item.current_info.st_mode),
+                    expected_before_token=self._stat_token(item.current_info),
+                    expected_before_acl_token=item.current_acl_token,
+                )
+            except WorkspaceConflictError:
+                entry["status"] = "conflict"
+            except WorkspaceError:
+                entry["status"] = "restore_failed"
+                stop_reason = "某文件恢复未完成；已停止后续恢复，请重新审阅当前状态。"
+            else:
+                try:
+                    self._mark_change_set_backup_undone(item.backup_id)
+                    entry["status"] = "restored"
+                except WorkspaceError:
+                    entry["status"] = "restore_failed"
+                    stop_reason = "文件内容已恢复，但备份标记未完成；已停止后续恢复。"
+            try:
+                self._write_change_set_record(record)
+            except WorkspaceError:
+                entry["status"] = "restore_failed"
+                record["state"] = "recovery_required"
+                stop_reason = "恢复后无法更新变更集日志；停止后续文件操作。"
+                break
+            if stop_reason:
+                record["state"] = "recovery_required"
+                break
+
+        complete = all(item["status"] in {"restored", "not_applied"} for item in record["files"])
+        if complete:
+            record["state"] = "recovered" if explicit else "rolled_back"
+        else:
+            record["state"] = "recovery_required"
+        try:
+            self._write_change_set_record(record)
+        except WorkspaceError:
+            record["state"] = "recovery_required"
+            stop_reason = stop_reason or "恢复结果日志未能完整更新；请在下次启动时重新检查状态。"
+        if stop_reason:
+            return self._change_set_result(record, stop_reason)
+        if complete:
+            return self._change_set_result(
+                record,
+                "变更集已完成逆序恢复；没有跨文件原子事务保证。" if not explicit
+                else "变更集恢复完成；没有跨文件原子事务保证。",
+            )
+        return self._change_set_result(record, "部分文件恢复完成，冲突或失败文件保持未覆盖；需要再次审阅恢复状态。")
+
+    def apply_change_set(
+        self,
+        changes: Any,
+        *,
+        approve_action: ApprovalCallback,
+        cancellation_event: Any | None = None,
+    ) -> str:
+        preview = self.preview_change_set(changes)
+        change_set_id = uuid.uuid4().hex
+        created_ns = time.time_ns()
+        backup_ids = [f"{time.time_ns()}-{uuid.uuid4().hex}" for _ in preview.changes]
+        review = (
+            f"变更集审阅编号：{change_set_id}\n"
+            f"整批预检：{len(preview.changes)} 个现有 UTF-8 文件；原文件备份合计 {preview.backup_bytes} bytes；"
+            f"输入 {preview.payload_bytes} bytes。\n"
+            f"完整差异指纹：{preview.digest}\n"
+            + preview.diff
+            + "\n只会审批并尝试应用上列全部文件；任一文件变化都会中止后续写入并尝试逆序恢复。"
+            "跨文件不是原子事务；每个文件仍只有最后版本检查后的窄竞态窗口。"
+        )
+        if _safe_terminal_display_length(review) > CHANGE_SET_DIFF_LIMIT_BYTES * 2:
+            raise WorkspaceError("变更集审批预览超过显示上限；整批未审批、未写入。")
+        if not approve_action(
+            ActionRequest(
+                operation="change_set",
+                path=change_set_id,
+                diff=review,
+                source="tool",
+            )
+        ):
+            return f"用户拒绝整个变更集 {change_set_id}；没有写入文件或创建备份。"
+        _raise_if_cancelled(cancellation_event)
+
+        # Revalidate every member before creating any backup or replacing a file.
+        for item in preview.changes:
+            self._revalidate_write_preview(item)
+        self._prune_change_set_logs()
+
+        files: list[dict[str, Any]] = []
+        for index, (item, before_sha256, backup_id) in enumerate(
+            zip(preview.changes, preview.file_sha256, backup_ids), 1
+        ):
+            after_bytes = item.new_content.encode("utf-8")
+            files.append(
+                {
+                    "path": item.canonical_path,
+                    "before_sha256": before_sha256,
+                    "after_sha256": hashlib.sha256(after_bytes).hexdigest(),
+                    "before_mode": item.before_mode,
+                    "after_mode": item.before_mode & 0o777 if item.before_mode is not None else 0,
+                    "before_acl_sha256": self._acl_sha256(item.before_acl_token),
+                    "after_acl_permissions_sha256": self._acl_permissions_sha256(item.before_acl_token),
+                    "backup_id": backup_id,
+                    "status": "pending",
+                }
+            )
+        record: dict[str, Any] = {
+            "version": 1,
+            "id": change_set_id,
+            "created_ns": created_ns,
+            "updated_ns": created_ns,
+            "state": "applying",
+            "files": files,
+        }
+        self._write_change_set_record(record)
+
+        try:
+            for index, (item, entry) in enumerate(zip(preview.changes, record["files"]), 1):
+                _raise_if_cancelled(cancellation_event)
+                entry["status"] = "applying"
+                self._write_change_set_record(record)
+                self.commit_write(
+                    item,
+                    cancellation_event=cancellation_event,
+                    backup_id=entry["backup_id"],
+                    change_set_id=change_set_id,
+                    change_set_index=index,
+                    persist_conflict_snapshot=False,
+                )
+                entry["status"] = "committed"
+                self._write_change_set_record(record)
+            record["state"] = "completed"
+            self._write_change_set_record(record)
+            return self._change_set_result(record, "已应用全部文件变更")
+        except ProviderCancelled:
+            record["state"] = "rolling_back"
+            try:
+                self._write_change_set_record(record)
+            except WorkspaceError:
+                pass
+            try:
+                recovery = self._change_set_recovery_preview(change_set_id, record)
+                result = self._execute_change_set_restoration(recovery, explicit=False)
+            except WorkspaceError:
+                record["state"] = "recovery_required"
+                try:
+                    self._write_change_set_record(record)
+                except WorkspaceError:
+                    pass
+                result = self._change_set_result(record, "取消后无法安全完成自动恢复")
+            return result
+        except WorkspaceError:
+            if record["files"]:
+                for entry in record["files"]:
+                    if entry["status"] == "applying":
+                        entry["status"] = "failed"
+                        break
+            record["state"] = "rolling_back"
+            try:
+                self._write_change_set_record(record)
+            except WorkspaceError:
+                pass
+            try:
+                recovery = self._change_set_recovery_preview(change_set_id, record)
+                return self._execute_change_set_restoration(recovery, explicit=False)
+            except WorkspaceError:
+                record["state"] = "recovery_required"
+                try:
+                    self._write_change_set_record(record)
+                except WorkspaceError:
+                    pass
+                return self._change_set_result(record, "变更集失败，自动恢复无法安全完成")
+        except BaseException:
+            record["state"] = "rolling_back"
+            try:
+                self._write_change_set_record(record)
+                recovery = self._change_set_recovery_preview(change_set_id, record)
+                self._execute_change_set_restoration(recovery, explicit=False)
+            except BaseException:
+                record["state"] = "recovery_required"
+                try:
+                    self._write_change_set_record(record)
+                except BaseException:
+                    pass
+            raise
+
+    def recover_change_set(
+        self,
+        change_set_id: str,
+        *,
+        approve_action: ApprovalCallback,
+        cancellation_event: Any | None = None,
+    ) -> str:
+        record = self._load_change_set_record(change_set_id)
+        if record["state"] in {"completed", "rolled_back", "recovered"}:
+            return self._change_set_result(record, "该变更集没有待恢复状态")
+        preview = self._change_set_recovery_preview(change_set_id, record)
+        if not any(item.status == "will_restore" for item in preview.items):
+            return self._execute_change_set_restoration(preview, explicit=True)
+        if not approve_action(
+            ActionRequest(
+                operation="change_set_recovery",
+                path=change_set_id,
+                diff=preview.diff,
+                source="command",
+            )
+        ):
+            return self._change_set_result(record, "用户拒绝本次变更集恢复；文件未修改")
+        _raise_if_cancelled(cancellation_event)
+        return self._execute_change_set_restoration(
+            preview,
+            explicit=True,
+            cancellation_event=cancellation_event,
+        )
+
+    def describe_incomplete_change_sets(self) -> str:
+        records = self.list_incomplete_change_sets()
+        if not records:
+            return "没有未完成的多文件变更集。"
+        items = "\n".join(
+            f"{record['id']}：{record['state']}；"
+            + "、".join(f"{entry['path']}（{entry['status']}）" for entry in record["files"])
+            for record in records
+        )
+        return (
+            f"发现 {len(records)} 个未完成变更集；启动时不会自动恢复或重放审批。\n{items}\n"
+            "使用 /变更集 恢复 <编号> 可审阅当前文件状态，并在单独确认后尝试安全恢复。"
+        )
+
+    def _load_backups(self, *, backup_id: str | None = None) -> list[tuple[Path, dict[str, Any]]]:
         backup_dir = self._backup_dir(create=False)
         if backup_dir is None:
             return []
         records: list[tuple[Path, dict[str, Any]]] = []
         try:
-            for path in backup_dir.glob("*.json"):
+            if backup_id is None:
+                paths = backup_dir.glob("*.json")
+            else:
+                if re.fullmatch(r"[0-9]+-[0-9a-f]{32}", backup_id) is None:
+                    raise WorkspaceError("撤销备份编号无效。")
+                candidate = backup_dir / f"{backup_id}.json"
+                try:
+                    candidate.lstat()
+                except FileNotFoundError:
+                    return []
+                paths = (candidate,)
+            for path in paths:
                 if self._is_reparse_point(path):
                     raise WorkspaceError(f"拒绝读取链接形式的撤销备份：{path.name}")
                 if path.stat().st_size > WRITE_LIMIT_BYTES * 4:
@@ -2334,6 +3287,27 @@ class Workspace:
                             type(data.get("before_mode")) is not int
                             or not 0 <= data["before_mode"] <= 0o7777
                         )
+                    )
+                    or (
+                        "after_mode" in data
+                        and data.get("after_mode") is not None
+                        and (
+                            type(data["after_mode"]) is not int
+                            or not 0 <= data["after_mode"] <= 0o777
+                        )
+                    )
+                    or (
+                        "change_set_id" in data
+                        and (
+                            not isinstance(data.get("change_set_id"), str)
+                            or re.fullmatch(r"[0-9a-f]{32}", data.get("change_set_id", "")) is None
+                            or type(data.get("change_set_index")) is not int
+                            or not 1 <= data["change_set_index"] <= CHANGE_SET_MAX_FILES
+                        )
+                    )
+                    or (
+                        "change_set_index" in data
+                        and "change_set_id" not in data
                     )
                     or (
                         data.get("before_exists")
@@ -2971,6 +3945,20 @@ def run_tool(
         if backup_id is None:
             return "补丁结果与当前文件相同，没有写入。"
         return f"已应用精确补丁并创建撤销备份 {backup_id}：{preview.canonical_path}"
+
+    if call.name == "apply_change_set":
+        _raise_if_cancelled(cancellation_event)
+        _validate_arguments(call, {"changes"})
+        if plan_only:
+            return "计划模式：已在工具层拦截多文件变更集；没有审批或修改文件。"
+        result = workspace.apply_change_set(
+            call.arguments["changes"],
+            approve_action=approve_action,
+            cancellation_event=cancellation_event,
+        )
+        if emit_output is not None and "已应用全部文件变更" not in result:
+            emit_output(f"变更集本地执行状态：{result}")
+        return result
 
     if call.name == "run_test_profile":
         _raise_if_cancelled(cancellation_event)

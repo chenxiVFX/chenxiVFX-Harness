@@ -135,10 +135,15 @@ class PromptToolkitTests(unittest.TestCase):
                 Document("/配置 提供商 deepseek-a"), CompleteEvent()
             )
         ]
+        change_set_values = [
+            item.text
+            for item in completer.get_completions(Document("/变更集 恢"), CompleteEvent())
+        ]
         self.assertEqual(plan_values, ["接受"])
         self.assertEqual(compression_values, ["撤销"])
         self.assertIn("编辑", config_values)
         self.assertEqual(provider_values, ["deepseek-anthropic"])
+        self.assertEqual(change_set_values, ["恢复"])
 
     def test_tui_config_editor_reviews_then_persists_through_input_events(self) -> None:
         from cvfx_harness.config import WorkspaceConfigStore
@@ -1125,6 +1130,39 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(received, ["是"])
         self.assertIn("当前选择：是", ui._notice)
+
+    def test_change_set_approval_keeps_full_diff_in_transcript_and_compacts_dock(self) -> None:
+        received: list[str] = []
+        review = (
+            "\n多文件变更集完整审阅（编号 0123456789abcdef）：\n"
+            "变更集审阅编号：0123456789abcdef\n"
+            "文件：a.txt\n原文件 SHA-256：0123456789abcdef…\n"
+            "精确差异\n-旧内容甲\n+新内容甲\n"
+            "文件：b.txt\n原文件 SHA-256：fedcba9876543210…\n"
+            "精确差异\n-旧内容乙\n+新内容乙"
+        )
+
+        def worker(ui: TerminalUI) -> int:
+            ui.output(review)
+            received.append(ui.input("确认应用整批变更？[y/N] "))
+            return 0
+
+        def send(pipe, ui: TerminalUI) -> None:
+            self._wait_until(
+                lambda: ui._pending is not None and ui._pending.approval,
+                "change-set approval was not shown",
+            )
+            self.assertIn("0123456789abcdef", ui._approval_text)
+            self.assertNotIn("新内容甲", ui._approval_text)
+            self.assertNotIn("新内容乙", ui._approval_text)
+            self.assertIn("新内容甲", ui._transcript)
+            self.assertIn("新内容乙", ui._transcript)
+            pipe.send_text("\t\r")
+
+        ui, result = self._run_ui(worker, send)
+        self.assertEqual(result, 0)
+        self.assertEqual(received, ["是"])
+        self.assertIn("审批选择：是（本次）", ui._transcript)
 
     def test_enter_after_focus_moves_to_transcript_does_not_confirm_approval(self) -> None:
         received: list[str] = []
