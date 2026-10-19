@@ -1167,6 +1167,74 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(captured["accept"], "text/event-stream")
         self.assertTrue(captured["request"]["stream"])
 
+    def test_openai_subagent_uses_local_fixture_with_only_preapproved_read_tools(self) -> None:
+        from cvfx_harness.subagents import SubagentManager, build_delegation_plan
+
+        tool_arguments = json.dumps({"path": "safe.txt"}, ensure_ascii=False, separators=(",", ":"))
+        responses = [
+            fixture_sse_frames([
+                {"choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "child-read-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": tool_arguments},
+                }]}, "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+            ]),
+            fixture_sse_frames([
+                {"choices": [{"index": 0, "delta": {"content": "合成文件核对完成"}, "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            ]),
+        ]
+        requests: list[dict[str, object]] = []
+        authorizations: list[str | None] = []
+
+        def serve(handler, request_body: bytes) -> None:
+            requests.append(json.loads(request_body.decode("utf-8")))
+            authorizations.append(handler.headers.get("Authorization"))
+            body = responses.pop(0)
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
+        server, worker = local_http_fixture(serve)
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "synthetic-child", timeout=2, stream_timeout=2
+            )
+            with make_test_temp(prefix="subagent-local-http-") as temp:
+                workspace = Workspace(temp)
+                (Path(temp) / "safe.txt").write_text("本地合成子代理文件内容", encoding="utf-8")
+                manager = SubagentManager(provider, workspace)
+                manager.submit(
+                    build_delegation_plan("只核对被批准的文件"),
+                    read_paths=("safe.txt",),
+                    approve_action=lambda _request: True,
+                )
+                deadline = time.monotonic() + 4
+                terminal = {"completed", "failed", "timed_out", "cancelled", "budget_exhausted"}
+                while manager.snapshots()[0].status not in terminal and time.monotonic() < deadline:
+                    threading.Event().wait(0.01)
+                snapshot = manager.snapshots()[0]
+                self.assertEqual(snapshot.status, "completed", snapshot.result.failure if snapshot.result else "")
+                self.assertEqual(snapshot.result.content, "合成文件核对完成")
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(authorizations, [None, None])
+        self.assertTrue(requests[0]["stream"])
+        self.assertEqual([tool["function"]["name"] for tool in requests[0]["tools"]], ["read_file"])
+        self.assertNotIn("write_file", json.dumps(requests[0]["tools"], ensure_ascii=False))
+        self.assertEqual([message["role"] for message in requests[0]["messages"]], ["system", "user"])
+        self.assertEqual([message["role"] for message in requests[1]["messages"]], ["system", "user", "assistant", "tool"])
+        self.assertIn("本地合成子代理文件内容", requests[1]["messages"][-1]["content"])
+        self.assertNotIn("parent conversation", json.dumps(requests, ensure_ascii=False))
+
     def test_sse_streamed_tool_calls_roundtrip_through_existing_approval_loop(self) -> None:
         request_bodies: list[dict[str, object]] = []
         responses = [

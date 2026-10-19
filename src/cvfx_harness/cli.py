@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shlex
 import sys
 import unicodedata
 from dataclasses import replace
@@ -26,7 +27,7 @@ from .providers import (
 )
 from .plans import MAX_PLAN_STEPS, MAX_STEP_CHARS, PlanError, PlanStore, PlanStatus
 from .sessions import SessionError, SessionStore, redact_likely_secrets
-from .subagents import DelegationPlanError, build_delegation_plan, run_bounded_subagents
+from .subagents import DelegationPlanError, SubagentManager, build_delegation_plan
 from .tools import ActionRequest, Workspace, WorkspaceError
 from .usage import DEFAULT_TOKEN_BUDGET
 
@@ -231,7 +232,11 @@ def _help_text() -> str:
   /配置 端点 <DeepSeek HTTPS URL>|默认
   /配置 预算 <1024–1000000>
   /配置 输出上限 <1–65536>
-  /子代理 任务 | 任务  逐项批准后执行最多 3 个隔离的一次性 Mock 子任务
+  /子代理 提交 [--读取 路径 ... --] 任务 | 任务
+                          逐项批准并提交最多 3 个隔离子任务
+  /子代理 列表 [编号]     查看子任务状态和共享预算
+  /子代理 取消 <编号>     请求取消排队中或运行中的子任务
+  /子代理 收取 [编号|全部] 将完成结果作为不可信上下文加入主对话
   /撤销              预览并恢复最近一次 Harness 文件写入
   /退出              结束会话
 
@@ -264,10 +269,11 @@ def _confirm_action(
     elif request.operation == "delegate":
         scope = _safe_terminal_text(request.diff) or "（没有任务内容）"
         output(
-            "\n子代理审批范围：每个子代理仅接收下列任务文本；不包含主会话、文件引用或工具结果。\n"
-            f"{scope}\n每项仅允许一次无工具调用，子代理深度为 0，结果为不可信文本。"
+            "\n子代理审批范围：每个子代理只接收所列任务及明确列出的只读路径；"
+            "不包含主会话、父代理文件引用或父代理工具结果。\n"
+            f"{scope}\n每项最多两轮；没有列出的路径和工具不可用；无写入、shell 或递归委派权限；结果为不可信文本。"
         )
-        prompt = "确认启动这些只读 Mock 子代理？[y/N] "
+        prompt = "确认授权这些隔离子任务？[y/N] "
     elif request.operation == "write":
         change_kind = (
             "新建文件" if request.file_existed is False
@@ -321,6 +327,7 @@ def run_console(
         token_budget=startup_config.token_budget,
         max_output_tokens=startup_config.max_output_tokens,
     )
+    subagent_manager = SubagentManager(provider, workspace)
     session_store = SessionStore(workspace)
     plan_store = PlanStore(workspace)
     try:
@@ -341,9 +348,11 @@ def run_console(
         try:
             line = input_fn(f"你[{mode}]> ")
         except EOFError:
+            subagent_manager.cancel_all()
             output("\n会话结束。")
             return 0
         except KeyboardInterrupt:
+            subagent_manager.cancel_all()
             output("\n已取消当前交互。")
             return 130
 
@@ -357,6 +366,7 @@ def run_console(
             output(_help_text())
             continue
         if command in {"/退出", "/exit", "/quit"}:
+            subagent_manager.cancel_all()
             output("会话结束。")
             return 0
         if command in {"/状态", "/status"}:
@@ -834,16 +844,102 @@ def run_console(
             output("压缩已应用；历史摘要保留为不可信用户消息，系统提示未更改。")
             continue
         if command in {"/子代理", "/delegate"}:
+            subcommand, _, subargument = argument.strip().partition(" ")
+            normalized_subcommand = subcommand.casefold()
+            if normalized_subcommand in {"列表", "list", "状态", "status"}:
+                requested_id = subargument.strip().upper()
+                snapshots = subagent_manager.snapshots()
+                if requested_id:
+                    snapshots = tuple(item for item in snapshots if item.task_id == requested_id)
+                if not snapshots:
+                    output("没有匹配的子任务。" if requested_id else "当前没有子任务。")
+                else:
+                    lines = [
+                        f"{item.task_id} [{item.status}] {_safe_terminal_text(item.task)}"
+                        + (f"（输出 {item.result.output_tokens} tokens）" if item.result else "")
+                        + ("（已收取）" if item.collected else "")
+                        for item in snapshots
+                    ]
+                    output("\n".join(lines) + "\n" + subagent_manager.budget_status())
+                continue
+            if normalized_subcommand in {"取消", "cancel"}:
+                task_id = subargument.strip()
+                try:
+                    cancelled = subagent_manager.cancel(task_id)
+                except DelegationPlanError as exc:
+                    output(f"取消失败：{exc}")
+                    continue
+                output(
+                    f"已请求取消 {task_id.upper()}；若正在读取模型响应，会在下一检查点停止。"
+                    if cancelled
+                    else f"{task_id.upper()} 不存在或已经结束。"
+                )
+                continue
+            if normalized_subcommand in {"收取", "collect"}:
+                requested = subargument.strip()
+                if not requested or requested.casefold() in {"全部", "all"}:
+                    ids = None
+                else:
+                    ids = (requested.upper(),)
+                try:
+                    collection = subagent_manager.collect(ids)
+                except DelegationPlanError as exc:
+                    output(f"收取失败：{exc}")
+                    continue
+                if collection.summary:
+                    try:
+                        agent.add_untrusted_subagent_results(collection.summary)
+                    except ValueError as exc:
+                        output(f"结果未加入主对话：{exc}")
+                        continue
+                    output(_safe_terminal_text(collection.summary))
+                    output(f"已收取 {len(collection.results)} 项结果；它们已作为不可信内容加入主对话，不会进入会话存档。")
+                else:
+                    output("没有可收取的已完成子任务结果。")
+                if collection.unavailable_ids:
+                    output("仍在运行或等待中的子任务：" + ", ".join(collection.unavailable_ids))
+                continue
+
+            if normalized_subcommand in {"提交", "submit"}:
+                read_paths: tuple[str, ...] = ()
+                if " -- " in subargument:
+                    option_text, raw_plan = subargument.split(" -- ", 1)
+                    try:
+                        options = shlex.split(option_text, posix=True)
+                    except ValueError:
+                        output("委派参数无效；路径含空格时请用引号。")
+                        continue
+                    parsed_paths: list[str] = []
+                    option_index = 0
+                    while option_index < len(options):
+                        if options[option_index] not in {"--读取", "--read"} or option_index + 1 >= len(options):
+                            output("用法：/子代理 提交 [--读取 <相对路径>]... -- <任务> [| <任务>]")
+                            break
+                        parsed_paths.append(options[option_index + 1])
+                        option_index += 2
+                    else:
+                        read_paths = tuple(parsed_paths)
+                    if option_index < len(options):
+                        continue
+                else:
+                    raw_plan = subargument
+            else:
+                # Keep the earlier `/子代理 任务 | 任务` form working.
+                raw_plan = argument
+                read_paths = ()
+            if not raw_plan.strip():
+                output("用法：/子代理 提交 <任务> [| <任务>]；还可用 列表、取消、收取。")
+                continue
             try:
-                plan = build_delegation_plan(argument)
+                plan = build_delegation_plan(raw_plan)
             except DelegationPlanError as exc:
                 output(f"无法生成委派计划：{exc}")
                 continue
             try:
-                outcome = run_bounded_subagents(
+                submitted = subagent_manager.submit(
                     plan,
-                    provider,
                     approve_action=approve_action,
+                    read_paths=read_paths,
                 )
             except DelegationPlanError as exc:
                 output(f"无法执行受限子代理计划：{exc}")
@@ -851,7 +947,9 @@ def run_console(
             except KeyboardInterrupt:
                 output("已取消子代理审批；没有启动未确认的任务。")
                 continue
-            output(_safe_terminal_text(outcome.summary))
+            for item in submitted:
+                output(f"{item.task_id}：{item.status}；任务已逐项审批，结果可用 /子代理 列表 查看。")
+            output(subagent_manager.budget_status())
             continue
         if command in {"/撤销", "/undo"}:
             try:

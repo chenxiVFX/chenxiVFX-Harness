@@ -15,7 +15,7 @@ CLI：中文命令、文件引用、权限确认、压缩预览和会话切换
       │      └── Workspace：路径校验、读写审批、差异、撤销备份
       ├── SessionStore：.harness/sessions 下的安全对话与手写检查点 JSON
       ├── CompressionPreview：本地确定性摘录、摘要预览和确认后替换
-      └── DelegationPlan：逐项工具层审批后运行一次性、无工具的 Mock 子代理
+      └── SubagentManager：逐项授权、最多 2 并发的 Mock / OpenAI 只读子代理
 ```
 
 ## 对话与稳定前缀
@@ -57,8 +57,10 @@ OpenAI 兼容 CLI 通过 `complete_streaming` 使用 `text/event-stream`。SSE �
 - `.harness/config/settings.json` 只存 provider/model/Base URL/预算等非敏感设置，拒绝重复键、未识别字段和疑似凭据，不包含 API Key；仅支持 Mock 与 DeepSeek OpenAI 兼容模式。`--ignore-config` 只跳过此文件以便修复损坏配置。
 - 目录 symlink 与硬链接逃逸通过实际链接 fixture 集成测试覆盖；junction 仅适用于 Windows。当前 Linux/Windows 与 Python 3.11/3.12 跨平台 CI 矩阵全部通过；若 Windows 系统拒绝创建测试 fixture，对应 Windows 用例会明确跳过。
 - 普通 Python 进程不能提供 OS 级沙箱。若未来加入 shell，须先设计并实测工作区隔离，不能把路径检查误称为进程沙箱。
-- 子代理仅从 CLI 明确列出的任务创建；工具层逐项展示确切任务文本并要求审批。每个 child 新建独立的 system/user 消息列表，不继承父会话、文件引用、工具结果、目标或工具 schema。仅有 `MockProvider.complete_subagent` 被开放；每项一次调用、输入最多 512 估算 tokens、输出最多 256 估算 tokens、超时 5 秒、最多 3 项、深度 0。
-- 取消事件、预算和状态按 child 独立。失败、超时、取消、拒绝或预算耗尽不阻止其他已批准 child；结果只生成 JSON 编码的不可信汇总，不加入父 Agent 上下文，不调用文件/命令工具。
+- 子代理通过 CLI 明确创建；每项任务启动前都展示任务文本和只读路径并单独审批。Mock 与 OpenAI provider 都使用同一 `complete_subagent` 受限入口；OpenAI 子代理只发送独立的子任务消息和该任务授权范围内返回的读取结果，不复制父上下文。Provider 认证仍只走既有 HTTPS Authorization header。
+- 默认不提供文件工具。提交时可预授权最多 4 个现存工作区相对路径：文件对应 `read_file`，目录对应 `list_directory`；调用前再次通过 `Workspace` 校验，路径必须与授权路径完全匹配。工具 schema 过滤掉 `write_file`，首轮最多 2 个只读调用，第二轮只用于最终答复；没有 shell、递归委派或任意代码入口。子代理只执行最多 2 轮模型请求，深度为 0。
+- 每会话最多 3 项，最多 2 项并发；单项任务最多 240 字符，单轮估算输入最多 512 tokens，全会话最多 3072 估算输入 tokens，每项输出最多 256 tokens，全会话保留输出上限最多 768 tokens，任务时限 5 秒。每个子代理有独立取消事件；排队任务可即时取消，运行任务在 provider 检查点中止。超时、取消、失败、拒绝和预算耗尽为不同终态。
+- 结果先做疑似凭据脱敏，再 JSON 编码并转义可能伪造的封装标记。用户用 `收取` 后，结果以 `kind=subagent`、`persistable=False` 的 user 消息附加到父 Agent；不自动解析结果内的 `@` 文件引用。父会话的普通引用流程仍会对每个读取请求独立审批，子代理审批不等同父代理文件审批。
 - 非流式 OpenAI 请求在请求前和响应后检查取消；CLI 的 SSE 响应体采用短 socket 读取超时并轮询取消，建连/响应头等待仍由 provider timeout 约束。429 不自动重试；记录 provider 返回的 Token 用量，不估算货币成本，也不把价格写入代码。
 - OpenAI 兼容 CLI 只在该 provider 启动时读取 `DEEPSEEK_API_KEY`；环境密钥限定 HTTPS `api.deepseek.com:443`，不能通过 `HARNESS_BASE_URL` 转发到其他主机。`/配置` 不显示值，密钥只作为 Bearer 认证头，不加入对话、存档或 Harness 日志。Mock 不查询密钥变量。
 - Codex Cloud Network secret 可把 `DEEPSEEK_API_KEY` placeholder 交给程序，再由 HTTPS 代理向允许的 DeepSeek 目标替换真实值；官方文档没有确认本适配器 Bearer 头的端到端兼容性，本项目尚未使用真实密钥验证。普通环境变量会直接对 task 代码可见，云端应由用户自行选择 Network secret 并限定 Allowed domains。
@@ -68,6 +70,6 @@ OpenAI 兼容 CLI 通过 `complete_streaming` 使用 `text/event-stream`。SSE �
 
 - “目标模式”暂指把用户目标作为上下文展示，不自动拆计划，不扩大模型权限。
 - “PTC”暂指 Programmatic Tool Calling。当前没有 PTC 运行时；脚本、批量工具调用或命令执行需要用户澄清并另行设计权限模型。
-- “子代理”暂限制为最多 3 项、深度 0、每项一次调用，只能用离线 Mock provider；无工具、无 Shell、无递归。未来其他 provider/并行机制需重新审查取消和成本边界。
+- “子代理”限制为会话最多 3 项、深度 0、最多 2 轮，只能使用 Mock 或 OpenAI 兼容 provider 和预授权精确路径中的只读文件工具；无 shell、无写入、无递归。token 估算不等同 provider tokenizer；本机 fixture 覆盖接口路径，不代表线上模型行为或完整产品验收。
 
 详细实现矩阵与续作步骤见 [ROADMAP.md](ROADMAP.md)。

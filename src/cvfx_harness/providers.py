@@ -26,6 +26,12 @@ MAX_STREAM_EVENTS = 16384
 MAX_STREAM_ASSISTANT_BYTES = 2 * 1024 * 1024
 MAX_STREAM_DURATION_SECONDS = 120.0
 STREAM_READ_POLL_SECONDS = 0.25
+MAX_SUBAGENT_TASK_CHARS = 240
+MAX_SUBAGENT_TURNS = 2
+MAX_SUBAGENT_TOOL_CALLS_PER_TURN = 2
+MAX_SUBAGENT_INPUT_TOKENS = 512
+MAX_SUBAGENT_OUTPUT_TOKENS = 256
+MAX_SUBAGENT_TIMEOUT_SECONDS = 5.0
 _URL_CREDENTIAL_MARKER = re.compile(
     r"(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|authorization)(?:=|%3d)"
 )
@@ -214,6 +220,7 @@ class AssistantTurn:
     tool_calls: list[ToolCall] = field(default_factory=list)
     assistant_message: dict[str, Any] = field(default_factory=dict)
     usage: ProviderUsage | None = None
+    finish_reason: str | None = None
 
 
 class Provider(Protocol):
@@ -268,6 +275,7 @@ class MockProvider:
         self,
         messages: list[dict[str, Any]],
         *,
+        tools: list[dict[str, Any]] | None = None,
         timeout_seconds: float,
         max_output_tokens: int,
         cancellation_event: threading.Event,
@@ -276,7 +284,7 @@ class MockProvider:
             raise ProviderCancelled("subagent cancelled")
         if timeout_seconds <= 0:
             raise TimeoutError("subagent deadline elapsed")
-        turn = self.complete(messages, [])
+        turn = self.complete(messages, tools or [], cancellation_event=cancellation_event, max_tokens=max_output_tokens)
         content = turn.content
         while content and estimate_tokens(content) > max_output_tokens:
             content = content[:-1]
@@ -390,6 +398,7 @@ class OpenAICompatibleProvider:
         cancellation_event: threading.Event | None = None,
         max_tokens: int = 2048,
         on_text_delta: Callable[[str], None],
+        timeout_seconds: float | None = None,
     ) -> AssistantTurn:
         """Receive bounded SSE deltas; never return partial tool calls to Agent."""
         if cancellation_event is not None and cancellation_event.is_set():
@@ -398,6 +407,15 @@ class OpenAICompatibleProvider:
             raise ProviderError("max_tokens must be between 1 and 65536")
         if not callable(on_text_delta):
             raise ProviderStreamError("SSE 文本回调无效。")
+        stream_timeout = self.stream_timeout
+        if timeout_seconds is not None:
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or not 0 < timeout_seconds <= MAX_STREAM_DURATION_SECONDS
+            ):
+                raise ProviderStreamError("SSE 单次请求时限无效。")
+            stream_timeout = min(stream_timeout, float(timeout_seconds))
 
         body: dict[str, Any] = {
             "model": self.model,
@@ -553,11 +571,11 @@ class OpenAICompatibleProvider:
             return False
 
         parser = _SSEParser(collect_event)
-        deadline = time.monotonic() + self.stream_timeout
+        deadline = time.monotonic() + stream_timeout
         try:
             with urllib.request.urlopen(
                 request,
-                timeout=min(self.timeout, self.stream_timeout),
+                timeout=min(self.timeout, stream_timeout),
             ) as response:
                 headers = getattr(response, "headers", None)
                 content_type = ""
@@ -656,16 +674,112 @@ class OpenAICompatibleProvider:
             ]
         return self._turn_from_payload(
             {
-                "choices": [{"message": message}],
+                "choices": [{"message": message, "finish_reason": finish_reason}],
                 "usage": usage_value,
             }
         )
 
+    def complete_subagent(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        timeout_seconds: float,
+        max_output_tokens: int,
+        cancellation_event: threading.Event,
+    ) -> AssistantTurn:
+        """Run an isolated SSE turn with only the canonical, user-approved read tools."""
+        if cancellation_event.is_set():
+            raise ProviderCancelled("subagent cancelled")
+        if (
+            not isinstance(messages, list)
+            or not 2 <= len(messages) <= 5
+            or not all(isinstance(item, dict) for item in messages)
+            or messages[0].get("role") != "system"
+            or messages[1].get("role") != "user"
+            or not isinstance(messages[0].get("content"), str)
+            or not isinstance(messages[1].get("content"), str)
+            or len(messages[1]["content"]) > MAX_SUBAGENT_TASK_CHARS
+            or any(item.get("role") not in {"system", "user", "assistant", "tool"} for item in messages)
+            or any(item.get("role") == "system" for item in messages[1:])
+            or any(item.get("role") == "user" for item in messages[2:])
+        ):
+            raise ProviderError("子代理上下文格式无效。")
+        try:
+            if len(json.dumps(messages, ensure_ascii=False).encode("utf-8")) > 128 * 1024:
+                raise ProviderError("子代理上下文超过本地大小上限。")
+        except (TypeError, ValueError, UnicodeEncodeError):
+            raise ProviderError("子代理上下文格式无效。") from None
+        allowed_names = {"read_file", "list_directory"}
+        if tools is None:
+            tools = []
+        if not isinstance(tools, list) or len(tools) > 2:
+            raise ProviderError("子代理只读工具列表格式无效。")
+        from .tools import TOOL_SCHEMAS
+
+        canonical_read_tools = {
+            schema["function"]["name"]: schema
+            for schema in TOOL_SCHEMAS
+            if schema["function"]["name"] in allowed_names
+        }
+        seen_tools: set[str] = set()
+        for schema in tools:
+            try:
+                name = schema["function"]["name"]
+            except (KeyError, TypeError):
+                raise ProviderError("子代理只读工具列表格式无效。") from None
+            if name not in allowed_names or name in seen_tools or schema != canonical_read_tools[name]:
+                raise ProviderError("子代理只允许使用只读文件工具。")
+            seen_tools.add(name)
+        from .usage import estimate_payload_tokens
+
+        if estimate_payload_tokens(messages, tools) > MAX_SUBAGENT_INPUT_TOKENS:
+            raise ProviderError("子代理输入超过本地预算上限。")
+        if type(max_output_tokens) is not int or not 1 <= max_output_tokens <= MAX_SUBAGENT_OUTPUT_TOKENS:
+            raise ProviderError("子代理输出预算超出本地上限。")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < timeout_seconds <= MAX_SUBAGENT_TIMEOUT_SECONDS
+        ):
+            raise ProviderError("子代理请求时限超出本地上限。")
+        if cancellation_event.is_set():
+            raise ProviderCancelled("subagent cancelled")
+        started = time.monotonic()
+        try:
+            turn = self.complete_streaming(
+                messages,
+                tools,
+                cancellation_event=cancellation_event,
+                max_tokens=max_output_tokens,
+                on_text_delta=lambda _fragment: None,
+                timeout_seconds=float(timeout_seconds),
+            )
+        except ProviderStreamError:
+            if cancellation_event.is_set():
+                raise ProviderCancelled("subagent cancelled") from None
+            if time.monotonic() - started >= timeout_seconds:
+                raise TimeoutError("subagent deadline elapsed") from None
+            raise
+        if time.monotonic() - started > timeout_seconds:
+            raise TimeoutError("subagent deadline elapsed")
+        if cancellation_event.is_set():
+            raise ProviderCancelled("subagent cancelled")
+        if len(turn.tool_calls) > MAX_SUBAGENT_TOOL_CALLS_PER_TURN:
+            raise ProviderError("子代理只读调用数超过本地上限。")
+        return turn
+
     def _turn_from_payload(self, payload: Any) -> AssistantTurn:
         try:
-            message = payload["choices"][0]["message"]
+            choice = payload["choices"][0]
+            message = choice["message"]
         except (KeyError, IndexError, TypeError, RecursionError):
             raise ProviderError("模型响应格式无效。") from None
+        if not isinstance(choice, dict):
+            raise ProviderError("模型响应格式无效。")
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            raise ProviderError("模型完成状态无效。")
         if not isinstance(message, dict):
             raise ProviderError("模型响应格式无效。")
 
@@ -734,6 +848,7 @@ class OpenAICompatibleProvider:
             tool_calls=calls,
             assistant_message=assistant_message,
             usage=self._parse_usage(payload.get("usage")),
+            finish_reason=finish_reason,
         )
 
     @staticmethod

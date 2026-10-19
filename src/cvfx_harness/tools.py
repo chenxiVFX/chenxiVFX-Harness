@@ -134,15 +134,37 @@ ApprovalCallback = Callable[[ActionRequest], bool]
 
 
 def authorize_subagent_plan(
-    tasks: tuple[str, ...], approve_action: ApprovalCallback
+    tasks: tuple[str, ...],
+    approve_action: ApprovalCallback,
+    *,
+    read_scopes: tuple[tuple[str, str], ...] = (),
 ) -> bool:
-    """Request explicit local approval for the exact text a child will receive."""
+    """Approve exact task text and optional exact child-only read scopes."""
     if not tasks or len(tasks) > 3 or any(not isinstance(task, str) or len(task) > 240 for task in tasks):
         raise WorkspaceError("子代理计划超出本地任务范围上限。")
+    if len(read_scopes) > 8 or any(
+        not isinstance(path, str)
+        or not path
+        or len(path) > 1024
+        or operation not in {"read_file", "list_directory"}
+        for path, operation in read_scopes
+    ):
+        raise WorkspaceError("子代理只读范围格式无效或超出上限。")
     preview = "\n".join(
-        f"子任务 {index}: {task}\n输入范围：仅此任务文字；不包含主会话、文件引用或工具结果。"
+        f"子任务 {index}: {task}\n"
+        "输入范围：仅此任务文字和下列明确批准的数据；不包含主会话或父代理工具结果。"
         for index, task in enumerate(tasks, 1)
     )
+    if read_scopes:
+        preview += (
+            "\n子代理只读范围（子任务专属，不延伸到子目录或其他路径）；"
+            "经批准的文件内容或目录清单会发送给当前 provider：\n"
+        ) + "\n".join(
+            f"- {operation}: {path}" for path, operation in read_scopes
+        )
+    else:
+        preview += "\n子代理不获准读取任何工作区文件。"
+    preview += "\n每项最多两轮模型请求；无写入、shell 或递归委派权限；结果是未可信文本。"
     return approve_action(
         ActionRequest(
             operation="delegate",
