@@ -144,7 +144,7 @@
 - 本机合成夹具包含 HTTP/SSE 分块、慢读、截断、CONNECT 隧道和 HTTPS SSE origin。测试专用证书只由 fixture trust store 信任，且主机名校验及 `CERT_REQUIRED` 保持启用；无 API 凭据或真实服务请求。
 - fixture 找到并修复一处可复现的分类 bug：解析分块后进入下一次读取时，阶段标签未从 `sse_parse` 复位，因而总时限耗尽会被误报为解析错误。此前那次真实 SSE 失败没有阶段诊断，本轮未重放，所以它的根因仍未知。
 - 工具兼容范围：流完整校验后继续走现有 Agent 工具审批循环；未完成/错误 SSE 不会把部分工具调用交给 Agent。Mock、无流式接口 provider、多候选、多模态、logprobs 和未知增量仍明确拒绝。单元测试和本机代理 fixture 不等同完整产品验收。
-- Debian / Python 3.12 本地离线回归：125 项，124 通过、1 项 Windows-only junction 跳过；editable install、安装自检、`compileall` 与 `git diff --check` 通过。Windows/Linux × Python 3.11/3.12 四格 CI 均通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39216864855)）。本机与 CI 单元测试不等同完整产品验收。
+- Debian / Python 3.12 本地离线回归：125 项，124 通过、1 项 Windows-only junction 跳过；editable install、安装自检、`compileall` 与 `git diff --check` 通过。Windows/Linux × Python 3.11/3.12 四格 CI 均通过（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39217266384)）。本机与 CI 单元测试不等同完整产品验收。
 - 本轮及后续离线开发没有真实 API 请求。沿用用户提供的账本：已知实际用量 1,222，未明失败请求保留 629 预留，预算占用 1,851 / 2,000,000；失败请求的真实费用仍未知，本分配余量 19,371。
 
 ## 参考项目复用边界
