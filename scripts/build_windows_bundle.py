@@ -41,7 +41,25 @@ FORBIDDEN_BUNDLE_PARTS = {
 
 
 def _fail(message: str) -> None:
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8", newline="\n") as summary:
+                summary.write(f"\n### Windows 单文件自检失败\n\n{message}\n")
+        except OSError:
+            pass
     raise SystemExit(f"Windows 单文件包构建失败：{message}")
+
+
+def _record_stage(name: str) -> None:
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    try:
+        with open(summary_path, "a", encoding="utf-8", newline="\n") as summary:
+            summary.write(f"- Windows 单文件阶段：{name}\n")
+    except OSError:
+        pass
 
 
 def _minimal_environment() -> dict[str, str]:
@@ -223,6 +241,7 @@ def main() -> int:
             str(work_dir),
             str(entry),
         ]
+        _record_stage("PyInstaller 编译")
         result = subprocess.run(
             command,
             check=False,
@@ -239,8 +258,10 @@ def main() -> int:
         if distribution_files != {executable.name}:
             _fail("PyInstaller dist 目录含意外文件")
 
+        _record_stage("内嵌依赖与仓库文件清单审计")
         archive_member_count = _audit_bundle(executable)
 
+        _record_stage("EXE 帮助启动自检")
         help_timings: list[float] = []
         for _ in range(5):
             help_result, elapsed_ms = _run_executable(
@@ -254,6 +275,7 @@ def main() -> int:
                 _fail("打包程序 --help 缺少中文说明或提供商选项")
             help_timings.append(elapsed_ms)
 
+        _record_stage("EXE TUI 合成键盘自检")
         tui_result, _ = _run_executable(
             executable,
             ["--_tui-selfcheck"],
@@ -262,6 +284,7 @@ def main() -> int:
         if tui_result.returncode != 0 or "TUI 合成输入、命令补全和退出自检通过。" not in tui_result.stdout:
             _fail("打包程序 TUI 启动、命令补全或退出自检失败")
 
+        _record_stage("EXE 离线 Mock 与中文工作区路径自检")
         with tempfile.TemporaryDirectory(prefix="cvfx harness 中文 ") as temporary_workspace:
             workspace = Path(temporary_workspace) / "工作区 with spaces 中文"
             workspace.mkdir()
@@ -297,6 +320,7 @@ def main() -> int:
     _write_artifact_readme(output_dir / "README-standalone-zh-CN.txt")
     shutil.copy2(repository_root / "THIRD_PARTY_NOTICES.txt", output_dir / "THIRD_PARTY_NOTICES.txt")
 
+    _record_stage("最终文件白名单与 SHA-256 生成")
     final_entries = list(output_dir.iterdir())
     final_files = {item.name for item in final_entries if item.is_file()}
     if (
