@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import base64
 import errno
+import fnmatch
 import hashlib
 import json
 import os
@@ -26,6 +27,20 @@ PATCH_APPROVAL_DISPLAY_LIMIT = 32 * 1024
 DIRECTORY_ENTRY_LIMIT = 100
 DIRECTORY_SCAN_LIMIT = 1000
 PATH_COMPLETION_LIMIT = 50
+SEARCH_FILE_LIMIT_BYTES = READ_LIMIT_BYTES
+SEARCH_TOTAL_BYTES_LIMIT = 8 * 1024 * 1024
+SEARCH_ENTRY_LIMIT = 5000
+SEARCH_FILE_COUNT_LIMIT = 2000
+SEARCH_DIRECTORY_COUNT_LIMIT = 500
+SEARCH_DEPTH_LIMIT = 64
+SEARCH_MATCH_LIMIT = 100
+SEARCH_MATCH_SNIPPET_CHARS = 240
+SEARCH_OUTPUT_LIMIT_BYTES = 32 * 1024
+SEARCH_TIME_LIMIT_SECONDS = 5.0
+SEARCH_QUERY_MAX_CHARS = 200
+SEARCH_GLOB_MAX_CHARS = 256
+SEARCH_GITIGNORE_RULE_LIMIT = 256
+SEARCH_GITIGNORE_PATTERN_MAX_CHARS = 1024
 _CONTROL_DIR = ".harness"
 _BACKUP_DIR = "backups"
 _SENSITIVE_DIRECTORIES = {
@@ -85,6 +100,34 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
                 "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_text",
+            "description": (
+                "Search allowed UTF-8 text files in a user-approved workspace-relative directory. "
+                "The query is a case-sensitive literal substring, never a regular expression. "
+                "Honors .gitignore rules and returns bounded, redacted untrusted snippets with relative paths and line numbers. "
+                "The user must approve each search scope before file contents are scanned."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "path": {
+                        "type": "string",
+                        "description": "Optional workspace-relative directory scope; defaults to the workspace root.",
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "Optional relative filename/path glob filter within the selected directory.",
+                    },
+                },
+                "required": ["query"],
                 "additionalProperties": False,
             },
         },
@@ -189,6 +232,136 @@ class WritePreview:
     new_content: str
     diff: str
     changed: bool
+
+
+@dataclass(frozen=True)
+class _GitIgnoreRule:
+    base_parts: tuple[str, ...]
+    pattern: str
+    negated: bool
+    directory_only: bool
+    basename_pattern: bool
+
+
+def _translate_gitignore_pattern(pattern: str) -> str | None:
+    translated: list[str] = []
+    literal_glob_chars = {"*": "[*]", "?": "[?]", "[": "[[]", "]": "[]]"}
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            index += 1
+            if index >= len(pattern):
+                return None
+            escaped = pattern[index]
+            translated.append(literal_glob_chars.get(escaped, escaped))
+        else:
+            translated.append(char)
+        index += 1
+    return "".join(translated)
+
+
+def _parse_gitignore(text: str, base_parts: tuple[str, ...]) -> list[_GitIgnoreRule] | None:
+    rules: list[_GitIgnoreRule] = []
+    for raw_line in text.splitlines():
+        line = raw_line
+        if any(
+            unicodedata.category(char).startswith("C")
+            or unicodedata.category(char) in {"Zl", "Zp"}
+            for char in line
+        ):
+            return None
+        while line.endswith(" "):
+            escaped = 0
+            cursor = len(line) - 2
+            while cursor >= 0 and line[cursor] == "\\":
+                escaped += 1
+                cursor -= 1
+            if escaped % 2:
+                break
+            line = line[:-1]
+        if not line:
+            continue
+        if len(line) > SEARCH_GITIGNORE_PATTERN_MAX_CHARS:
+            return None
+        if line.startswith("\\#") or line.startswith("\\!"):
+            line = line[1:]
+        elif line.startswith("#"):
+            continue
+        negated = line.startswith("!")
+        if negated:
+            line = line[1:]
+        if not line:
+            continue
+        if len(rules) >= SEARCH_GITIGNORE_RULE_LIMIT:
+            return None
+        if len(line.split("/")) > SEARCH_DEPTH_LIMIT:
+            return None
+        anchored = line.startswith("/")
+        if anchored:
+            line = line.lstrip("/")
+        directory_only = line.endswith("/")
+        if directory_only:
+            line = line.rstrip("/")
+        if not line:
+            continue
+        translated = _translate_gitignore_pattern(line)
+        if translated is None:
+            return None
+        rules.append(
+            _GitIgnoreRule(
+                base_parts=base_parts,
+                pattern=translated,
+                negated=negated,
+                directory_only=directory_only,
+                basename_pattern="/" not in line and not anchored,
+            )
+        )
+    return rules
+
+
+def _matches_gitignore_rule(
+    rule: _GitIgnoreRule,
+    relative_parts: tuple[str, ...],
+    *,
+    is_directory: bool,
+) -> bool:
+    if len(relative_parts) <= len(rule.base_parts):
+        return False
+    if relative_parts[: len(rule.base_parts)] != rule.base_parts:
+        return False
+    if rule.directory_only and not is_directory:
+        return False
+    suffix = relative_parts[len(rule.base_parts) :]
+    if rule.basename_pattern:
+        return any(fnmatch.fnmatchcase(part, rule.pattern) for part in suffix)
+    return _match_glob_parts(suffix, tuple(rule.pattern.split("/")))
+
+
+def _match_glob_parts(path_parts: tuple[str, ...], pattern_parts: tuple[str, ...]) -> bool:
+    """Match slash-separated globs without letting * cross a path separator."""
+    states: dict[tuple[int, int], bool] = {}
+
+    def match(path_index: int, pattern_index: int) -> bool:
+        key = (path_index, pattern_index)
+        if key in states:
+            return states[key]
+        if pattern_index == len(pattern_parts):
+            result = path_index == len(path_parts)
+        elif pattern_parts[pattern_index] == "**":
+            result = match(path_index, pattern_index + 1) or (
+                path_index < len(path_parts) and match(path_index + 1, pattern_index)
+            )
+        else:
+            result = (
+                path_index < len(path_parts)
+                and fnmatch.fnmatchcase(path_parts[path_index], pattern_parts[pattern_index])
+                and match(path_index + 1, pattern_index + 1)
+            )
+        states[key] = result
+        return result
+
+    return match(0, 0)
 
 
 ApprovalCallback = Callable[[ActionRequest], bool]
@@ -558,6 +731,480 @@ class Workspace:
         if data is None:
             raise WorkspaceError(f"文件不存在或不是普通文件：{relative_path}")
         return data.decode("utf-8-sig")
+
+    @staticmethod
+    def _search_path_matches(relative_path: str, glob_pattern: str) -> bool:
+        if not glob_pattern:
+            return True
+        if "/" not in glob_pattern:
+            return fnmatch.fnmatchcase(PurePosixPath(relative_path).name, glob_pattern)
+        return _match_glob_parts(
+            tuple(PurePosixPath(relative_path).parts),
+            tuple(glob_pattern.split("/")),
+        )
+
+    @staticmethod
+    def _search_ignored(
+        relative_path: str,
+        *,
+        is_directory: bool,
+        rules: list[_GitIgnoreRule],
+        checkpoint: Callable[[], bool] | None = None,
+    ) -> bool:
+        parts = tuple(PurePosixPath(relative_path).parts)
+        ignored = False
+        for rule in rules:
+            if checkpoint is not None and not checkpoint():
+                return False
+            if _matches_gitignore_rule(rule, parts, is_directory=is_directory):
+                ignored = not rule.negated
+        return ignored
+
+    def _validate_search_request(
+        self,
+        query: str,
+        relative_directory: str,
+        glob_pattern: str,
+    ) -> Path:
+        from .sessions import contains_likely_secret
+
+        if (
+            not isinstance(query, str)
+            or not query
+            or len(query) > SEARCH_QUERY_MAX_CHARS
+            or any(
+                unicodedata.category(char).startswith("C")
+                or unicodedata.category(char) in {"Zl", "Zp"}
+                for char in query
+            )
+            or contains_likely_secret(query)
+        ):
+            raise WorkspaceError("搜索字面量无效、超长或疑似凭据；没有扫描文件。")
+        if (
+            not isinstance(relative_directory, str)
+            or len(relative_directory) > 1024
+            or any(
+                unicodedata.category(char).startswith("C")
+                or unicodedata.category(char) in {"Zl", "Zp"}
+                for char in relative_directory
+            )
+            or contains_likely_secret(relative_directory)
+        ):
+            raise WorkspaceError("搜索目录无效；没有扫描文件。")
+        if (
+            not isinstance(glob_pattern, str)
+            or len(glob_pattern) > SEARCH_GLOB_MAX_CHARS
+            or any(
+                unicodedata.category(char).startswith("C")
+                or unicodedata.category(char) in {"Zl", "Zp"}
+                for char in glob_pattern
+            )
+            or contains_likely_secret(glob_pattern)
+        ):
+            raise WorkspaceError("文件名过滤规则无效或疑似凭据；没有扫描文件。")
+        if glob_pattern and (
+            PureWindowsPath(glob_pattern).is_absolute()
+            or PureWindowsPath(glob_pattern).drive
+            or glob_pattern.startswith("/")
+            or ":" in glob_pattern
+            or ".." in re.split(r"[\\/]+", glob_pattern)
+            or "\\" in glob_pattern
+        ):
+            raise WorkspaceError("文件名过滤规则必须是工作区内的相对 glob。")
+        try:
+            scope = self.resolve_directory(relative_directory or ".")
+        except WorkspaceError:
+            raise
+        if len(scope.relative_to(self.root).as_posix()) > 1024:
+            raise WorkspaceError("搜索目录超过本地显示长度上限。")
+        return scope
+
+    @staticmethod
+    def _escape_search_text(value: str) -> tuple[str, int]:
+        from .sessions import redact_likely_secrets
+
+        safe, redaction_count = redact_likely_secrets(value)
+        escaped: list[str] = []
+        for char in safe:
+            if (
+                unicodedata.category(char).startswith("C")
+                or unicodedata.category(char) in {"Zl", "Zp"}
+            ):
+                codepoint = ord(char)
+                if codepoint <= 0xFF:
+                    escaped.append(f"\\x{codepoint:02x}")
+                elif codepoint <= 0xFFFF:
+                    escaped.append(f"\\u{codepoint:04x}")
+                else:
+                    escaped.append(f"\\U{codepoint:08x}")
+            else:
+                escaped.append(char)
+        return "".join(escaped), redaction_count
+
+    def search_text(
+        self,
+        query: str,
+        *,
+        relative_directory: str = ".",
+        glob_pattern: str = "",
+        cancellation_event: Any | None = None,
+    ) -> str:
+        """Search bounded UTF-8 text below an approved workspace-relative directory."""
+        from .sessions import contains_likely_secret
+
+        scope = self._validate_search_request(query, relative_directory, glob_pattern)
+        scope_parts = tuple(scope.relative_to(self.root).parts)
+        scope_posix = PurePosixPath(*scope_parts).as_posix() if scope_parts else "."
+        started = time.monotonic()
+        deadline = started + SEARCH_TIME_LIMIT_SECONDS
+        counts = {
+            "directories": 0,
+            "entries": 0,
+            "files": 0,
+            "bytes": 0,
+            "ignored": 0,
+            "sensitive_or_linked": 0,
+            "oversized": 0,
+            "binary": 0,
+            "unreadable": 0,
+            "redactions": 0,
+        }
+        matches: list[dict[str, Any]] = []
+        reasons: list[str] = []
+        scope_ignored = False
+        output_bytes = 0
+
+        def stop(reason: str) -> None:
+            if reason not in reasons:
+                reasons.append(reason)
+
+        def checkpoint() -> bool:
+            _raise_if_cancelled(cancellation_event)
+            if time.monotonic() >= deadline:
+                stop("time_limit")
+                return False
+            return True
+
+        def read_ignore_rules(
+            directory: Path,
+            directory_parts: tuple[str, ...],
+            inherited: list[_GitIgnoreRule],
+        ) -> list[_GitIgnoreRule] | None:
+            ignore_relative = PurePosixPath(*(directory_parts + (".gitignore",))).as_posix()
+            try:
+                ignore_path = directory / ".gitignore"
+                if self._is_reparse_point(ignore_path):
+                    stop("ignore_rules_unreadable")
+                    return None
+                ignore_target = self.resolve(ignore_relative)
+                info = ignore_target.stat()
+                if not stat.S_ISREG(info.st_mode) or getattr(info, "st_nlink", 1) > 1:
+                    stop("ignore_rules_unreadable")
+                    return None
+                if info.st_size > SEARCH_FILE_LIMIT_BYTES:
+                    stop("ignore_rules_unreadable")
+                    return None
+                if counts["bytes"] + info.st_size > SEARCH_TOTAL_BYTES_LIMIT:
+                    stop("byte_limit")
+                    return None
+                data = self._read_snapshot(ignore_target)
+                if data is None:
+                    stop("ignore_rules_unreadable")
+                    return None
+                if len(data) > SEARCH_FILE_LIMIT_BYTES:
+                    stop("ignore_rules_unreadable")
+                    return None
+                if counts["bytes"] + len(data) > SEARCH_TOTAL_BYTES_LIMIT:
+                    stop("byte_limit")
+                    return None
+                try:
+                    text = data.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    stop("ignore_rules_unreadable")
+                    return None
+                counts["bytes"] += len(data)
+                local = _parse_gitignore(text, directory_parts)
+                if local is None or len(inherited) + len(local) > SEARCH_GITIGNORE_RULE_LIMIT:
+                    stop("ignore_rules_unreadable")
+                    return None
+                return local
+            except FileNotFoundError:
+                return []
+            except WorkspaceError:
+                # A present but unreadable ignore file makes the effective scope
+                # ambiguous, so fail closed instead of scanning unfiltered content.
+                if (directory / ".gitignore").exists():
+                    stop("ignore_rules_unreadable")
+                    return None
+                return []
+            except OSError:
+                stop("ignore_rules_unreadable")
+                return None
+
+        rules: list[_GitIgnoreRule] = []
+        current_dir = self.root
+        current_parts: tuple[str, ...] = ()
+        for part in scope_parts:
+            if not checkpoint():
+                break
+            local = read_ignore_rules(current_dir, current_parts, rules)
+            if local is None:
+                break
+            rules.extend(local)
+            current_parts = current_parts + (part,)
+            relative_part = PurePosixPath(*current_parts).as_posix()
+            ignored_scope = self._search_ignored(
+                relative_part,
+                is_directory=True,
+                rules=rules,
+                checkpoint=checkpoint,
+            )
+            if reasons:
+                break
+            if ignored_scope:
+                counts["ignored"] += 1
+                scope_ignored = True
+                break
+            current_dir = current_dir / part
+
+        stack: list[tuple[Path, tuple[str, ...], list[_GitIgnoreRule]]] = []
+        if not reasons and not scope_ignored:
+            try:
+                if self.resolve_directory(relative_directory or ".") != scope:
+                    raise WorkspaceError("审批后搜索目录发生变化；没有扫描文件。")
+            except WorkspaceError:
+                raise
+            local = read_ignore_rules(scope, scope_parts, rules)
+            if local is None:
+                pass
+            else:
+                stack.append((scope, scope_parts, rules + local))
+
+        while stack and not reasons and not scope_ignored:
+            if not checkpoint():
+                break
+            directory, directory_parts, directory_rules = stack.pop()
+            if counts["directories"] >= SEARCH_DIRECTORY_COUNT_LIMIT:
+                stop("directory_limit")
+                break
+            counts["directories"] += 1
+            relative_directory_now = PurePosixPath(*directory_parts).as_posix() if directory_parts else "."
+            try:
+                if self.resolve_directory(relative_directory_now) != directory:
+                    raise WorkspaceError("搜索期间目录路径发生变化。")
+                scan_fd: int | None = None
+                scan_target: int | Path = directory
+                if self._supports_dir_fd_operations():
+                    scan_fd, _unused_name = self._open_parent_directory_fd(
+                        directory / ".cvfx-search-directory-handle"
+                    )
+                    scan_target = scan_fd
+                else:
+                    self._assert_no_reparse_points(directory)
+                try:
+                    with os.scandir(scan_target) as iterator:
+                        names: list[str] = []
+                        while True:
+                            if not checkpoint():
+                                break
+                            try:
+                                entry = next(iterator)
+                            except StopIteration:
+                                break
+                            if counts["entries"] >= SEARCH_ENTRY_LIMIT:
+                                stop("entry_limit")
+                                break
+                            counts["entries"] += 1
+                            names.append(entry.name)
+                finally:
+                    if scan_fd is not None:
+                        os.close(scan_fd)
+                if self.resolve_directory(relative_directory_now) != directory:
+                    raise WorkspaceError("搜索期间目录路径发生变化。")
+                names.sort(key=lambda name: (name.casefold(), name))
+                child_directories: list[tuple[Path, tuple[str, ...], list[_GitIgnoreRule]]] = []
+                for name in names:
+                    if not checkpoint():
+                        break
+                    if name in {".", ".."} or any(
+                        unicodedata.category(char).startswith("C")
+                        or unicodedata.category(char) in {"Zl", "Zp"}
+                        for char in name
+                    ):
+                        continue
+                    child_parts = directory_parts + (name,)
+                    relative = PurePosixPath(*child_parts).as_posix()
+                    if len(relative) > 1024:
+                        stop("path_limit")
+                        break
+                    child_path = self.root.joinpath(*child_parts)
+                    try:
+                        if self._is_reparse_point(child_path):
+                            counts["sensitive_or_linked"] += 1
+                            continue
+                        info = child_path.stat(follow_symlinks=False)
+                    except (OSError, WorkspaceError):
+                        counts["unreadable"] += 1
+                        continue
+                    is_directory = stat.S_ISDIR(info.st_mode)
+                    if not is_directory and not stat.S_ISREG(info.st_mode):
+                        counts["binary"] += 1
+                        continue
+                    ignored = self._search_ignored(
+                        relative,
+                        is_directory=is_directory,
+                        rules=directory_rules,
+                        checkpoint=checkpoint,
+                    )
+                    if reasons:
+                        break
+                    if ignored:
+                        counts["ignored"] += 1
+                        continue
+                    try:
+                        if is_directory:
+                            resolved_child = self.resolve_directory(relative)
+                        else:
+                            resolved_child = self.resolve(relative)
+                    except WorkspaceError:
+                        counts["sensitive_or_linked"] += 1
+                        continue
+
+                    if is_directory:
+                        if len(child_parts) - len(scope_parts) > SEARCH_DEPTH_LIMIT:
+                            stop("depth_limit")
+                            break
+                        if counts["directories"] + len(stack) + len(child_directories) >= SEARCH_DIRECTORY_COUNT_LIMIT:
+                            stop("directory_limit")
+                            break
+                        child_local = read_ignore_rules(resolved_child, child_parts, directory_rules)
+                        if child_local is None:
+                            break
+                        child_directories.append(
+                            (resolved_child, child_parts, directory_rules + child_local)
+                        )
+                        continue
+
+                    if getattr(info, "st_nlink", 1) > 1 or contains_likely_secret(relative):
+                        counts["sensitive_or_linked"] += 1
+                        continue
+                    if not self._search_path_matches(
+                        PurePosixPath(*child_parts[len(scope_parts) :]).as_posix(),
+                        glob_pattern,
+                    ):
+                        continue
+                    if info.st_size > SEARCH_FILE_LIMIT_BYTES:
+                        counts["oversized"] += 1
+                        continue
+                    if counts["files"] >= SEARCH_FILE_COUNT_LIMIT:
+                        stop("file_limit")
+                        break
+                    if counts["bytes"] + info.st_size > SEARCH_TOTAL_BYTES_LIMIT:
+                        stop("byte_limit")
+                        break
+                    counts["files"] += 1
+                    try:
+                        data, _final_info = self._read_snapshot_state(
+                            resolved_child,
+                            validate_utf8=False,
+                        )
+                    except WorkspaceError:
+                        counts["unreadable"] += 1
+                        continue
+                    if data is None:
+                        counts["unreadable"] += 1
+                        continue
+                    if len(data) > SEARCH_FILE_LIMIT_BYTES:
+                        counts["oversized"] += 1
+                        continue
+                    counts["bytes"] += len(data)
+                    if b"\0" in data:
+                        counts["binary"] += 1
+                        continue
+                    try:
+                        text_value = data.decode("utf-8-sig")
+                    except UnicodeDecodeError:
+                        counts["binary"] += 1
+                        continue
+                    for line_number, line in enumerate(text_value.splitlines(), 1):
+                        if not checkpoint():
+                            break
+                        safe_line, line_redactions = self._escape_search_text(line)
+                        counts["redactions"] += line_redactions
+                        match_at = safe_line.find(query)
+                        if match_at < 0:
+                            continue
+                        room = max(0, SEARCH_MATCH_SNIPPET_CHARS - len(query))
+                        start = max(0, match_at - room // 2)
+                        end = min(len(safe_line), start + SEARCH_MATCH_SNIPPET_CHARS)
+                        start = max(0, end - SEARCH_MATCH_SNIPPET_CHARS)
+                        snippet = safe_line[start:end]
+                        if start:
+                            snippet = "…" + snippet
+                        if end < len(safe_line):
+                            snippet += "…"
+                        rendered_path, path_redactions = self._escape_search_text(relative)
+                        counts["redactions"] += path_redactions
+                        match = {"path": rendered_path, "line": line_number, "text": snippet}
+                        encoded_match = json.dumps(
+                            match, ensure_ascii=False, separators=(",", ":")
+                        ).encode("utf-8")
+                        if output_bytes + len(encoded_match) > SEARCH_OUTPUT_LIMIT_BYTES - 4096:
+                            stop("output_limit")
+                            break
+                        matches.append(match)
+                        output_bytes += len(encoded_match)
+                        if len(matches) >= SEARCH_MATCH_LIMIT:
+                            stop("result_limit")
+                            break
+                    if reasons:
+                        break
+                if reasons:
+                    break
+                # Reverse so traversal remains sorted while using a LIFO stack.
+                stack.extend(reversed(child_directories))
+            except WorkspaceError:
+                raise
+            except OSError as exc:
+                raise WorkspaceError(f"工作区文本搜索失败：{type(exc).__name__}") from None
+
+        _raise_if_cancelled(cancellation_event)
+        result = {
+            "untrusted": True,
+            "mode": "literal_case_sensitive",
+            "query": query,
+            "scope": scope_posix,
+            "scope_message": (
+                "所选目录被 `.gitignore` 排除；没有读取其中的文件。"
+                if scope_ignored
+                else None
+            ),
+            "glob": glob_pattern or None,
+            "matches": matches,
+            "counts": counts,
+            "scope_ignored": scope_ignored,
+            "truncated": bool(reasons),
+            "truncation_reasons": reasons,
+            "messages": {
+                "time_limit": "达到 5 秒时限；搜索结果不完整。",
+                "entry_limit": "达到目录项扫描上限；搜索结果不完整。",
+                "file_limit": "达到文件扫描上限；搜索结果不完整。",
+                "directory_limit": "达到目录扫描上限；搜索结果不完整。",
+                "depth_limit": "达到递归深度上限；搜索结果不完整。",
+                "byte_limit": "达到累计读取字节上限；搜索结果不完整。",
+                "result_limit": "达到匹配结果条数上限；后续内容未检查。",
+                "output_limit": "达到搜索结果输出上限；部分匹配行未返回。",
+                "path_limit": "工作区相对路径过长；搜索已停止。",
+                "ignore_rules_unreadable": "无法安全解析 .gitignore；搜索已停止，没有继续扫描。",
+            },
+        }
+        encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        while len(encoded.encode("utf-8")) > SEARCH_OUTPUT_LIMIT_BYTES and matches:
+            matches.pop()
+            stop("output_limit")
+            result["truncated"] = True
+            encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        return encoded
 
     @staticmethod
     def _diff(
@@ -1933,11 +2580,18 @@ class Workspace:
         return f"已撤销写入并恢复备份 {backup_id}：{relative_path}"
 
 
-def _validate_arguments(call: ToolCall, expected: set[str]) -> None:
+def _validate_arguments(
+    call: ToolCall,
+    expected: set[str],
+    *,
+    required: set[str] | None = None,
+) -> None:
     if not isinstance(call.arguments, dict):
         raise WorkspaceError("工具参数必须是 JSON 对象。")
     actual = set(call.arguments)
-    if actual != expected:
+    if (required is None and actual != expected) or (
+        required is not None and (not required <= actual or not actual <= expected)
+    ):
         raise WorkspaceError("工具参数缺失或包含未授权字段。")
 
 
@@ -2067,6 +2721,47 @@ def run_tool(
             "truncated": truncated,
         }
         return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+    if call.name == "search_text":
+        _raise_if_cancelled(cancellation_event)
+        _validate_arguments(
+            call,
+            {"query", "path", "glob"},
+            required={"query"},
+        )
+        query = _string_argument(call, "query")
+        path = _string_argument(call, "path") if "path" in call.arguments else "."
+        glob_pattern = _string_argument(call, "glob") if "glob" in call.arguments else ""
+        target = workspace._validate_search_request(query, path, glob_pattern)
+        relative_scope = target.relative_to(workspace.root).as_posix() or "."
+        approval = ActionRequest(
+            operation="search",
+            path=relative_scope,
+            diff=(
+                f"固定字面量（区分大小写，不是正则）：{query}\n"
+                f"工作区相对范围：{relative_scope}\n"
+                f"文件路径 glob：{glob_pattern or '无（搜索所有允许的 UTF-8 文本文件）'}\n"
+                "会遵守搜索路径上的 .gitignore；敏感路径、内部状态、链接、硬链接、二进制和超大文件会跳过。\n"
+                f"本次最多检查 {SEARCH_ENTRY_LIMIT} 个目录项、{SEARCH_FILE_COUNT_LIMIT} 个文件、"
+                f"{SEARCH_DIRECTORY_COUNT_LIMIT} 个目录（递归深度最多 {SEARCH_DEPTH_LIMIT}）、"
+                f"{SEARCH_TOTAL_BYTES_LIMIT // (1024 * 1024)} MiB，最多运行 {SEARCH_TIME_LIMIT_SECONDS:g} 秒；"
+                f"最多返回 {SEARCH_MATCH_LIMIT} 条、每条最多 {SEARCH_MATCH_SNIPPET_CHARS} 字符、"
+                f"总输出不超过 {SEARCH_OUTPUT_LIMIT_BYTES // 1024} KiB。\n"
+                "匹配行片段及相对路径会脱敏后发送给模型；搜索结果是未可信文本，不产生后续写入或运行授权。"
+            ),
+            source="tool",
+        )
+        if not approve_action(approval):
+            return "用户拒绝本次工作区文本搜索；没有读取文件内容。"
+        _raise_if_cancelled(cancellation_event)
+        if workspace._validate_search_request(query, path, glob_pattern) != target:
+            raise WorkspaceError("审批后搜索范围发生变化；没有扫描文件。")
+        return workspace.search_text(
+            query,
+            relative_directory=path,
+            glob_pattern=glob_pattern,
+            cancellation_event=cancellation_event,
+        )
 
     if call.name == "write_file":
         _raise_if_cancelled(cancellation_event)

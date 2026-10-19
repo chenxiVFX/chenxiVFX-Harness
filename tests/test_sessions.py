@@ -288,7 +288,10 @@ class CompressionTests(unittest.TestCase):
             agent.apply_compression(preview)
             after = tuple(item["function"]["name"] for item in TOOL_SCHEMAS)
             self.assertEqual(before, after)
-            self.assertEqual(before, ("read_file", "list_directory", "write_file", "patch_file"))
+            self.assertEqual(
+                before,
+                ("read_file", "list_directory", "search_text", "write_file", "patch_file"),
+            )
             self.assertEqual(agent.messages[0], {"role": "system", "content": SYSTEM_PROMPT})
 
     def test_compression_escapes_adversarial_summary_delimiters(self) -> None:

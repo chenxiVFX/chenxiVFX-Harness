@@ -735,6 +735,10 @@ def _confirm_action(
         prompt = f"\n{source} {safe_path!r} 会发送给模型。确认读取？[y/N] "
     elif request.operation == "list":
         prompt = f"\n模型请求查看目录 {safe_path!r} 的名称和类型。确认列出？[y/N] "
+    elif request.operation == "search":
+        preview = _safe_terminal_text(request.diff) or "（没有搜索范围详情）"
+        output(f"\n工作区文本搜索审批范围 {safe_path!r}：\n{preview}")
+        prompt = "确认搜索该范围并将脱敏匹配片段发送给模型？[y/N] "
     elif request.operation == "undo":
         diff = _safe_terminal_text(request.diff) or "（内容无差异）"
         output(f"\n撤销差异（备份 {_safe_terminal_text(request.backup_id or '')}）：\n{diff}")

@@ -519,6 +519,76 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertIn("审批选择：是（本次）", ui._transcript)
         self.assertIn("[模拟模式] 已收到", ui._transcript)
 
+    def test_tui_search_uses_real_input_and_approves_only_bounded_scope(self) -> None:
+        class SearchProvider:
+            label = "offline search fixture"
+            model = "synthetic"
+
+            def __init__(self) -> None:
+                self.requests: list[list[dict[str, object]]] = []
+                self.tool_schemas: list[list[dict[str, object]]] = []
+
+            def complete(self, messages, tools, **kwargs):
+                del kwargs
+                self.requests.append([dict(message) for message in messages])
+                self.tool_schemas.append(list(tools))
+                if len(self.requests) == 1:
+                    call = ToolCall(
+                        "tui-search",
+                        "search_text",
+                        {"query": "预算阈值", "path": "src", "glob": "*.py"},
+                    )
+                    return AssistantTurn("", [call])
+                return AssistantTurn("已找到 src/配置.py 第 2 行。")
+
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-search-") as workspace:
+            source = Path(workspace) / "src" / "配置.py"
+            source.parent.mkdir()
+            source.write_bytes("# 标题\r\n预算阈值=16384\r\n".encode("utf-8"))
+            provider = SearchProvider()
+
+            def drive(pipe, ui: TerminalUI) -> None:
+                self._wait_until(
+                    lambda: ui._pending is not None and not ui._pending.approval,
+                    "main input prompt did not become ready",
+                )
+                pipe.send_text("帮我查找预算阈值\r")
+                self._wait_until(
+                    lambda: ui._pending is not None and ui._pending.approval,
+                    "workspace text search did not request approval",
+                )
+                self.assertEqual(len(provider.requests), 1)
+                self.assertTrue(ui._prompt.startswith("确认搜索该范围并将脱敏匹配片段发送给模型"))
+                self.assertIn("预算阈值", ui._approval_text)
+                self.assertIn("工作区相对范围：src", ui._approval_text)
+                self.assertIn("*.py", ui._approval_text)
+                self.assertNotIn("16384", ui._transcript)
+                pipe.send_text("\t\r")
+                self._wait_until(
+                    lambda: ui._pending is not None
+                    and not ui._pending.approval
+                    and len(provider.requests) == 2,
+                    "approved search result did not reach the offline provider",
+                )
+                result = next(
+                    message["content"]
+                    for message in provider.requests[1]
+                    if message.get("role") == "tool"
+                )
+                self.assertIn('"untrusted":true', result)
+                self.assertIn('"path":"src/配置.py"', result)
+                self.assertIn('"line":2', result)
+                self.assertIn("search_text", [
+                    schema["function"]["name"] for schema in provider.tool_schemas[0]
+                ])
+                pipe.send_text("/退出\r")
+
+            ui, rc = self._run_cli_ui(workspace, provider, drive)
+
+        self.assertEqual(rc, 0)
+        self.assertIn("审批选择：是（本次）", ui._transcript)
+        self.assertIn("已找到 src/配置.py 第 2 行。", ui._transcript)
+
     def test_tab_fills_filtered_command_and_enter_submits(self) -> None:
         received: list[str] = []
 
