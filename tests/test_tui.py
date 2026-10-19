@@ -117,7 +117,12 @@ class PromptToolkitTests(unittest.TestCase):
             item.text
             for item in completer.get_completions(Document("/计划 接"), CompleteEvent())
         ]
+        compression_values = [
+            item.text
+            for item in completer.get_completions(Document("/压缩 撤"), CompleteEvent())
+        ]
         self.assertEqual(plan_values, ["接受"])
+        self.assertEqual(compression_values, ["撤销"])
 
     def test_tui_plan_proposal_review_revision_and_acceptance_loop(self) -> None:
         from cvfx_harness.plans import PlanStore

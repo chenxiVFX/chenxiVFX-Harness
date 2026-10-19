@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -11,7 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
-from .agent import Agent, DEFAULT_MAX_OUTPUT_TOKENS
+from .agent import Agent, DEFAULT_MAX_OUTPUT_TOKENS, MIN_CONTEXT_COMPLETION_HEADROOM
 from .config import (
     CONFIG_RELATIVE_PATH,
     ConfigError,
@@ -51,6 +52,7 @@ _CLI_COMMANDS = (
 _CLI_ENUM_ARGUMENTS = {
     "/模式": ("计划", "执行"),
     "/测试": ("列表", "添加", "运行", "移除"),
+    "/压缩": ("撤销",),
     "/计划": ("生成", "显示", "修订", "接受", "拒绝", "添加", "执行", "完成", "阻塞", "取消", "重试", "清空"),
 }
 _STREAM_SECRET_TAIL_CHARS = 16
@@ -82,6 +84,73 @@ def _safe_terminal_text(text: str) -> str:
         else:
             visible.append(char)
     return "".join(visible)
+
+
+def _format_turn_indexes(indexes: tuple[int, ...]) -> str:
+    if not indexes:
+        return "无"
+    ranges: list[tuple[int, int]] = []
+    for value in indexes:
+        if ranges and value == ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], value)
+        else:
+            ranges.append((value, value))
+    shown = ranges[:24]
+    formatted = [f"#{start}" if start == end else f"#{start}–#{end}" for start, end in shown]
+    if len(ranges) > len(shown):
+        formatted.append(f"另有 {len(ranges) - len(shown)} 段不连续轮次")
+    return "、".join(formatted)
+
+
+def _format_compression_summary(summary: str) -> str:
+    """Render the deterministic summary fields in a readable, terminal-safe preview."""
+    try:
+        body = Agent._summary_body(summary)
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return _safe_terminal_text(summary)
+
+    lines = ["（摘要会以不可信的用户上下文加入对话）"]
+    loss_note = body.get("loss_note")
+    if isinstance(loss_note, str):
+        lines.append(f"摘要说明：{_safe_terminal_text(loss_note)}")
+    goal = body.get("goal_context")
+    if isinstance(goal, str) and goal:
+        lines.append(f"当前目标：{_safe_terminal_text(goal)}")
+    constraints = body.get("explicit_constraints")
+    if isinstance(constraints, list):
+        lines.append(f"明确限制（{len(constraints)} 条，保留完整原文）：")
+        lines.extend(
+            f"  - {_safe_terminal_text(item)}"
+            for item in constraints
+            if isinstance(item, str)
+        )
+    excerpts = body.get("dialogue_excerpts")
+    if isinstance(excerpts, list) and excerpts:
+        lines.append("历史对话摘录：")
+        for item in excerpts:
+            if not isinstance(item, dict):
+                continue
+            index = item.get("turn_index")
+            label = f"第 {index} 轮" if type(index) is int and index > 0 else "旧轮次"
+            user = item.get("user_excerpt")
+            assistant = item.get("assistant_excerpt")
+            if isinstance(user, str):
+                lines.append(f"  {label} 用户：{_safe_terminal_text(user)}")
+            if isinstance(assistant, str):
+                lines.append(f"  {label} 助手：{_safe_terminal_text(assistant)}")
+    earlier = body.get("earlier_summary_excerpts")
+    if isinstance(earlier, list) and earlier:
+        lines.append("更早摘要摘录：")
+        for item in earlier:
+            if not isinstance(item, dict) or not isinstance(item.get("excerpt"), str):
+                continue
+            index = item.get("turn_index")
+            label = f"第 {index} 轮" if type(index) is int and index > 0 else "旧摘要"
+            lines.append(f"  {label}：{_safe_terminal_text(item['excerpt'])}")
+    omitted = body.get("omitted_dialogue_excerpt_count")
+    if type(omitted) is int and omitted > 0:
+        lines.append(f"另有 {omitted} 个旧对话轮次没有短摘录；其内容不会完整保留。")
+    return "\n".join(lines)
 
 
 def _safe_error_text(error: BaseException) -> str:
@@ -300,7 +369,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--token-budget",
         type=_parse_integer_argument,
         default=argparse.SUPPRESS,
-        help="本地上下文预算提示（默认 16384）；只是估算，不会限制提供商侧输出上限",
+        help="本地估算上下文阈值（默认 16384）；不代表提供商上下文窗口或账户额度",
     )
     parser.add_argument(
         "--max-output-tokens",
@@ -360,9 +429,10 @@ def _help_text() -> str:
   /检查点 <名称>    输入一段手写脱敏摘要；预览并确认后仅保存该摘要
   /恢复 <名称>       校验并载入历史会话；替换当前上下文前确认，TUI 可补全名称
   /会话              列出本工作区的本地会话名称
-  /压缩 [保留轮数]   预览本地上下文压缩；默认保留最近 4 轮，需确认后应用
-  /统计              显示当前估算上下文、预算、累计用量和提供商报告
-  /预算 [tokens]     查看或临时设置本轮上下文预算（1024–1000000）
+  /压缩 [保留轮数]   预览本地压缩；默认保留最近 4 轮，需确认后应用
+  /压缩 撤销         恢复最近一次压缩前的内存检查点（仅压缩后尚未成功继续对话时）
+  /统计              分开展示本地估算、提供商 usage 与缓存命中字段
+  /预算 [tokens]     查看或临时设置本地估算阈值（1024–1000000；不是账户额度）
   /配置              显示本轮和下次启动的非敏感设置；密钥值不会显示或保存
   /配置 提供商 mock|openai
   /配置 模型 <名称>|默认
@@ -746,9 +816,9 @@ def run_console(
                     f"提供商：{startup_config.provider}（{source['provider']}）\n"
                     f"模型：{_safe_terminal_text(startup_config.model)}（{source['model']}）\n"
                     f"Base URL：{_safe_terminal_text(startup_config.base_url or '无（mock）')}（{source['base_url']}）\n"
-                    f"上下文预算：{startup_config.token_budget}（{source['token_budget']}）\n"
+                    f"本地估算上下文阈值：{startup_config.token_budget}（{source['token_budget']}）\n"
                     f"输出上限：{startup_config.max_output_tokens}（{source['max_output_tokens']}）\n"
-                    f"本轮预算：{agent.token_budget}；本轮输出上限：{agent.max_output_tokens} tokens\n"
+                    f"本轮本地估算阈值：{agent.token_budget}；本轮输出上限：{agent.max_output_tokens} tokens\n"
                     f"每次提问最多模型请求：{agent.max_provider_requests}；请求总时限：{getattr(provider, 'stream_timeout', DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS):g} 秒\n"
                     f"新子任务运行时限：{subagent_manager.timeout_seconds:g} 秒（审批与执行前排队不计）\n"
                     f"DeepSeek 密钥变量：{DEEPSEEK_API_KEY_ENV}；仅 DeepSeek 兼容模式从环境读取，不展示或写入配置\n"
@@ -1306,32 +1376,44 @@ def run_console(
             estimates = agent.estimated_context_breakdown()
             context_tokens = estimates["total"]
             percent = context_tokens * 100 / agent.token_budget
+            headroom = agent.token_budget - context_tokens
+            if headroom < MIN_CONTEXT_COMPLETION_HEADROOM:
+                context_state = "已到本地发送保护线"
+            elif headroom < agent.token_budget * 0.2:
+                context_state = "接近本地阈值"
+            else:
+                context_state = "低于本地阈值"
             stats = agent.usage
             provider_usage = (
-                f"{stats.provider_usage_reports} 次报告，输入 {stats.provider_prompt_tokens}、输出 {stats.provider_completion_tokens} tokens"
+                f"{stats.provider_usage_reports} 次有效报告，输入 {stats.provider_prompt_tokens}、输出 {stats.provider_completion_tokens} tokens"
                 if stats.provider_usage_reports
-                else "暂无提供商 usage 报告"
+                else "没有有效报告；提供商用量未知"
             )
             provider_cache = (
-                f"{stats.provider_cached_prompt_reports} 次报告，共 {stats.provider_cached_prompt_tokens} tokens"
+                f"{stats.provider_cached_prompt_reports} 次有效字段，共报告命中 {stats.provider_cached_prompt_tokens} tokens"
                 if stats.provider_cached_prompt_reports
-                else "暂无提供商缓存 usage 报告"
+                else "没有有效缓存命中字段；命中量未知"
             )
             schema_count = len(agent._tool_schemas())
             output(
-                f"当前上下文估算：{context_tokens} tokens（预算 {agent.token_budget}，约 {percent:.1f}%）\n"
+                f"当前上下文本地估算：{context_tokens} tokens；本地阈值 {agent.token_budget}，约 {percent:.1f}%，"
+                f"余量 {max(0, headroom)}（{context_state}）\n"
                 f"工具前缀独立估算（系统提示 + 当前 {schema_count} 项工具 schema）：{estimates['stable_prefix']} tokens\n"
                 f"会话消息独立估算：{estimates['conversation']} tokens；两个分项不相加，也不是缓存命中量\n"
                 f"累计请求：{stats.requests}\n"
-                f"累计估算输入/输出：{stats.estimated_input_tokens} / {stats.estimated_output_tokens} tokens\n"
-                f"提供商报告：{provider_usage}\n"
-                f"提供商缓存输入报告：{provider_cache}\n"
-                "估算使用本地字符启发式，不是 tokenizer 精确值；预算仅提示。"
+                f"累计本地估算输入/输出：{stats.estimated_input_tokens} / {stats.estimated_output_tokens} tokens\n"
+                f"提供商 usage 字段：{provider_usage}\n"
+                f"提供商缓存命中字段：{provider_cache}\n"
+                "本地字符启发式不是 tokenizer 精确值；阈值不代表提供商上下文窗口或账户额度。"
+                "缓存字段缺失或无效时命中量未知，本地分项不代表缓存命中或节省量。"
             )
             continue
         if command in {"/预算", "/budget"}:
             if not argument.strip():
-                output(f"当前 Token 预算提示：{agent.token_budget}")
+                output(
+                    f"当前本地估算上下文阈值：{agent.token_budget} tokens。"
+                    "它会在发送前保护本地估算不超阈值，不是提供商上下文窗口或账户额度。"
+                )
                 continue
             try:
                 new_budget = int(argument.strip())
@@ -1341,9 +1423,20 @@ def run_console(
                 output("用法：/预算 <1024–1000000>")
                 continue
             agent.token_budget = new_budget
-            output(f"已将本地预算提示设为 {new_budget} tokens。")
+            output(f"已将本地估算上下文阈值设为 {new_budget} tokens；这不是提供商上下文窗口或账户额度。")
             continue
         if command in {"/压缩", "/compact"}:
+            if argument.strip().casefold() in {"撤销", "恢复", "undo", "restore"}:
+                try:
+                    restored_turns = agent.restore_compression_checkpoint()
+                except ValueError as exc:
+                    output(f"无法恢复压缩检查点：{_safe_error_text(exc)}。当前会话未改变。")
+                    continue
+                output(
+                    f"已从压缩前的内存检查点恢复 {restored_turns} 个历史轮次。"
+                    "检查点只在当前进程内保留；压缩后成功继续对话会使其失效。"
+                )
+                continue
             try:
                 keep = int(argument.strip()) if argument.strip() else 4
                 preview = agent.preview_compression(keep_recent_turns=keep)
@@ -1351,7 +1444,10 @@ def run_console(
                 output(f"无法预览压缩：{exc}")
                 continue
             if preview is None:
-                output("没有可安全压缩且能减少估算上下文的旧轮次。")
+                output(
+                    "没有可安全压缩且能减少估算上下文的旧轮次；旧对话可能过短或不可摘要。"
+                    "可用 /压缩 1 预览保留更少近期轮次，或用 /预算 <tokens> 调整本地阈值。"
+                )
                 continue
             summary = next(
                 turn.messages[0]["content"]
@@ -1364,7 +1460,14 @@ def run_console(
                 f"（其中工具轮次 {preview.dropped_tool_turns} 个）；摘要 {preview.summary_bytes} bytes，"
                 f"保留明确限制 {preview.preserved_constraint_count} 条，当前目标"
                 f"{'已纳入（敏感形态已脱敏）' if preview.goal_redacted else '已纳入' if preview.goal_preserved else '未设置'}。\n"
-                f"将加入以下不可信用户上下文：\n{_safe_terminal_text(summary)}"
+                f"将概括的旧对话轮次：{_format_turn_indexes(preview.summarized_turn_indexes)}；"
+                f"将合并的既有摘要：{_format_turn_indexes(preview.merged_summary_indexes)}。\n"
+                f"不会摘要且将整轮丢弃的旧内容：{_format_turn_indexes(preview.dropped_turn_indexes)}；"
+                "旧工具调用及结果只会成组丢弃，不写入摘要。\n"
+                f"最近原样保留的轮次：{_format_turn_indexes(preview.preserved_recent_turn_indexes)}。"
+                f"摘要含 {preview.included_dialogue_excerpts} 条对话摘录；另有 {preview.omitted_dialogue_excerpts} 轮未摘录。\n"
+                "将加入以下不可信用户上下文（有损摘要）：\n"
+                f"{_format_compression_summary(summary)}"
             )
             try:
                 answer = input_fn("确认应用压缩？[y/N] ")

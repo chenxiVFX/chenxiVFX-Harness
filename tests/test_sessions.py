@@ -14,11 +14,11 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cvfx_harness.agent import Agent, SYSTEM_PROMPT
-from cvfx_harness.cli import run_console
-from cvfx_harness.providers import AssistantTurn, MockProvider, ProviderCancelled, ToolCall
+from cvfx_harness.cli import _format_compression_summary, run_console
+from cvfx_harness.providers import AssistantTurn, MockProvider, ProviderCancelled, ProviderError, ToolCall
 from cvfx_harness.sessions import MAX_SESSION_BYTES, SessionError, SessionStore
 from cvfx_harness.tools import TOOL_SCHEMAS, Workspace
-from cvfx_harness.usage import ProviderUsage, UsageStats, estimate_tokens
+from cvfx_harness.usage import ProviderUsage, UsageStats, estimate_payload_tokens, estimate_tokens
 
 
 class ScriptedProvider:
@@ -28,10 +28,12 @@ class ScriptedProvider:
     def __init__(self, turns: list[AssistantTurn]) -> None:
         self.turns = turns
         self.requests: list[list[dict[str, object]]] = []
+        self.max_tokens: list[int] = []
 
     def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
-        del tools, cancellation_event, max_tokens
+        del tools, cancellation_event
         self.requests.append([dict(message) for message in messages])
+        self.max_tokens.append(max_tokens)
         return self.turns.pop(0)
 
 
@@ -354,6 +356,115 @@ class CompressionTests(unittest.TestCase):
             self.assertNotIn(raw_key, summary)
             self.assertIn("[已脱敏]", summary)
 
+    def test_long_chinese_summary_adapts_excerpts_and_identifies_turns(self) -> None:
+        with local_temp() as temp:
+            agent = Agent(MockProvider(), Workspace(temp), approve_action=lambda _request: False)
+            agent.turns = [
+                _dialogue(f"第 {index} 轮：" + "长中文内容" * 36, "历史处理说明" * 36)
+                for index in range(1, 151)
+            ]
+            agent._rebuild_messages()
+
+            preview = agent.preview_compression(keep_recent_turns=1)
+            self.assertIsNotNone(preview)
+            assert preview is not None
+            self.assertLessEqual(preview.summary_bytes, 32 * 1024)
+            self.assertEqual(preview.summarized_turn_indexes, tuple(range(1, 150)))
+            self.assertEqual(preview.preserved_recent_turn_indexes, (150,))
+            self.assertEqual(preview.included_dialogue_excerpts, 128)
+            self.assertEqual(preview.omitted_dialogue_excerpts, 21)
+            summary = next(turn.messages[0]["content"] for turn in preview.replacement if turn.kind == "summary")
+            body = Agent._summary_body(summary)
+            self.assertEqual(body["dialogue_excerpts"][0]["turn_index"], 22)
+            self.assertLess(len(body["dialogue_excerpts"][0]["user_excerpt"]), 160)
+            self.assertEqual(body["omitted_dialogue_excerpt_count"], 21)
+
+    def test_review_display_escapes_controls_and_summary_redacts_goal_secret(self) -> None:
+        with local_temp() as temp:
+            raw_key = "sk-" + "b" * 24
+            agent = Agent(MockProvider(), Workspace(temp), approve_action=lambda _request: False)
+            agent.goal = f"目标只保留当前任务；api_key={raw_key}"
+            agent.turns = [
+                _dialogue("旧问题\x1b[31m控制字符" + "中文" * 120, "旧答复" * 120),
+                _dialogue("最近问题", "最近答复"),
+            ]
+            agent._rebuild_messages()
+            preview = agent.preview_compression(keep_recent_turns=1)
+            self.assertIsNotNone(preview)
+            assert preview is not None
+            summary = next(turn.messages[0]["content"] for turn in preview.replacement if turn.kind == "summary")
+            rendered = _format_compression_summary(summary)
+            self.assertNotIn(raw_key, summary)
+            self.assertNotIn(raw_key, rendered)
+            self.assertNotIn("\x1b", rendered)
+            self.assertIn("\\x1b", rendered)
+            self.assertIn("[已脱敏]", rendered)
+            self.assertIn("第 1 轮 用户", rendered)
+
+    def test_apply_compression_can_restore_checkpoint_until_successful_continuation(self) -> None:
+        with local_temp() as temp:
+            provider = ScriptedProvider([
+                AssistantTurn("继续答复", assistant_message={"role": "assistant", "content": "继续答复"}),
+            ])
+            agent = Agent(provider, Workspace(temp), approve_action=lambda _request: False)
+            agent.turns = [
+                _dialogue("旧问题" * 250, "旧答复" * 250),
+                _dialogue("保留问题", "保留答复"),
+            ]
+            agent._rebuild_messages()
+            original = json.dumps(agent.messages, ensure_ascii=False)
+            preview = agent.preview_compression(keep_recent_turns=1)
+            self.assertIsNotNone(preview)
+            assert preview is not None
+            agent.apply_compression(preview)
+            self.assertNotEqual(json.dumps(agent.messages, ensure_ascii=False), original)
+            self.assertEqual(agent.restore_compression_checkpoint(), 2)
+            self.assertEqual(json.dumps(agent.messages, ensure_ascii=False), original)
+
+            preview = agent.preview_compression(keep_recent_turns=1)
+            assert preview is not None
+            agent.apply_compression(preview)
+            agent.ask("继续会话")
+            continued = json.dumps(agent.messages, ensure_ascii=False)
+            with self.assertRaisesRegex(ValueError, "没有可恢复"):
+                agent.restore_compression_checkpoint()
+            self.assertEqual(json.dumps(agent.messages, ensure_ascii=False), continued)
+
+    def test_stale_compression_apply_leaves_the_current_conversation_untouched(self) -> None:
+        with local_temp() as temp:
+            agent = Agent(MockProvider(), Workspace(temp), approve_action=lambda _request: False)
+            agent.turns = [
+                _dialogue("旧问题" * 250, "旧答复" * 250),
+                _dialogue("保留问题", "保留答复"),
+            ]
+            agent._rebuild_messages()
+            preview = agent.preview_compression(keep_recent_turns=1)
+            self.assertIsNotNone(preview)
+            assert preview is not None
+            agent.turns[0].messages[0]["content"] += "外部更新"
+            agent._rebuild_messages()
+            current = json.dumps(agent.messages, ensure_ascii=False)
+            with self.assertRaisesRegex(ValueError, "重新预览"):
+                agent.apply_compression(preview)
+            self.assertEqual(json.dumps(agent.messages, ensure_ascii=False), current)
+
+    def test_modified_review_payload_is_rejected_without_changing_conversation(self) -> None:
+        with local_temp() as temp:
+            agent = Agent(MockProvider(), Workspace(temp), approve_action=lambda _request: False)
+            agent.turns = [
+                _dialogue("旧问题" * 250, "旧答复" * 250),
+                _dialogue("保留问题", "保留答复"),
+            ]
+            agent._rebuild_messages()
+            preview = agent.preview_compression(keep_recent_turns=1)
+            self.assertIsNotNone(preview)
+            assert preview is not None
+            current = json.dumps(agent.messages, ensure_ascii=False)
+            preview.replacement[0].messages[0]["content"] += "被替换的预览"
+            with self.assertRaisesRegex(ValueError, "预览内容已变化"):
+                agent.apply_compression(preview)
+            self.assertEqual(json.dumps(agent.messages, ensure_ascii=False), current)
+
     def test_preview_is_untrusted_and_preserves_recent_tool_call_pair(self) -> None:
         with local_temp() as temp:
             assistant_tool = {
@@ -473,6 +584,98 @@ class CompressionTests(unittest.TestCase):
             self.assertEqual(len(users), 4)
             self.assertFalse(any("untrusted-history-summary" in str(content) for content in users))
 
+    def test_cli_compression_cancellation_keeps_original_context(self) -> None:
+        with local_temp() as temp:
+            answers = "模拟答复" * 300
+            provider = ScriptedProvider([
+                AssistantTurn(answers, assistant_message={"role": "assistant", "content": answers})
+                for _ in range(4)
+            ])
+            inputs = iter(["问题甲" * 300, "问题乙" * 300, "问题丙" * 300, "/压缩 1", KeyboardInterrupt, "问题丁", "/退出"])
+            outputs: list[str] = []
+
+            def input_fn(_prompt: str) -> str:
+                value = next(inputs)
+                if value is KeyboardInterrupt:
+                    raise KeyboardInterrupt
+                return value
+
+            args = SimpleNamespace(workspace=temp, provider="mock", model=None, max_output_tokens=8192)
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                rc = run_console(args, input_fn=input_fn, output=outputs.append)
+            self.assertEqual(rc, 0)
+            self.assertTrue(any("已取消压缩；当前上下文未改变" in line for line in outputs))
+            users = [message["content"] for message in provider.requests[-1] if message["role"] == "user"]
+            self.assertEqual(len(users), 4)
+            self.assertFalse(any("untrusted-history-summary" in content for content in users))
+
+    def test_context_budget_preflight_stops_before_provider_and_preserves_context(self) -> None:
+        with local_temp() as temp:
+            provider = ScriptedProvider([
+                AssistantTurn("不应收到请求", assistant_message={"role": "assistant", "content": "不应收到请求"}),
+            ])
+            agent = Agent(
+                provider,
+                Workspace(temp),
+                approve_action=lambda _request: False,
+                token_budget=1024,
+                max_output_tokens=512,
+            )
+            agent.turns = [_dialogue("长中文" * 500, "旧答复" * 250)]
+            agent._rebuild_messages()
+            original = json.dumps(agent.messages, ensure_ascii=False)
+            with self.assertRaisesRegex(ProviderError, "请求未发送"):
+                agent.ask("追加一个问题")
+            self.assertEqual(provider.requests, [])
+            self.assertEqual(agent.usage.requests, 0)
+            self.assertEqual(json.dumps(agent.messages, ensure_ascii=False), original)
+
+    def test_context_budget_caps_provider_output_to_estimated_headroom(self) -> None:
+        with local_temp() as temp:
+            provider = ScriptedProvider([
+                AssistantTurn("简短结果", assistant_message={"role": "assistant", "content": "简短结果"}),
+            ])
+            agent = Agent(
+                provider,
+                Workspace(temp),
+                approve_action=lambda _request: False,
+                max_output_tokens=512,
+                max_provider_requests=1,
+            )
+            prompt = "合成的短问题"
+            messages = [
+                *agent.messages,
+                {"role": "user", "content": Agent._user_content(prompt, agent.goal, [])},
+            ]
+            estimated_input = estimate_payload_tokens(messages, agent._tool_schemas())
+            agent.token_budget = max(1024, estimated_input + 200)
+            expected_headroom = agent.token_budget - estimated_input
+            agent.ask(prompt)
+            self.assertEqual(provider.max_tokens, [expected_headroom])
+            self.assertLessEqual(provider.max_tokens[0], 512)
+
+    def test_stats_separate_provider_usage_from_unknown_cache_hits(self) -> None:
+        with local_temp() as temp:
+            provider = ScriptedProvider([
+                AssistantTurn(
+                    "合成答复",
+                    assistant_message={"role": "assistant", "content": "合成答复"},
+                    usage=ProviderUsage(17, 3, 20, None),
+                ),
+            ])
+            inputs = iter(["合成问题", "/统计", "/退出"])
+            outputs: list[str] = []
+            args = SimpleNamespace(workspace=temp, provider="mock", model=None)
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                rc = run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append)
+            self.assertEqual(rc, 0)
+            combined = "\n".join(outputs)
+            self.assertIn("当前上下文本地估算", combined)
+            self.assertIn("累计本地估算输入/输出", combined)
+            self.assertIn("1 次有效报告，输入 17、输出 3", combined)
+            self.assertIn("没有有效缓存命中字段；命中量未知", combined)
+            self.assertNotIn("已节省", combined)
+
     def test_cli_commands_show_help_stats_config_budget_and_bounded_plan(self) -> None:
         with local_temp() as temp:
             from cvfx_harness.subagents import SubagentManager
@@ -511,13 +714,13 @@ class CompressionTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             combined = "\n".join(outputs)
             self.assertIn("/保存", combined)
-            self.assertIn("当前上下文估算", combined)
+            self.assertIn("当前上下文本地估算", combined)
             self.assertIn("工具前缀独立估算", combined)
             self.assertIn("会话消息独立估算", combined)
             self.assertIn("不是缓存命中量", combined)
-            self.assertIn("暂无提供商缓存 usage 报告", combined)
+            self.assertIn("没有有效缓存命中字段；命中量未知", combined)
             self.assertIn("Shell：禁用", combined)
-            self.assertIn("已将本地预算提示设为 22000", combined)
+            self.assertIn("已将本地估算上下文阈值设为 22000", combined)
             self.assertIn("/子代理 提交", combined)
             self.assertIn("S01", combined)
             self.assertIn("S02", combined)

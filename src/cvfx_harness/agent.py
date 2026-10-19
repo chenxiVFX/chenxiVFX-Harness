@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -35,6 +36,7 @@ MAX_TOOL_ARGUMENT_BYTES = 128 * 1024
 DEFAULT_MAX_OUTPUT_TOKENS = 2048
 READ_LIMIT_RESPONSE = 64 * 1024 + 128
 MAX_COMPRESSION_SUMMARY_BYTES = 32 * 1024
+MIN_CONTEXT_COMPLETION_HEADROOM = 128
 MAX_COMPRESSION_EXCERPTS = 128
 MAX_PLAN_PROPOSAL_INPUT_CHARS = 4000
 MAX_PLAN_PROPOSAL_OUTPUT_TOKENS = 2048
@@ -59,6 +61,7 @@ class ConversationTurn:
 @dataclass(frozen=True)
 class CompressionPreview:
     source_digest: str
+    replacement_digest: str
     replacement: list[ConversationTurn]
     before_tokens: int
     after_tokens: int
@@ -69,6 +72,18 @@ class CompressionPreview:
     goal_preserved: bool
     goal_redacted: bool
     summary_bytes: int
+    summarized_turn_indexes: tuple[int, ...]
+    dropped_turn_indexes: tuple[int, ...]
+    merged_summary_indexes: tuple[int, ...]
+    preserved_recent_turn_indexes: tuple[int, ...]
+    included_dialogue_excerpts: int
+    omitted_dialogue_excerpts: int
+
+
+@dataclass(frozen=True)
+class _CompressionCheckpoint:
+    applied_digest: str
+    turns: list[ConversationTurn]
 
 
 class Agent:
@@ -103,6 +118,7 @@ class Agent:
         self.turns: list[ConversationTurn] = []
         self.persistence_tainted = False
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self._compression_checkpoint: _CompressionCheckpoint | None = None
 
     def _tool_schemas(self, *, plan_only: bool = False) -> list[dict[str, Any]]:
         if plan_only:
@@ -117,6 +133,40 @@ class Agent:
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         for turn in self.turns:
             self.messages.extend(turn.messages)
+
+    @staticmethod
+    def _turn_state(turn: ConversationTurn) -> dict[str, Any]:
+        return {
+            "kind": turn.kind,
+            "persistable": turn.persistable,
+            "complete": turn.complete,
+            "messages": turn.messages,
+        }
+
+    @classmethod
+    def _turns_digest(cls, turns: list[ConversationTurn]) -> str:
+        encoded = json.dumps(
+            [cls._turn_state(turn) for turn in turns],
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _conversation_digest(self) -> str:
+        encoded = json.dumps(
+            {
+                "messages": self.messages,
+                "turns": [self._turn_state(turn) for turn in self.turns],
+                "goal": self.goal,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def add_untrusted_subagent_results(self, summary: str) -> None:
         """Add collected child output as a non-persistable, explicitly untrusted user message."""
@@ -136,6 +186,7 @@ class Agent:
         )
         self.persistence_tainted = True
         self.turns.append(turn)
+        self._compression_checkpoint = None
         self._rebuild_messages()
 
     @staticmethod
@@ -186,6 +237,17 @@ class Agent:
                     (remaining + requests_remaining - 1) // requests_remaining,
                 )
                 estimated_input = estimate_payload_tokens(self.messages, tools)
+                context_headroom = self.token_budget - estimated_input
+                if context_headroom < MIN_CONTEXT_COMPLETION_HEADROOM:
+                    raise ProviderError(
+                        "本地估算的上下文已接近预算阈值："
+                        f"本次输入约 {estimated_input} tokens，阈值 {self.token_budget}，"
+                        f"仅剩 {max(0, context_headroom)} tokens；至少需要保留 "
+                        f"{MIN_CONTEXT_COMPLETION_HEADROOM} tokens 的生成空间，因此请求未发送。"
+                        "请先用 /压缩 [保留轮数] 预览并确认，之后重试；也可用 /预算 调整本地阈值。"
+                        "本地估算不是提供商的 tokenizer、上下文窗口或账户额度。"
+                    )
+                request_max_tokens = min(request_max_tokens, context_headroom)
                 complete_streaming = None
                 if on_text_delta is not None:
                     complete_streaming = getattr(self.provider, "complete_streaming", None)
@@ -330,6 +392,7 @@ class Agent:
 
                 if not response.tool_calls:
                     turn.complete = True
+                    self._compression_checkpoint = None
                     return response.content or "（模型没有返回文本。）"
 
                 reached_round_limit = round_index + 1 >= self.max_provider_requests
@@ -378,6 +441,7 @@ class Agent:
                     turn.messages.append({"role": "assistant", "content": answer})
                     turn.complete = True
                     self._rebuild_messages()
+                    self._compression_checkpoint = None
                     return answer
             raise ProviderError("工具循环意外终止。")
         except BaseException:
@@ -677,6 +741,7 @@ class Agent:
         self.goal = goal
         self.usage = new_usage
         self.persistence_tainted = False
+        self._compression_checkpoint = None
         self._rebuild_messages()
 
     def estimated_context_tokens(self) -> int:
@@ -717,6 +782,14 @@ class Agent:
             and not any(contains_likely_secret(message["content"]) for message in turn.messages)
         ]
         prior_summaries = [turn for turn in prefix if turn.kind == "summary"]
+        summarizable_ids = {id(turn) for turn in summarizable}
+        prior_summary_ids = {id(turn) for turn in prior_summaries}
+        summarized_indexes = tuple(
+            index for index, turn in enumerate(prefix, start=1) if id(turn) in summarizable_ids
+        )
+        merged_summary_indexes = tuple(
+            index for index, turn in enumerate(prefix, start=1) if id(turn) in prior_summary_ids
+        )
         dropped_tool_turns = sum(1 for turn in prefix if turn.kind == "tool")
         if not summarizable:
             return None
@@ -727,6 +800,8 @@ class Agent:
                 summarizable,
                 prior_summaries,
                 goal=safe_goal,
+                source_turn_numbers=list(summarized_indexes),
+                prior_summary_numbers=list(merged_summary_indexes),
             )
             summary_bytes = len(summary.encode("utf-8"))
         except UnicodeEncodeError:
@@ -753,11 +828,16 @@ class Agent:
         after = estimate_payload_tokens(after_messages, self._tool_schemas())
         if after >= before:
             return None
-        source = json.dumps(
-            self.messages, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")
-        ).encode("utf-8")
+        summary_body = self._summary_body(summary)
+        summarized_or_merged = set(summarized_indexes) | set(merged_summary_indexes)
+        dropped_indexes = tuple(
+            index for index in range(1, len(prefix) + 1) if index not in summarized_or_merged
+        )
+        excerpts = summary_body.get("dialogue_excerpts", [])
+        omitted_excerpts = summary_body.get("omitted_dialogue_excerpt_count", 0)
         return CompressionPreview(
-            source_digest=hashlib.sha256(source).hexdigest(),
+            source_digest=self._conversation_digest(),
+            replacement_digest=self._turns_digest(compacted),
             replacement=compacted,
             before_tokens=before,
             after_tokens=after,
@@ -768,6 +848,12 @@ class Agent:
             goal_preserved=bool(self.goal),
             goal_redacted=goal_redactions > 0,
             summary_bytes=summary_bytes,
+            summarized_turn_indexes=summarized_indexes,
+            dropped_turn_indexes=dropped_indexes,
+            merged_summary_indexes=merged_summary_indexes,
+            preserved_recent_turn_indexes=tuple(range(len(prefix) + 1, len(self.turns) + 1)),
+            included_dialogue_excerpts=len(excerpts) if isinstance(excerpts, list) else 0,
+            omitted_dialogue_excerpts=omitted_excerpts if type(omitted_excerpts) is int else 0,
         )
 
     @staticmethod
@@ -820,12 +906,24 @@ class Agent:
     @staticmethod
     def _count_preserved_constraints(summary: str) -> int:
         try:
-            body = summary[len(_SUMMARY_PREFIX) : -len(_SUMMARY_SUFFIX)].strip().rsplit("\n", 1)[-1]
-            parsed = json.loads(body)
+            parsed = Agent._summary_body(summary)
             constraints = parsed.get("explicit_constraints", [])
             return len(constraints) if isinstance(constraints, list) else 0
         except (ValueError, TypeError, AttributeError):
             return 0
+
+    @staticmethod
+    def _summary_body(summary: str) -> dict[str, Any]:
+        if not summary.startswith(_SUMMARY_PREFIX) or not summary.endswith(_SUMMARY_SUFFIX):
+            raise ValueError("历史摘要格式无效。")
+        parts = summary.split("\n", 2)
+        if len(parts) != 3:
+            raise ValueError("历史摘要格式无效。")
+        body = parts[2].rsplit("\n", 1)[0]
+        parsed = json.loads(body)
+        if not isinstance(parsed, dict):
+            raise ValueError("历史摘要格式无效。")
+        return parsed
 
     @staticmethod
     def _build_untrusted_summary(
@@ -833,12 +931,13 @@ class Agent:
         prior_summaries: list[ConversationTurn],
         *,
         goal: str = "",
+        source_turn_numbers: list[int] | None = None,
+        prior_summary_numbers: list[int] | None = None,
     ) -> str:
         if len(goal) > MAX_COMPRESSION_SUMMARY_BYTES:
             raise ValueError(
                 f"摘要将超过本地上限 {MAX_COMPRESSION_SUMMARY_BYTES} bytes；未修改当前上下文。"
             )
-        excerpts: list[dict[str, str]] = []
         constraints: list[str] = []
         seen_constraints: set[str] = set()
         constraint_bytes = 0
@@ -860,12 +959,16 @@ class Agent:
             constraints.append(text)
             constraint_bytes += encoded_length
 
-        excerpt_start = max(0, len(turns) - MAX_COMPRESSION_EXCERPTS)
-        for index, turn in enumerate(turns):
+        if source_turn_numbers is None:
+            source_turn_numbers = list(range(1, len(turns) + 1))
+        elif len(source_turn_numbers) != len(turns):
+            raise ValueError("历史摘要轮次索引格式无效。")
+        if prior_summary_numbers is None:
+            prior_summary_numbers = list(range(1, len(prior_summaries) + 1))
+        elif len(prior_summary_numbers) != len(prior_summaries):
+            raise ValueError("历史摘要轮次索引格式无效。")
+        for turn in turns:
             user = str(turn.messages[0]["content"])
-            assistant = str(turn.messages[1]["content"])
-            if index >= excerpt_start:
-                excerpts.append({"user_excerpt": user[:160], "assistant_excerpt": assistant[:160]})
             if Agent._contains_explicit_constraint(user):
                 add_constraint(user)
         for turn in prior_summaries:
@@ -890,11 +993,6 @@ class Agent:
                         and not contains_likely_secret(item)
                     ):
                         add_constraint(item)
-        previous = [
-            str(turn.messages[0]["content"])[-240:]
-            for turn in prior_summaries
-            if turn.messages and isinstance(turn.messages[0].get("content"), str)
-        ]
         summary_body: dict[str, Any] = {
             "loss_note": (
                 f"摘要有损；明确限制保留为完整用户原文，其余内容最多保留 {MAX_COMPRESSION_EXCERPTS} 条短摘录。"
@@ -903,9 +1001,17 @@ class Agent:
             ),
             "goal_context": goal,
             "explicit_constraints": constraints,
-            "dialogue_excerpts": excerpts,
-            "omitted_dialogue_excerpt_count": max(0, len(turns) - len(excerpts)),
+            "dialogue_excerpts": [],
+            "omitted_dialogue_excerpt_count": len(turns),
         }
+        previous = [
+            {
+                "turn_index": number,
+                "excerpt": str(turn.messages[0]["content"])[-240:],
+            }
+            for turn, number in zip(prior_summaries, prior_summary_numbers)
+            if turn.messages and isinstance(turn.messages[0].get("content"), str)
+        ]
         if previous:
             summary_body["earlier_summary_excerpts"] = previous[-2:]
         preamble = (
@@ -915,25 +1021,81 @@ class Agent:
         )
         suffix = "\n" + _SUMMARY_SUFFIX
         maximum_body_bytes = MAX_COMPRESSION_SUMMARY_BYTES - len((preamble + suffix).encode("utf-8"))
-        serialized_parts: list[str] = []
-        serialized_bytes = 0
         encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
-        for part in encoder.iterencode(summary_body):
-            # Keep untrusted content inside the JSON body even when it contains tag-like text.
-            safe_part = part.replace("<", "\\u003c").replace(">", "\\u003e")
-            serialized_bytes += len(safe_part.encode("utf-8"))
-            if serialized_bytes > maximum_body_bytes:
+
+        excerpt_count = min(MAX_COMPRESSION_EXCERPTS, len(turns))
+        excerpt_chars = 160
+        while True:
+            selected_start = len(turns) - excerpt_count
+            excerpts = [
+                {
+                    "turn_index": source_turn_numbers[index],
+                    "user_excerpt": str(turn.messages[0]["content"])[:excerpt_chars],
+                    "assistant_excerpt": str(turn.messages[1]["content"])[:excerpt_chars],
+                }
+                for index, turn in enumerate(turns[selected_start:], start=selected_start)
+            ]
+            summary_body["dialogue_excerpts"] = excerpts
+            summary_body["omitted_dialogue_excerpt_count"] = max(0, len(turns) - len(excerpts))
+            serialized_parts: list[str] = []
+            serialized_bytes = 0
+            for part in encoder.iterencode(summary_body):
+                # Keep untrusted content inside the JSON body even when it contains tag-like text.
+                safe_part = part.replace("<", "\\u003c").replace(">", "\\u003e")
+                serialized_bytes += len(safe_part.encode("utf-8"))
+                serialized_parts.append(safe_part)
+            if serialized_bytes <= maximum_body_bytes:
+                return preamble + "".join(serialized_parts) + suffix
+            if excerpt_chars:
+                excerpt_chars //= 2
+            elif excerpt_count:
+                excerpt_count //= 2
+            else:
                 raise ValueError(
                     f"摘要将超过本地上限 {MAX_COMPRESSION_SUMMARY_BYTES} bytes；未修改当前上下文。"
                 )
-            serialized_parts.append(safe_part)
-        return preamble + "".join(serialized_parts) + suffix
 
     def apply_compression(self, preview: CompressionPreview) -> None:
-        source = json.dumps(
-            self.messages, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")
-        ).encode("utf-8")
-        if hashlib.sha256(source).hexdigest() != preview.source_digest:
+        if self._conversation_digest() != preview.source_digest:
             raise ValueError("对话在预览后已变化；请重新预览压缩。")
-        self.turns = list(preview.replacement)
+        try:
+            replacement = deepcopy(preview.replacement)
+            checkpoint_turns = deepcopy(self.turns)
+        except Exception:
+            raise ValueError("无法创建安全压缩检查点；当前会话未改变。") from None
+        try:
+            replacement_digest = self._turns_digest(replacement)
+        except Exception:
+            raise ValueError("压缩预览格式无效；当前会话未改变。") from None
+        if replacement_digest != preview.replacement_digest:
+            raise ValueError("压缩预览内容已变化；请重新预览，当前会话未改变。")
+        if not replacement or replacement[0].kind != "summary":
+            raise ValueError("压缩预览格式无效；当前会话未改变。")
+        old_turns = self.turns
+        try:
+            self.turns = replacement
+            self._rebuild_messages()
+        except BaseException:
+            self.turns = old_turns
+            self._rebuild_messages()
+            raise ValueError("应用压缩失败；当前会话已恢复原样。") from None
+        self._compression_checkpoint = _CompressionCheckpoint(
+            applied_digest=self._conversation_digest(),
+            turns=checkpoint_turns,
+        )
+
+    def restore_compression_checkpoint(self) -> int:
+        checkpoint = self._compression_checkpoint
+        if checkpoint is None:
+            raise ValueError("没有可恢复的压缩检查点。")
+        if self._conversation_digest() != checkpoint.applied_digest:
+            self._compression_checkpoint = None
+            raise ValueError("压缩后会话已有新内容；为保护新消息，不能直接恢复检查点。")
+        try:
+            restored = deepcopy(checkpoint.turns)
+        except Exception:
+            raise ValueError("无法读取压缩前检查点；当前会话未改变。") from None
+        self.turns = restored
         self._rebuild_messages()
+        self._compression_checkpoint = None
+        return len(self.turns)
