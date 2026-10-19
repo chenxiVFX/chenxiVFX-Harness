@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import http.client
 import json
 import os
@@ -89,7 +90,12 @@ def _stream_transport_category(error: BaseException, stage: str) -> str:
     reason: BaseException = error
     if isinstance(error, urllib.error.URLError) and isinstance(error.reason, BaseException):
         reason = error.reason
-    if isinstance(reason, TimeoutError):
+    timeout_codes = {errno.ETIMEDOUT, 10060}  # POSIX ETIMEDOUT and Winsock WSAETIMEDOUT.
+    if (
+        isinstance(reason, TimeoutError)
+        or getattr(reason, "errno", None) in timeout_codes
+        or getattr(reason, "winerror", None) == 10060
+    ):
         return "connect_timeout" if stage in {"connect", "response_headers"} else "read_timeout"
     if isinstance(reason, ssl.SSLError):
         return "tls_failure"

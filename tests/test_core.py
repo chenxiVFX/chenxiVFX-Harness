@@ -33,6 +33,7 @@ from cvfx_harness.providers import (
     ProviderStreamError,
     ToolCall,
     _SSEParser,
+    _stream_transport_category,
     provider_from_environment,
 )
 from cvfx_harness.tools import ActionRequest, Workspace, WorkspaceError, run_tool
@@ -1363,6 +1364,8 @@ class ProviderTests(unittest.TestCase):
         self.assertIsNone(diagnostic.http_status)
         self.assertEqual(diagnostic.received_bytes, 0)
         self.assertNotIn(private_text, str(caught.exception))
+        self.assertEqual(_stream_transport_category(OSError(10060, private_text), "connect"), "connect_timeout")
+        self.assertEqual(_stream_transport_category(OSError(10060, private_text), "response_body"), "read_timeout")
 
         malformed = b"data: {\xff}\n\n"
 
