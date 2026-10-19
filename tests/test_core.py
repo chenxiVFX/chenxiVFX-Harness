@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import io
+import hashlib
 import os
 import shutil
 import select
@@ -229,6 +230,147 @@ class WorkspaceTests(unittest.TestCase):
         arguments.update(extra)
         return ToolCall("write-1", "write_file", arguments)  # type: ignore[arg-type]
 
+    @staticmethod
+    def patch_call(
+        path: str,
+        source: bytes,
+        old_text: str,
+        new_text: str,
+        **extra: object,
+    ) -> ToolCall:
+        arguments: dict[str, object] = {
+            "path": path,
+            "expected_sha256": hashlib.sha256(source).hexdigest(),
+            "old_text": old_text,
+            "new_text": new_text,
+        }
+        arguments.update(extra)
+        return ToolCall("patch-1", "patch_file", arguments)  # type: ignore[arg-type]
+
+    def test_patch_preserves_chinese_crlf_and_missing_final_newline_then_undoes(self) -> None:
+        target = self.root / "说明.txt"
+        source = "标题\r\n旧值\r\n尾部".encode("utf-8")
+        expected = "标题\r\n新值\r\n尾部".encode("utf-8")
+        target.write_bytes(source)
+        approvals: list[ActionRequest] = []
+        result = run_tool(
+            self.workspace,
+            self.patch_call("说明.txt", source, "旧值", "新值"),
+            approve_action=self.approve(approvals),
+        )
+        self.assertIn("精确补丁", result)
+        self.assertEqual(target.read_bytes(), expected)
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0].operation, "patch")
+        self.assertIn("目标：说明.txt", approvals[0].diff)
+        self.assertIn(hashlib.sha256(source).hexdigest(), approvals[0].diff)
+        self.assertIn("-旧值", approvals[0].diff)
+        self.assertIn("+新值", approvals[0].diff)
+
+        undo_requests: list[ActionRequest] = []
+        self.workspace.undo_last(approve_action=self.approve(undo_requests))
+        self.assertEqual(target.read_bytes(), source)
+        self.assertEqual(undo_requests[0].operation, "undo")
+
+    def test_read_file_returns_raw_sha256_for_explicit_patch_precondition(self) -> None:
+        target = self.root / "versioned.txt"
+        source = b"\xef\xbb\xbf\xe4\xb8\xad\xe6\x96\x87\r\n"
+        target.write_bytes(source)
+        result = run_tool(
+            self.workspace,
+            ToolCall("read-1", "read_file", {"path": "versioned.txt"}),
+            approve_action=self.approve(),
+        )
+        self.assertEqual(result.split("\n", 1)[0], f"SHA256={hashlib.sha256(source).hexdigest()}")
+        self.assertTrue(result.endswith("中文\r\n"))
+
+    def test_patch_rejects_empty_duplicate_mismatched_oversized_and_control_fragments(self) -> None:
+        target = self.root / "patch.txt"
+        source = b"same then same"
+        target.write_bytes(source)
+        approvals: list[ActionRequest] = []
+        invalid_calls = [
+            self.patch_call("patch.txt", source, "", "new"),
+            self.patch_call("patch.txt", source, "same!", "new"),
+            self.patch_call("patch.txt", source, "same", "new"),
+            self.patch_call("patch.txt", source, "same", "new", expected_sha256="0" * 64),
+            self.patch_call("patch.txt", source, "same", "x" * (16 * 1024 + 1)),
+            self.patch_call("patch.txt", source, "same", "bad\x1b[31m"),
+            self.patch_call("patch.txt", source, "same", "bad\u202e"),
+        ]
+        for call in invalid_calls:
+            with self.subTest(arguments=call.arguments), self.assertRaises(WorkspaceError):
+                run_tool(self.workspace, call, approve_action=self.approve(approvals))
+        self.assertEqual(approvals, [])
+        self.assertEqual(target.read_bytes(), source)
+        self.assertFalse((self.root / ".harness").exists())
+
+        target.write_bytes(b"x" * (64 * 1024 + 1))
+        with self.assertRaisesRegex(WorkspaceError, "64 KiB"):
+            run_tool(
+                self.workspace,
+                self.patch_call("patch.txt", source, "same", "new"),
+                approve_action=self.approve(approvals),
+            )
+        self.assertEqual(approvals, [])
+
+    def test_patch_rejects_sensitive_paths_and_decline_creates_no_backup(self) -> None:
+        secret = self.root / "api_key.txt"
+        secret.write_text("hidden", encoding="utf-8")
+        approvals: list[ActionRequest] = []
+        with self.assertRaises(WorkspaceError):
+            run_tool(
+                self.workspace,
+                self.patch_call("api_key.txt", b"hidden", "hidden", "changed"),
+                approve_action=self.approve(approvals),
+            )
+        self.assertEqual(approvals, [])
+
+        target = self.root / "decline.txt"
+        source = b"before"
+        target.write_bytes(source)
+        result = run_tool(
+            self.workspace,
+            self.patch_call("decline.txt", source, "before", "after"),
+            approve_action=self.approve(approvals, answer=False),
+        )
+        self.assertIn("拒绝", result)
+        self.assertEqual(target.read_bytes(), source)
+        self.assertEqual([item.operation for item in approvals], ["patch"])
+        self.assertFalse((self.root / ".harness").exists())
+
+    def test_patch_invalidates_approval_when_file_changes_concurrently(self) -> None:
+        target = self.root / "race-patch.txt"
+        source = b"before"
+        target.write_bytes(source)
+
+        def change_during_approval(_request: ActionRequest) -> bool:
+            target.write_bytes(b"concurrent change")
+            return True
+
+        with self.assertRaisesRegex(WorkspaceError, "審批预览后文件发生变化|审批预览后文件发生变化|预览后文件发生变化"):
+            run_tool(
+                self.workspace,
+                self.patch_call("race-patch.txt", source, "before", "after"),
+                approve_action=change_during_approval,
+            )
+        self.assertEqual(target.read_bytes(), b"concurrent change")
+        self.assertFalse((self.root / ".harness" / "backups").exists())
+
+    def test_patch_refuses_diff_that_expands_past_safe_terminal_preview_limit(self) -> None:
+        target = self.root / "format-heavy.txt"
+        source = ("\u202e" * 4000 + "before").encode("utf-8")
+        target.write_bytes(source)
+        approvals: list[ActionRequest] = []
+        with self.assertRaisesRegex(WorkspaceError, "终端显示上限"):
+            run_tool(
+                self.workspace,
+                self.patch_call("format-heavy.txt", source, "before", "after"),
+                approve_action=self.approve(approvals),
+            )
+        self.assertEqual(approvals, [])
+        self.assertEqual(target.read_bytes(), source)
+
     def test_unicode_path_read_write(self) -> None:
         (self.root / "资料").mkdir()
         call = self.write_call("资料/你好.txt", "模型测试：中文 ✓\n")
@@ -390,9 +532,9 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("用户拒绝", denied)
         self.assertNotIn("readable", denied)
         self.assertEqual(requests[0].operation, "read")
-        self.assertEqual(
-            run_tool(self.workspace, call, approve_action=self.approve()), "readable"
-        )
+        result = run_tool(self.workspace, call, approve_action=self.approve())
+        self.assertTrue(result.startswith("SHA256=" + hashlib.sha256(b"readable").hexdigest() + "\n"))
+        self.assertTrue(result.endswith("readable"))
 
         with self.assertRaisesRegex(WorkspaceError, "未授权"):
             run_tool(
@@ -1039,7 +1181,8 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(provider.requests[1][-2]["reasoning_content"], "合成 reasoning 记号")
             self.assertEqual(provider.requests[1][-1]["role"], "tool")
             self.assertEqual(provider.requests[1][-1]["tool_call_id"], "call-1")
-            self.assertEqual(provider.requests[1][-1]["content"], "approved body")
+            self.assertTrue(provider.requests[1][-1]["content"].endswith("approved body"))
+            self.assertTrue(provider.requests[1][-1]["content"].startswith("SHA256="))
             self.assertEqual(provider.max_token_history, [256, 256])
 
     def test_missing_usage_reserves_request_budget_and_caps_request_count(self) -> None:

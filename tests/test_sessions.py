@@ -286,7 +286,7 @@ class CompressionTests(unittest.TestCase):
             agent.apply_compression(preview)
             after = tuple(item["function"]["name"] for item in TOOL_SCHEMAS)
             self.assertEqual(before, after)
-            self.assertEqual(before, ("read_file", "list_directory", "write_file"))
+            self.assertEqual(before, ("read_file", "list_directory", "write_file", "patch_file"))
             self.assertEqual(agent.messages[0], {"role": "system", "content": SYSTEM_PROMPT})
 
     def test_compression_escapes_adversarial_summary_delimiters(self) -> None:
@@ -834,7 +834,8 @@ class DelegationTests(unittest.TestCase):
             self.assertEqual(manager.snapshots()[0].status, "completed")
             self.assertIn("read_file: safe.txt", approvals[0].diff)
             self.assertEqual([schema["function"]["name"] for schema in allowed_provider.calls[0][1]], ["read_file"])
-            self.assertEqual(allowed_provider.calls[1][0][-1]["content"], "只读合成内容")
+            self.assertTrue(allowed_provider.calls[1][0][-1]["content"].startswith("SHA256="))
+            self.assertTrue(allowed_provider.calls[1][0][-1]["content"].endswith("只读合成内容"))
             self.assertEqual([message["role"] for message in allowed_provider.calls[1][0]], ["system", "user", "assistant", "tool"])
 
             for request in (

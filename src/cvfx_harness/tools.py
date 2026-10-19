@@ -19,6 +19,9 @@ from .providers import ProviderCancelled, ToolCall
 
 READ_LIMIT_BYTES = 64 * 1024
 WRITE_LIMIT_BYTES = 64 * 1024
+PATCH_FRAGMENT_LIMIT_BYTES = 16 * 1024
+PATCH_DIFF_LIMIT_BYTES = 32 * 1024
+PATCH_APPROVAL_DISPLAY_LIMIT = 32 * 1024
 DIRECTORY_ENTRY_LIMIT = 100
 DIRECTORY_SCAN_LIMIT = 1000
 PATH_COMPLETION_LIMIT = 50
@@ -101,11 +104,49 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "patch_file",
+            "description": (
+                "Apply one exact UTF-8 text replacement in one existing workspace file. "
+                "Provide the SHA-256 from the most recent approved read_file result. "
+                "The old_text must be non-empty and occur exactly once; no fuzzy or global replacement is performed. "
+                "The user must approve the exact diff."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "expected_sha256": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "expected_sha256", "old_text", "new_text"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 
 class WorkspaceError(RuntimeError):
     pass
+
+
+def _safe_terminal_display_length(text: str) -> int:
+    """Measure the escaped rendering used by the CLI approval panel."""
+    visible_length = 0
+    for char in text:
+        if char == "\n":
+            visible_length += 1
+            continue
+        if unicodedata.category(char).startswith("C"):
+            codepoint = ord(char)
+            visible_length += 4 if codepoint <= 0xFF else 6 if codepoint <= 0xFFFF else 10
+        else:
+            visible_length += 1
+    return visible_length
 
 
 @dataclass(frozen=True)
@@ -491,6 +532,84 @@ class Workspace:
         if not target.parent.is_dir():
             raise WorkspaceError("目标文件的父目录必须已存在。")
         before_bytes = self._read_snapshot(target)
+        return self._build_write_preview(relative_path, target, content, before_bytes)
+
+    def preview_patch(
+        self,
+        relative_path: str,
+        *,
+        expected_sha256: str,
+        old_text: str,
+        new_text: str,
+    ) -> tuple[WritePreview, str]:
+        """Build a single exact replacement preview against an explicit byte version."""
+        if not isinstance(expected_sha256, str) or re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256) is None:
+            raise WorkspaceError("补丁必须提供 64 位十六进制原文件 SHA-256。")
+        if not isinstance(old_text, str) or not isinstance(new_text, str):
+            raise WorkspaceError("补丁文本必须是 UTF-8 字符串。")
+        if old_text == "":
+            raise WorkspaceError("补丁旧文本不能为空。")
+        self._validate_patch_fragment(old_text, "旧文本")
+        self._validate_patch_fragment(new_text, "新文本")
+
+        target = self._resolve_write_target(relative_path)
+        if not target.parent.is_dir():
+            raise WorkspaceError("目标文件的父目录必须已存在。")
+        before_bytes = self._read_snapshot(target)
+        if before_bytes is None:
+            raise WorkspaceError("精确补丁只允许修改已存在的普通文件。")
+        actual_sha256 = hashlib.sha256(before_bytes).hexdigest()
+        if actual_sha256 != expected_sha256.casefold():
+            raise WorkspaceError("原文件 SHA-256 与补丁预期版本不符；请重新读取后再请求补丁。")
+
+        try:
+            before_text = before_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise WorkspaceError("当前仅支持 UTF-8 文本文件。") from None
+        self._validate_writable_text(before_text)
+        occurrences = before_text.count(old_text)
+        if occurrences == 0:
+            raise WorkspaceError("旧文本在当前文件中没有精确匹配；文件未修改。")
+        if occurrences != 1:
+            raise WorkspaceError("旧文本出现多次；为避免误改，本次补丁已拒绝。")
+        updated_text = before_text.replace(old_text, new_text, 1)
+        preview = self._build_write_preview(relative_path, target, updated_text, before_bytes)
+        try:
+            diff_size = len(preview.diff.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise WorkspaceError("补丁差异不是有效 UTF-8 文本。") from None
+        if diff_size > PATCH_DIFF_LIMIT_BYTES:
+            raise WorkspaceError("补丁差异超过 32 KiB 审批显示上限。")
+        return preview, actual_sha256
+
+    @staticmethod
+    def _validate_patch_fragment(content: str, label: str) -> None:
+        try:
+            size = len(content.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise WorkspaceError(f"补丁{label}不是有效 UTF-8 文本。") from None
+        if size > PATCH_FRAGMENT_LIMIT_BYTES:
+            raise WorkspaceError(f"补丁{label}超过 16 KiB 上限。")
+        if any(
+            (unicodedata.category(char) == "Cc" and char not in "\t\r\n")
+            or unicodedata.category(char) in {"Cf", "Cs"}
+            for char in content
+        ):
+            raise WorkspaceError(f"补丁{label}含终端控制或格式字符。")
+
+    def _build_write_preview(
+        self,
+        relative_path: str,
+        target: Path,
+        content: str,
+        before_bytes: bytes | None,
+    ) -> WritePreview:
+        try:
+            new_bytes = content.encode("utf-8")
+        except UnicodeEncodeError:
+            raise WorkspaceError("写入内容不是有效 UTF-8 文本。") from None
+        if len(new_bytes) > WRITE_LIMIT_BYTES:
+            raise WorkspaceError("单次写入超过 64 KiB 上限。")
         existed = before_bytes is not None
         before_content = before_bytes.decode("utf-8") if before_bytes is not None else ""
         if existed and content == "" and before_bytes != b"":
@@ -959,7 +1078,8 @@ def run_tool(
         data = workspace._read_snapshot(target)
         if data is None:
             raise WorkspaceError(f"文件不存在或不是普通文件：{path}")
-        return data.decode("utf-8-sig")
+        digest = hashlib.sha256(data).hexdigest()
+        return f"SHA256={digest}\n{data.decode('utf-8-sig')}"
 
     if call.name == "list_directory":
         _raise_if_cancelled(cancellation_event)
@@ -1043,6 +1163,46 @@ def run_tool(
         if backup_id is None:
             return "文件内容已经相同，没有写入。"
         return f"已写入工作区文件并创建撤销备份 {backup_id}：{path}"
+
+    if call.name == "patch_file":
+        _raise_if_cancelled(cancellation_event)
+        _validate_arguments(call, {"path", "expected_sha256", "old_text", "new_text"})
+        path = _string_argument(call, "path")
+        expected_sha256 = _string_argument(call, "expected_sha256")
+        old_text = _string_argument(call, "old_text")
+        new_text = _string_argument(call, "new_text")
+        workspace.resolve(path)
+        if plan_only:
+            return "计划模式：已在工具层拦截补丁；文件未修改。"
+        preview, actual_sha256 = workspace.preview_patch(
+            path,
+            expected_sha256=expected_sha256,
+            old_text=old_text,
+            new_text=new_text,
+        )
+        if not preview.changed:
+            return "补丁结果与当前文件相同，没有写入，也未创建撤销备份。"
+        approval_diff = (
+            f"目标：{preview.canonical_path}\n"
+            f"预期原文件 SHA-256：{actual_sha256}\n"
+            f"{preview.diff}"
+        )
+        if _safe_terminal_display_length(approval_diff) > PATCH_APPROVAL_DISPLAY_LIMIT:
+            raise WorkspaceError("补丁审批预览超过终端显示上限；请缩小本次修改范围。")
+        request = ActionRequest(
+            operation="patch",
+            path=preview.canonical_path,
+            diff=approval_diff,
+            source="tool",
+            file_existed=True,
+        )
+        if not approve_action(request):
+            return "用户拒绝本次补丁；文件未修改，也未创建撤销备份。"
+        _raise_if_cancelled(cancellation_event)
+        backup_id = workspace.commit_write(preview, cancellation_event=cancellation_event)
+        if backup_id is None:
+            return "补丁结果与当前文件相同，没有写入。"
+        return f"已应用精确补丁并创建撤销备份 {backup_id}：{preview.canonical_path}"
 
     if call.name == "run_test_profile":
         _raise_if_cancelled(cancellation_event)

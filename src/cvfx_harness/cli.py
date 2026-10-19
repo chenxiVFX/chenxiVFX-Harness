@@ -517,6 +517,10 @@ def _confirm_action(
         preview = _safe_terminal_text(request.diff) or "（没有测试输出）"
         output(f"\n向模型分享测试输出审批 {safe_path!r}：\n{preview}")
         prompt = "确认把以上已脱敏输出发送给当前模型？[y/N] "
+    elif request.operation == "patch":
+        diff = _safe_terminal_text(request.diff) or "（内容无差异）"
+        output(f"\n局部补丁审批 {safe_path!r}：\n{diff}")
+        prompt = "确认应用这一个精确补丁？[y/N] "
     elif request.operation == "write":
         change_kind = (
             "新建文件" if request.file_existed is False
@@ -1052,7 +1056,7 @@ def run_console(
                     and any(
                         isinstance(call, dict)
                         and isinstance(call.get("function"), dict)
-                        and call["function"].get("name") == "write_file"
+                        and call["function"].get("name") in {"write_file", "patch_file"}
                         for call in message["tool_calls"]
                     )
                     for message in (step_agent.turns[-1].messages if step_agent.turns else [])
@@ -1065,7 +1069,7 @@ def run_console(
                         expected_text=step.text,
                         expected_status="in-progress",
                     )
-                    output(f"第 {index} 步请求了写入；Harness 已在工具层拦截，工作区未修改。状态为 blocked。")
+                    output(f"第 {index} 步请求了写入或补丁；Harness 已在工具层拦截，工作区未修改。状态为 blocked。")
                     continue
 
                 if sse_streaming and step_stream["received"]:

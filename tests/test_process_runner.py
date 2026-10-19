@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 import shutil
 import sys
 import tempfile
@@ -311,6 +312,102 @@ class TestProcessRunner(unittest.TestCase):
             self.assertTrue(any("terminal=\\x1b" in item for item in displayed))
         finally:
             temporary.cleanup()
+
+    def test_synthetic_read_patch_test_flow_keeps_test_output_local_without_share_consent(self) -> None:
+        temp_root = Path(__file__).resolve().parents[1] / ".test-tmp"
+        temp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temp_root) as temp:
+            project = Path(temp)
+            workspace = Workspace(project)
+            tests_dir = project / "tests"
+            tests_dir.mkdir()
+            profile_store = TestProfileStore(workspace)
+            profile_store.add("synthetic", "unittest", sys.executable, ".", "tests")
+            profile_path = project / ".harness" / "config" / "test_profiles.json"
+            profile_before = profile_path.read_bytes()
+            (project / "fixture.txt").write_text("旧值", encoding="utf-8")
+            (tests_dir / "test_patch_flow.py").write_text(
+                "from pathlib import Path\n"
+                "import unittest\n"
+                "class SyntheticPatchFlow(unittest.TestCase):\n"
+                "    def test_patched_fixture(self):\n"
+                "        self.assertEqual(Path('fixture.txt').read_text(encoding='utf-8'), '新值')\n",
+                encoding="utf-8",
+            )
+            approvals: list[ActionRequest] = []
+            local_output: list[str] = []
+
+            class FlowProvider:
+                label = "offline synthetic fixture"
+
+                def __init__(self) -> None:
+                    self.requests = 0
+                    self.schemas: list[dict[str, object]] = []
+                    self.tool_results: list[str] = []
+
+                def complete(self, messages, tools, **kwargs):
+                    del kwargs
+                    self.schemas = tools
+                    self.requests += 1
+                    if self.requests == 1:
+                        return AssistantTurn("", [ToolCall("read-1", "read_file", {"path": "fixture.txt"})])
+                    self.tool_results = [
+                        item["content"] for item in messages if item.get("role") == "tool"
+                    ]
+                    if self.requests == 2:
+                        sha_line = self.tool_results[-1].split("\n", 1)[0]
+                        expected_sha256 = sha_line.removeprefix("SHA256=")
+                        return AssistantTurn(
+                            "",
+                            [ToolCall("patch-1", "patch_file", {
+                                "path": "fixture.txt",
+                                "expected_sha256": expected_sha256,
+                                "old_text": "旧值",
+                                "new_text": "新值",
+                            })],
+                        )
+                    if self.requests == 3:
+                        return AssistantTurn(
+                            "",
+                            [ToolCall("test-1", "run_test_profile", {"profile_id": "synthetic"})],
+                        )
+                    return AssistantTurn("本地合成补丁和测试流程已完成。")
+
+            provider = FlowProvider()
+
+            def approve(request: ActionRequest) -> bool:
+                approvals.append(request)
+                return request.operation != "share_test_output"
+
+            agent = Agent(
+                provider,
+                workspace,
+                approve_action=approve,
+                test_profile_store=profile_store,
+                emit_output=local_output.append,
+            )
+            answer = agent.ask("请读取合成文件、精确补丁并运行 synthetic 测试。")
+
+            self.assertEqual(answer, "本地合成补丁和测试流程已完成。")
+            self.assertEqual(provider.requests, 4)
+            self.assertEqual([item.operation for item in approvals], [
+                "read", "patch", "run_test", "share_test_output",
+            ])
+            patch_schema = next(
+                schema["function"] for schema in provider.schemas
+                if schema["function"]["name"] == "patch_file"
+            )
+            self.assertEqual(
+                patch_schema["parameters"]["required"],
+                ["path", "expected_sha256", "old_text", "new_text"],
+            )
+            self.assertEqual((project / "fixture.txt").read_text(encoding="utf-8"), "新值")
+            self.assertEqual(profile_path.read_bytes(), profile_before)
+            self.assertTrue(any("OK" in item and "Ran 1 test" in item for item in local_output))
+            self.assertIn("批准后将把至多 16 KiB 输出发送给当前模型", approvals[-1].diff)
+            test_result = agent.messages[-2]["content"]
+            self.assertIn("用户选择仅在本地查看", test_result)
+            self.assertNotIn("Ran 1 test", test_result)
 
     def test_explicit_second_approval_shares_only_redacted_output(self) -> None:
         temporary, workspace, store, _profile = self._project("basic")

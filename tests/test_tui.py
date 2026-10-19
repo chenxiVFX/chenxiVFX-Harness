@@ -895,6 +895,31 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertIn("已取消当前模型请求", ui._transcript)
         self.assertIn("恢复后继续生成的合成流式答复。", ui._transcript)
 
+    def test_patch_approval_shows_compact_diff_and_escapes_terminal_control(self) -> None:
+        request = ActionRequest(
+            operation="patch",
+            path="资料/说明.txt",
+            diff=(
+                "目标：资料/说明.txt\n"
+                "预期原文件 SHA-256：" + "a" * 64 + "\n"
+                "--- a/资料/说明.txt\n+++ b/资料/说明.txt\n"
+                "-旧值\x1b[2J\n+新值\n"
+            ),
+        )
+        output: list[str] = []
+        prompts: list[str] = []
+        approved = _confirm_action(
+            request,
+            input_fn=lambda prompt: prompts.append(prompt) or "是",
+            output=output.append,
+        )
+        self.assertTrue(approved)
+        self.assertIn("目标：资料/说明.txt", output[0])
+        self.assertIn("预期原文件 SHA-256：" + "a" * 64, output[0])
+        self.assertIn("-旧值\\x1b[2J", output[0])
+        self.assertNotIn("\x1b[2J", output[0])
+        self.assertIn("精确补丁", prompts[0])
+
     def test_cli_write_tool_default_denial_and_one_explicit_approval(self) -> None:
         from cvfx_harness.tui import _InputRequest
 
