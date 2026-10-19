@@ -113,6 +113,57 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertEqual(command_items[0].display_meta_text, "显示完整说明")
         self.assertEqual(values, ["计划"])
         self.assertEqual(path_values, [])
+        plan_values = [
+            item.text
+            for item in completer.get_completions(Document("/计划 接"), CompleteEvent())
+        ]
+        self.assertEqual(plan_values, ["接受"])
+
+    def test_tui_plan_proposal_review_revision_and_acceptance_loop(self) -> None:
+        from cvfx_harness.plans import PlanStore
+
+        class SyntheticPlanProvider:
+            label = "synthetic-plan-fixture"
+            model = "synthetic"
+
+            def __init__(self) -> None:
+                self.requests = []
+
+            def complete(self, messages, tools, *, cancellation_event=None, max_tokens=2048):
+                del cancellation_event, max_tokens
+                self.requests.append((messages, tools))
+                return AssistantTurn(
+                    '{"steps":[{"description":"检查中文界面","completion_criteria":"列出可见命令",'
+                    '"required_tools":["list_directory"]}]}',
+                    assistant_message={
+                        "role": "assistant",
+                        "content": '{"steps":[{"description":"检查中文界面","completion_criteria":"列出可见命令",'
+                        '"required_tools":["list_directory"]}]}',
+                    },
+                )
+
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-plan-") as workspace:
+            provider = SyntheticPlanProvider()
+
+            def drive(pipe, ui: TerminalUI) -> None:
+                self._wait_until(lambda: ui._pending is not None, "TUI did not request plan input")
+                pipe.send_text("/计划 生成 检查命令\r")
+                self._wait_until(lambda: "待审阅候选计划" in ui._transcript, "candidate was not rendered")
+                self.assertEqual(provider.requests[0][1], [])
+                self.assertIn("建议工具：列出目录", ui._transcript)
+                pipe.send_text("/计划 修订 1 条件 命令清单可见\r")
+                self._wait_until(lambda: "已修订候选" in ui._transcript, "revision was not rendered")
+                pipe.send_text("/计划 接受\r")
+                self._wait_until(lambda: "已接受并保存" in ui._transcript, "proposal was not accepted")
+                pipe.send_text("/计划\r")
+                self._wait_until(lambda: "[pending] 检查中文界面" in ui._transcript, "accepted step was not displayed")
+                pipe.send_text("/退出\r")
+
+            _ui, rc = self._run_cli_ui(workspace, provider, drive)
+            self.assertEqual(rc, 0)
+            saved = PlanStore(Workspace(workspace)).load()
+            self.assertEqual(saved.steps[0].completion_criteria, "命令清单可见")
+            self.assertEqual(len(provider.requests), 1)
 
     def test_test_profile_id_completion_suggests_runnable_and_removable_profiles(self) -> None:
         from prompt_toolkit.completion import CompleteEvent
