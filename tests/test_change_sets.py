@@ -543,6 +543,7 @@ workspace.apply_change_set(changes, approve_action=lambda _request: True)
     @unittest.skipUnless(os.name == "nt", "Windows DACL semantics require a Windows fixture")
     def test_windows_dacl_is_retained_through_batch_failure_compensation(self) -> None:
         first = self.root / "a.txt"
+        original_bytes = first.read_bytes()
         before_acl = Workspace._windows_dacl_token(first)
         _set_windows_dacl_protection(first, True)
         protected_acl = Workspace._windows_dacl_token(first)
@@ -563,7 +564,7 @@ workspace.apply_change_set(changes, approve_action=lambda _request: True)
             approve_action=self.approval(requests),
         )
         self.assertIn("已恢复", result)
-        self.assertEqual(first.read_bytes(), self.sources["a.txt"].encode("utf-8"))
+        self.assertEqual(first.read_bytes(), original_bytes)
         self.assertEqual(
             Workspace._windows_dacl_copy_token(Workspace._windows_dacl_token(first)),
             Workspace._windows_dacl_copy_token(protected_acl),
