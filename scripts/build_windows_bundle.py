@@ -192,6 +192,14 @@ def _write_artifact_readme(path: Path) -> None:
   .\\cvfx-harness.exe --workspace "$workspace" --provider mock
 
 Mock 完全离线，不读取密钥或连接模型。输入“你好”试用中文，再用 /状态核对工作区，/退出结束。
+脚本单次请求可用：
+
+  .\\cvfx-harness.exe --workspace "$workspace" --provider mock --prompt "用中文打招呼" --output-format json
+
+此模式只向 stdout 写一行 UTF-8 JSON；诊断码只写 stderr。--prompt - 从重定向的 UTF-8 标准输入读取。
+本次最多发一个模型请求，不恢复会话、不解析 @文件 引用、不读取工作区且不执行任何工具；工具请求返回 needs_approval，使用交互 CLI 重新提交后仍需逐项审批。
+用量把本地估算、提供商实际报告和缓存字段分开，缺失报告标为 unknown。退出码：成功 0、输入/配置 2、
+服务错误 3、审批/本地交互 4、协议错误 5、内部错误 1、取消 130。结果不包含工具参数或原始工具输出。
 若工作区配置损坏或字段无效，可加 --ignore-config --provider mock 离线启动，再用 /配置 编辑从默认值重新审阅；该启动方式不会读取损坏文件，只有确认保存后才替换它。
 在 Mock 会话中可用 /配置 编辑 保存非敏感的提供商、模型与端点；选择 openai 表示 DeepSeek OpenAI
 兼容接口。设置保存在工作区 .harness/config/settings.json，不包含密钥；Harness 不会修改项目 .gitignore。
@@ -366,6 +374,45 @@ def main() -> int:
             _fail("打包程序未完成离线 Mock 中文交互")
         if workspace.name.casefold() not in mock_result.stdout.casefold():
             _fail("打包程序未正确处理含空格和中文的工作区路径")
+
+        _record_stage("EXE UTF-8 JSON 单次请求重定向自检")
+        with tempfile.TemporaryDirectory(prefix="cvfx json redirect 中文 ") as temporary_workspace:
+            workspace = Path(temporary_workspace) / "JSON 工作区 with spaces"
+            workspace.mkdir()
+            try:
+                machine_result = subprocess.run(
+                    [
+                        str(executable), "--workspace", str(workspace), "--ignore-config",
+                        "--provider", "mock", "--prompt", "中文单次 JSON 重定向",
+                        "--output-format", "json",
+                    ],
+                    capture_output=True,
+                    check=False,
+                    env=minimal_environment,
+                    timeout=60,
+                )
+                machine_stdout = machine_result.stdout.decode("utf-8", errors="strict")
+                machine_stderr = machine_result.stderr.decode("utf-8", errors="strict")
+                machine_payload = json.loads(machine_stdout)
+            except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, json.JSONDecodeError):
+                _fail("打包程序 JSON 重定向输出不是有效 UTF-8 JSON")
+            machine_usage = machine_payload.get("usage") if isinstance(machine_payload, dict) else None
+            local_usage = machine_usage.get("local_estimate") if isinstance(machine_usage, dict) else None
+            provider_usage = machine_usage.get("provider_actual") if isinstance(machine_usage, dict) else None
+            if (
+                machine_result.returncode != 0
+                or machine_stderr
+                or len(machine_stdout.splitlines()) != 1
+                or not isinstance(machine_payload, dict)
+                or machine_payload.get("status") != "success"
+                or machine_payload.get("code") != "ok"
+                or "中文单次 JSON 重定向" not in str(machine_payload.get("answer"))
+                or not isinstance(local_usage, dict)
+                or local_usage.get("status") != "estimated"
+                or not isinstance(provider_usage, dict)
+                or provider_usage.get("status") != "unknown"
+            ):
+                _fail("打包程序单次 JSON 重定向内容、UTF-8 或状态字段无效")
 
         _record_stage("EXE 冷启动计划续跑与有限上下文审阅")
         with tempfile.TemporaryDirectory(prefix="cvfx plan resume 中文 ") as temporary_workspace:

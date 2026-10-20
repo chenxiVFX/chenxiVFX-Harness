@@ -45,6 +45,7 @@ from cvfx_harness.cli import (
     _completion_matches,
     _safe_terminal_text,
     build_parser,
+    main,
     parse_references,
     run_console,
 )
@@ -2890,6 +2891,241 @@ class AgentTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_single_request_json_keeps_unicode_and_separates_actual_and_estimated_usage(self) -> None:
+        with make_test_temp(prefix="cli-json-result-") as temp:
+            provider = ScriptedProvider([
+                AssistantTurn("中文单次结果", usage=ProviderUsage(8, 3, 11, 5)),
+            ])
+            args = build_parser().parse_args([
+                "--workspace", temp, "--ignore-config", "--provider", "mock",
+                "--prompt", "返回固定中文结果", "--output-format", "json",
+            ])
+            output: list[str] = []
+            stderr = io.StringIO()
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider), patch("sys.stderr", stderr):
+                result = run_console(args, output=output.append)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(output), 1)
+        self.assertEqual(stderr.getvalue(), "")
+        payload = json.loads(output[0])
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["status"], "success")
+        self.assertEqual(payload["code"], "ok")
+        self.assertEqual(payload["answer"], "中文单次结果")
+        self.assertEqual(payload["tools"], [])
+        self.assertEqual(payload["usage"]["requests"], 1)
+        self.assertEqual(payload["usage"]["provider_actual"], {
+            "status": "reported", "reports": 1, "prompt_tokens": 8, "completion_tokens": 3,
+            "total_tokens": 11,
+        })
+        self.assertEqual(payload["usage"]["cache_actual"], {
+            "status": "reported", "reports": 1, "cached_prompt_tokens": 5,
+        })
+        self.assertEqual(payload["usage"]["local_estimate"]["status"], "estimated")
+
+    def test_single_request_json_reports_missing_usage_and_never_executes_proposed_tools(self) -> None:
+        with make_test_temp(prefix="cli-json-missing-usage-") as temp:
+            provider = ScriptedProvider([AssistantTurn("用量未知的中文结果")])
+            args = build_parser().parse_args([
+                "--workspace", temp, "--ignore-config", "--provider", "mock",
+                "--prompt", "普通问题", "--output-format", "json",
+            ])
+            output: list[str] = []
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                result = run_console(args, output=output.append)
+        payload = json.loads(output[0])
+        self.assertEqual(result, 0)
+        self.assertEqual(payload["usage"]["provider_actual"]["status"], "unknown")
+        self.assertEqual(payload["usage"]["cache_actual"]["status"], "unknown")
+        self.assertEqual(payload["usage"]["local_estimate"]["status"], "estimated")
+
+        with make_test_temp(prefix="cli-json-approval-required-") as temp:
+            private_path = "private synthetic.txt"
+            private_marker = "PRIVATE_TOOL_RESULT_MUST_NOT_BE_EMITTED"
+            Path(temp, private_path).write_text(private_marker, encoding="utf-8")
+            provider = ScriptedProvider([
+                AssistantTurn("", [ToolCall("json-read", "read_file", {"path": private_path})]),
+            ])
+            args = build_parser().parse_args([
+                "--workspace", temp, "--ignore-config", "--provider", "mock",
+                "--max-model-requests", "4", "--prompt", "读取文件", "--output-format", "json",
+            ])
+            output = []
+            stderr = io.StringIO()
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider), \
+                    patch("cvfx_harness.agent.run_tool", side_effect=AssertionError("single request must not run tools")), \
+                    patch("sys.stderr", stderr):
+                result = run_console(args, output=output.append)
+
+        payload = json.loads(output[0])
+        self.assertEqual(result, 4)
+        self.assertEqual(payload["status"], "needs_approval")
+        self.assertEqual(payload["code"], "approval_required")
+        self.assertEqual(payload["tools"], ["read_file"])
+        self.assertEqual(payload["usage"]["requests"], 1)
+        self.assertEqual(len(provider.requests), 1)
+        self.assertEqual(stderr.getvalue(), "cvfx-harness: approval_required\n")
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn(private_path, serialized)
+        self.assertNotIn(private_marker, serialized)
+
+        with make_test_temp(prefix="cli-json-interaction-required-") as temp:
+            provider = ScriptedProvider([AssistantTurn("", [ToolCall(
+                "json-question", "ask_user", {
+                    "questions": [{"id": "q1", "question": "继续前要确认哪一点？"}],
+                },
+            )])])
+            args = build_parser().parse_args([
+                "--workspace", temp, "--ignore-config", "--provider", "mock",
+                "--prompt", "需要澄清", "--output-format", "json",
+            ])
+            output = []
+            stderr = io.StringIO()
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider), \
+                    patch("cvfx_harness.cli._ask_user_cli", side_effect=AssertionError("single request must not prompt")), \
+                    patch("sys.stderr", stderr):
+                result = run_console(args, output=output.append)
+        payload = json.loads(output[0])
+        self.assertEqual(result, 4)
+        self.assertEqual(payload["status"], "needs_input")
+        self.assertEqual(payload["code"], "interaction_required")
+        self.assertEqual(payload["tools"], ["ask_user"])
+        self.assertEqual(len(provider.requests), 1)
+        self.assertEqual(stderr.getvalue(), "cvfx-harness: interaction_required\n")
+
+    def test_single_request_json_redirection_reads_utf8_stdin_and_rejects_credentials_silently(self) -> None:
+        with make_test_temp(prefix="cli-json-stdin-") as temp:
+            stdin = io.TextIOWrapper(io.BytesIO("生成中文 JSON".encode("utf-8")), encoding="utf-8")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with patch("sys.stdin", stdin), patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+                result = main([
+                    "--workspace", temp, "--ignore-config", "--provider", "mock",
+                    "--prompt", "-", "--output-format", "json",
+                ])
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(result, 0)
+            self.assertEqual(payload["status"], "success")
+            self.assertIn("中文", payload["answer"])
+            self.assertEqual(stderr.getvalue(), "")
+
+        with make_test_temp(prefix="cli-json-secret-") as temp:
+            secret = "sk-" + "A" * 24
+            args = build_parser().parse_args([
+                "--workspace", temp, "--ignore-config", "--provider", "mock",
+                "--prompt", f"输入 {secret}", "--output-format", "json",
+            ])
+            output: list[str] = []
+            stderr = io.StringIO()
+            with patch("cvfx_harness.cli.provider_from_environment", side_effect=AssertionError("sensitive prompt must stop before provider setup")), \
+                    patch("sys.stderr", stderr):
+                result = run_console(args, output=output.append)
+        payload = json.loads(output[0])
+        self.assertEqual(result, 2)
+        self.assertEqual(payload["status"], "rejected")
+        self.assertEqual(payload["code"], "sensitive_input")
+        self.assertNotIn(secret, output[0])
+        self.assertEqual(stderr.getvalue(), "cvfx-harness: sensitive_input\n")
+
+        with make_test_temp(prefix="cli-json-invalid-utf8-") as temp:
+            stdin = io.TextIOWrapper(io.BytesIO(b"\xff"), encoding="utf-8")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with patch("sys.stdin", stdin), patch("sys.stdout", stdout), patch("sys.stderr", stderr), \
+                    patch("cvfx_harness.cli.provider_from_environment", side_effect=AssertionError("invalid UTF-8 must stop before provider setup")):
+                result = main([
+                    "--workspace", temp, "--ignore-config", "--provider", "mock",
+                    "--prompt", "-", "--output-format", "json",
+                ])
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(result, 2)
+        self.assertEqual(payload["status"], "rejected")
+        self.assertEqual(payload["code"], "invalid_input")
+        self.assertEqual(stderr.getvalue(), "cvfx-harness: invalid_input\n")
+
+    def test_json_output_without_single_prompt_returns_structured_input_error(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            result = main(["--output-format", "json"])
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(result, 2)
+        self.assertEqual(payload["status"], "rejected")
+        self.assertEqual(payload["code"], "invalid_input")
+        self.assertEqual(payload["exit_code"], 2)
+        self.assertEqual(stderr.getvalue(), "cvfx-harness: invalid_input\n")
+
+    def test_single_request_json_distinguishes_protocol_failure_and_cancellation(self) -> None:
+        with make_test_temp(prefix="cli-json-protocol-") as temp:
+            body = fixture_sse_frames([
+                {"choices": [{"index": 0, "delta": {"unsupported": "shape"}, "finish_reason": "stop"}]},
+            ])
+
+            def serve(handler, _request_body: bytes) -> None:
+                handler.send_response(200)
+                handler.send_header("Content-Type", "text/event-stream")
+                handler.send_header("Content-Length", str(len(body)))
+                handler.end_headers()
+                handler.wfile.write(body)
+
+            server, worker = local_http_fixture(serve)
+            try:
+                provider = OpenAICompatibleProvider(
+                    f"http://127.0.0.1:{server.server_port}", "", "fixture-model", timeout=2, stream_timeout=2
+                )
+                args = build_parser().parse_args([
+                    "--workspace", temp, "--ignore-config", "--provider", "mock",
+                    "--prompt", "测试合成协议错误", "--output-format", "json",
+                ])
+                output: list[str] = []
+                stderr = io.StringIO()
+                with patch("cvfx_harness.cli.provider_from_environment", return_value=provider), patch("sys.stderr", stderr):
+                    result = run_console(args, output=output.append)
+            finally:
+                server.shutdown()
+                worker.join(timeout=2)
+                server.server_close()
+        payload = json.loads(output[0])
+        self.assertEqual(result, 5)
+        self.assertEqual(payload["status"], "protocol_error")
+        self.assertEqual(payload["code"], "protocol_error")
+        self.assertEqual(payload["usage"]["provider_actual"]["status"], "unknown")
+        self.assertEqual(stderr.getvalue(), "cvfx-harness: protocol_error\n")
+
+        with make_test_temp(prefix="cli-json-agent-protocol-") as temp:
+            provider = ScriptedProvider([AssistantTurn("截断结果", finish_reason="length")])
+            args = build_parser().parse_args([
+                "--workspace", temp, "--ignore-config", "--provider", "mock",
+                "--prompt", "测试完成状态校验", "--output-format", "json",
+            ])
+            output = []
+            stderr = io.StringIO()
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider), patch("sys.stderr", stderr):
+                result = run_console(args, output=output.append)
+        payload = json.loads(output[0])
+        self.assertEqual(result, 5)
+        self.assertEqual(payload["status"], "protocol_error")
+        self.assertEqual(payload["code"], "protocol_error")
+
+        with make_test_temp(prefix="cli-json-cancelled-") as temp:
+            provider = ScriptedProvider([])
+            args = build_parser().parse_args([
+                "--workspace", temp, "--ignore-config", "--provider", "mock",
+                "--prompt", "取消测试", "--output-format", "json",
+            ])
+            cancellation = threading.Event()
+            cancellation.set()
+            output = []
+            stderr = io.StringIO()
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider), patch("sys.stderr", stderr):
+                result = run_console(args, output=output.append, cancellation_event=cancellation)
+        payload = json.loads(output[0])
+        self.assertEqual(result, 130)
+        self.assertEqual(payload["status"], "cancelled")
+        self.assertEqual(payload["usage"]["requests"], 0)
+        self.assertEqual(stderr.getvalue(), "cvfx-harness: cancelled\n")
+
     def test_workspace_help_and_status_make_root_and_approval_boundary_explicit(self) -> None:
         with make_test_temp(prefix="工作区 状态-") as temp:
             selected = Path(temp) / "项目 中文"

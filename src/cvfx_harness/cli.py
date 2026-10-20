@@ -104,6 +104,20 @@ _STREAM_SECRET_FIELDS = (
     "api_key", "api-key", "client_secret", "client-secret", "access_token",
     "access-token", "refresh_token", "refresh-token", "password", "passwd",
 )
+_SINGLE_REQUEST_EXIT_CODES = {
+    "ok": 0,
+    "invalid_input": 2,
+    "sensitive_input": 2,
+    "invalid_workspace": 2,
+    "configuration_error": 2,
+    "provider_configuration_error": 2,
+    "provider_error": 3,
+    "approval_required": 4,
+    "interaction_required": 4,
+    "protocol_error": 5,
+    "internal_error": 1,
+    "cancelled": 130,
+}
 
 
 def _safe_terminal_text(text: str) -> str:
@@ -359,6 +373,185 @@ def configure_console_encoding() -> None:
             reconfigure(encoding="utf-8", errors="replace")
 
 
+def _single_request_prompt(value: str) -> str:
+    if value != "-":
+        prompt = value
+    else:
+        stream = sys.stdin
+        binary_stream = getattr(stream, "buffer", None)
+        if binary_stream is not None:
+            raw = binary_stream.read(MAX_MULTILINE_INPUT_BYTES + 1)
+            if len(raw) > MAX_MULTILINE_INPUT_BYTES:
+                raise ValueError("invalid_input")
+            try:
+                prompt = raw.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                raise ValueError("invalid_input") from None
+        else:
+            prompt = stream.read(MAX_MULTILINE_INPUT_BYTES + 1)
+    try:
+        prompt_bytes = prompt.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        raise ValueError("invalid_input") from None
+    if len(prompt_bytes) > MAX_MULTILINE_INPUT_BYTES or not prompt.strip():
+        raise ValueError("invalid_input")
+    if contains_likely_secret(prompt):
+        raise PermissionError("sensitive_input")
+    return prompt
+
+
+def _single_request_usage(agent: Agent | None) -> dict[str, object]:
+    if agent is None:
+        requests = input_estimate = output_estimate = reports = prompt = completion = cache_reports = cache_tokens = 0
+    else:
+        stats = agent.usage
+        requests = stats.requests
+        input_estimate = stats.estimated_input_tokens
+        output_estimate = stats.estimated_output_tokens
+        reports = stats.provider_usage_reports
+        prompt = stats.provider_prompt_tokens
+        completion = stats.provider_completion_tokens
+        cache_reports = stats.provider_cached_prompt_reports
+        cache_tokens = stats.provider_cached_prompt_tokens
+    provider_state = (
+        "unknown" if reports == 0 else "reported" if reports == requests else "partial"
+    )
+    cache_state = (
+        "unknown"
+        if cache_reports == 0
+        else "reported"
+        if cache_reports == reports == requests
+        else "partial"
+    )
+    return {
+        "requests": requests,
+        "local_estimate": {
+            "status": "estimated",
+            "input_tokens": input_estimate,
+            "output_tokens": output_estimate,
+        },
+        "provider_actual": {
+            "status": provider_state,
+            "reports": reports,
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+        },
+        "cache_actual": {
+            "status": cache_state,
+            "reports": cache_reports,
+            "cached_prompt_tokens": cache_tokens,
+        },
+    }
+
+
+def _emit_single_request_result(
+    output: Callable[[str], None],
+    *,
+    json_output: bool,
+    status: str,
+    code: str,
+    answer: str | None = None,
+    message: str | None = None,
+    tools: tuple[str, ...] | list[str] = (),
+    agent: Agent | None = None,
+) -> int:
+    exit_code = _SINGLE_REQUEST_EXIT_CODES[code]
+    safe_answer = (
+        _safe_terminal_text(redact_likely_secrets(answer)[0])
+        if answer is not None
+        else None
+    )
+    if json_output:
+        result = {
+            "schema_version": 1,
+            "status": status,
+            "code": code,
+            "exit_code": exit_code,
+            "answer": safe_answer,
+            "tools": list(dict.fromkeys(tools)),
+            "message": message,
+            "usage": _single_request_usage(agent),
+        }
+        output(json.dumps(result, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
+        if exit_code:
+            print(f"cvfx-harness: {code}", file=sys.stderr)
+    elif safe_answer is not None:
+        output(safe_answer)
+    elif message:
+        output(message)
+    return exit_code
+
+
+def _run_single_request(
+    prompt: str,
+    agent: Agent,
+    provider: object,
+    *,
+    output: Callable[[str], None],
+    json_output: bool,
+    cancellation_event: threading.Event | None,
+) -> int:
+    try:
+        streaming = callable(getattr(provider, "complete_streaming", None))
+        answer = agent.ask(
+            prompt,
+            cancellation_event=cancellation_event,
+            on_text_delta=(lambda _fragment: None) if streaming else None,
+        )
+    except (KeyboardInterrupt, ProviderCancelled):
+        return _emit_single_request_result(
+            output, json_output=json_output, status="cancelled", code="cancelled",
+            message="请求已取消。", agent=agent,
+        )
+    except ProviderStreamError as exc:
+        category = (
+            exc.diagnostics.category if exc.diagnostics is not None else exc.category
+        )
+        if category in {"parse_error", "protocol_error", "protocol_rejection", "missing_end_marker", "size_limit"}:
+            return _emit_single_request_result(
+                output, json_output=json_output, status="protocol_error", code="protocol_error",
+                message="模型响应协议无效；本次未执行工具。", agent=agent,
+            )
+        return _emit_single_request_result(
+            output, json_output=json_output, status="error", code="provider_error",
+            message="模型服务请求失败。", agent=agent,
+        )
+    except ProviderError:
+        if agent.usage.requests:
+            return _emit_single_request_result(
+                output, json_output=json_output, status="protocol_error", code="protocol_error",
+                message="模型响应未通过本地协议或预算校验；本次未执行工具。", agent=agent,
+            )
+        return _emit_single_request_result(
+            output, json_output=json_output, status="error", code="provider_error",
+            message="模型请求无法开始。", agent=agent,
+        )
+    except Exception:
+        return _emit_single_request_result(
+            output, json_output=json_output, status="error", code="internal_error",
+            message="单次请求处理失败。", agent=agent,
+        )
+
+    tools = tuple(agent.turns[-1].tool_names) if agent.turns else ()
+    if tools:
+        if "ask_user" in tools:
+            return _emit_single_request_result(
+                output, json_output=json_output, status="needs_input", code="interaction_required",
+                message="模型请求本地交互；单次非交互模式没有提交答案。",
+                tools=tools, agent=agent,
+            )
+        return _emit_single_request_result(
+            output, json_output=json_output, status="needs_approval", code="approval_required",
+            message="模型请求工具；本次单次请求未执行工具，需在交互模式中逐项审批。",
+            tools=tools, agent=agent,
+        )
+    return _emit_single_request_result(
+        output, json_output=json_output, status="success", code="ok",
+        answer=answer, agent=agent,
+    )
+
+
 def _parse_integer_argument(value: str) -> int:
     try:
         return int(value)
@@ -454,6 +647,17 @@ def build_parser() -> argparse.ArgumentParser:
             "根目录不能是 symlink/junction；包含空格的路径请加引号。"
             "每次启动固定一个根目录；更换目录须取消/结束当前会话后重新启动新会话。"
         ),
+    )
+    parser.add_argument(
+        "--prompt",
+        metavar="TEXT",
+        help="发送一条请求后退出；使用 - 从标准输入读取 UTF-8。单次模式不会执行工具。",
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=("text", "json"),
+        default="text",
+        help="单次请求的输出格式；json 输出一条结构化结果，错误诊断写入 stderr",
     )
     parser.add_argument(
         "--provider",
@@ -1144,6 +1348,32 @@ def run_console(
     cancellation_event: threading.Event | None = None,
     ask_user_fn: Callable[[QuestionnaireRequest], QuestionnaireResult] | None = None,
 ) -> int:
+    single_request = getattr(args, "prompt", None) is not None
+    json_output = getattr(args, "output_format", "text") == "json"
+    if json_output and not single_request:
+        return _emit_single_request_result(
+            output, json_output=True, status="rejected", code="invalid_input",
+            message="JSON 输出格式需要同时指定 --prompt。",
+        )
+    single_prompt: str | None = None
+    if single_request:
+        try:
+            single_prompt = _single_request_prompt(args.prompt)
+        except KeyboardInterrupt:
+            return _emit_single_request_result(
+                output, json_output=json_output, status="cancelled", code="cancelled",
+                message="读取单次输入时已取消。",
+            )
+        except PermissionError:
+            return _emit_single_request_result(
+                output, json_output=json_output, status="rejected", code="sensitive_input",
+                message="输入含有疑似凭据，未发送给模型。",
+            )
+        except (OSError, ValueError):
+            return _emit_single_request_result(
+                output, json_output=json_output, status="rejected", code="invalid_input",
+                message="单次输入无效、非 UTF-8 或超过 64 KiB。",
+            )
     try:
         workspace = selected_workspace or Workspace(args.workspace)
         workspace.resolve_directory(".")
@@ -1163,16 +1393,32 @@ def run_console(
             ),
         )
     except (ConfigError, WorkspaceError, ProviderError) as exc:
+        if single_request:
+            if isinstance(exc, WorkspaceError):
+                code, message = "invalid_workspace", "工作区不可用。"
+            elif isinstance(exc, ConfigError):
+                code, message = "configuration_error", "工作区配置无效。"
+            else:
+                code, message = "provider_configuration_error", "模型提供商配置无效。"
+            return _emit_single_request_result(
+                output, json_output=json_output, status="error", code=code, message=message
+            )
         output(f"错误：{exc}")
         return 2
 
     mode = "执行"
-    approve_action = lambda request: _confirm_action(
-        request, input_fn=input_fn, output=output
-    )
-    ask_user_callback = ask_user_fn or (
-        lambda request: _ask_user_cli(request, input_fn=input_fn, output=output)
-    )
+    if single_request:
+        # A single request has no interactive approval surface. The one-provider-
+        # request limit below also prevents a denied tool call from being replayed.
+        approve_action = lambda _request: False
+        ask_user_callback = lambda _request: QuestionnaireResult("cancelled")
+    else:
+        approve_action = lambda request: _confirm_action(
+            request, input_fn=input_fn, output=output
+        )
+        ask_user_callback = ask_user_fn or (
+            lambda request: _ask_user_cli(request, input_fn=input_fn, output=output)
+        )
     test_profile_store = TestProfileStore(workspace)
     agent = Agent(
         provider,
@@ -1180,11 +1426,21 @@ def run_console(
         approve_action=approve_action,
         token_budget=startup_config.token_budget,
         max_output_tokens=startup_config.max_output_tokens,
-        max_provider_requests=getattr(args, "max_model_requests", 4),
+        max_provider_requests=1 if single_request else getattr(args, "max_model_requests", 4),
         test_profile_store=test_profile_store,
-        emit_output=output,
+        emit_output=(lambda _text: None) if single_request else output,
         ask_user=ask_user_callback,
     )
+    if single_request:
+        assert single_prompt is not None
+        return _run_single_request(
+            single_prompt,
+            agent,
+            provider,
+            output=output,
+            json_output=json_output,
+            cancellation_event=cancellation_event,
+        )
     subagent_manager = SubagentManager(
         provider,
         workspace,
@@ -2833,6 +3089,13 @@ def run_console(
 def main(argv: list[str] | None = None) -> int:
     configure_console_encoding()
     args = build_parser().parse_args(argv)
+    if args.output_format == "json" and args.prompt is None:
+        return _emit_single_request_result(
+            print, json_output=True, status="rejected", code="invalid_input",
+            message="JSON 输出格式需要同时指定 --prompt。",
+        )
+    if args.prompt is not None:
+        return run_console(args)
     is_stdin_tty = sys.stdin.isatty()
     is_stdout_tty = sys.stdout.isatty()
     term = os.environ.get("TERM")
