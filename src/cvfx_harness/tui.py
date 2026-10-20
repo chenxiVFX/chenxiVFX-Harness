@@ -14,6 +14,7 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.history import DummyHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.document import Document
 from prompt_toolkit.layout import (
     Dimension,
     HSplit,
@@ -32,6 +33,7 @@ from prompt_toolkit.widgets import Button, TextArea
 from wcwidth import wcswidth
 
 from .profiles import TestProfileError, TestProfileStore
+from .input_limits import MAX_PROMPT_INPUT_BYTES
 from .config import ConfigError, WorkspaceConfigStore, validate_tui_shortcuts
 from .questions import (
     MAX_TOTAL_ANSWER_BYTES,
@@ -413,6 +415,9 @@ class TerminalUI:
         self._status = "启动中"
         self._notice = ""
         self._resetting_input = False
+        self._input_last_valid_text = ""
+        self._input_last_valid_cursor = 0
+        self._input_rejection: str | None = None
         self._prompt = ""
         self._approval_text = ""
         self._approval_choice_yes = False
@@ -439,6 +444,7 @@ class TerminalUI:
         )
         self._input_buffer = self.input_area.buffer
         self._input_buffer.on_text_changed += self._on_input_text_changed
+        self._input_buffer.on_cursor_position_changed += self._on_input_cursor_position_changed
         self._input_area_container = ConditionalContainer(
             self.input_area,
             Condition(
@@ -1117,8 +1123,43 @@ class TerminalUI:
         return bindings
 
     def _on_input_text_changed(self, buffer) -> None:
-        if buffer.text:
-            self._notice = ""
+        if self._resetting_input:
+            return
+        invalid_unicode = False
+        try:
+            input_size = len(buffer.text.encode("utf-8", errors="strict"))
+        except UnicodeEncodeError:
+            input_size = MAX_PROMPT_INPUT_BYTES + 1
+            invalid_unicode = True
+        if input_size > MAX_PROMPT_INPUT_BYTES:
+            self._resetting_input = True
+            try:
+                buffer.document = Document(
+                    self._input_last_valid_text,
+                    min(self._input_last_valid_cursor, len(self._input_last_valid_text)),
+                )
+                buffer.exit_selection()
+                buffer.cancel_completion()
+            finally:
+                self._resetting_input = False
+            if invalid_unicode:
+                self._input_rejection = "invalid_unicode"
+                self._notice = "本次编辑含无法编码的字符，未纳入；原草稿已保留。"
+            else:
+                self._input_rejection = "oversize"
+                self._notice = (
+                    f"本次编辑超出 {MAX_PROMPT_INPUT_BYTES} UTF-8 bytes 上限；"
+                    "这次编辑未纳入，原草稿已保留。"
+                )
+            return
+        self._input_last_valid_text = buffer.text
+        self._input_last_valid_cursor = buffer.cursor_position
+        self._input_rejection = None
+        self._notice = ""
+
+    def _on_input_cursor_position_changed(self, buffer) -> None:
+        if not self._resetting_input:
+            self._input_last_valid_cursor = buffer.cursor_position
 
     def _on_question_text_changed(self, buffer) -> None:
         if buffer.text and self._question_pending is not None:
@@ -1208,6 +1249,9 @@ class TerminalUI:
             self._input_buffer.text = ""
         finally:
             self._resetting_input = False
+        self._input_last_valid_text = ""
+        self._input_last_valid_cursor = 0
+        self._input_rejection = None
 
     def _request_cancel(self) -> None:
         self._cancel_requested = True
@@ -1259,8 +1303,10 @@ class TerminalUI:
             columns = self._application.output.get_size().columns
         except (AttributeError, NotImplementedError, OSError):
             columns = 80
+        if columns >= 52:
+            return "多行粘贴留草稿 · Ctrl+J换行 · Enter提交 · /查看命令"
         if columns >= 42:
-            return "输入任务开始  ·  输入 / 查看命令"
+            return "Ctrl+J换行 · Enter提交 · /查看命令"
         return "输入任务  ·  /命令"
 
     def _header_fragments(self) -> list[tuple[str, str]]:
@@ -1639,6 +1685,20 @@ class TerminalUI:
                 line = "Pg↑↓审阅 · Enter确认 · Esc取消"
             else:
                 line = "Enter确认 · Esc取消"
+        elif self._input_rejection == "oversize":
+            if columns >= 50:
+                line = f"输入超出 {MAX_PROMPT_INPUT_BYTES} UTF-8 bytes；编辑拒绝，原草稿保留"
+            elif columns >= 30:
+                line = f"超 {MAX_PROMPT_INPUT_BYTES} UTF-8 bytes；草稿保留"
+            else:
+                line = "超限；草稿保留"
+        elif self._input_rejection == "invalid_unicode":
+            if columns >= 50:
+                line = "本次编辑字符无法编码；已拒绝，原草稿保留"
+            elif columns >= 30:
+                line = "字符无法编码；原草稿保留"
+            else:
+                line = "字符无效；保留草稿"
         elif self._notice:
             line = f"{self._status}  ·  {self._notice}"
         elif self._pending is None and not self._worker_done:
@@ -1646,8 +1706,22 @@ class TerminalUI:
         elif self._pending is None:
             line = self._status
         else:
-            if columns >= 36:
-                line = "等待输入 · Tab补全 · Enter提交"
+            complete_state = self._input_buffer.complete_state
+            has_candidates = bool(complete_state is not None and complete_state.completions)
+            if has_candidates and columns >= 60:
+                line = "↑↓选择 · Enter/Tab填入候选 · 再按Enter提交 · Esc关闭建议"
+            elif has_candidates and columns >= 40:
+                line = "↑↓选择 · Enter填入候选 · 再按Enter提交"
+            elif has_candidates:
+                line = "Enter填入候选 · 再按Enter提交"
+            elif columns >= 72:
+                line = "等待输入 · 多行粘贴留草稿 · Ctrl+J换行 · Tab补全 · Enter提交 · Esc取消"
+            elif columns >= 53:
+                line = "等待输入 · Ctrl+J换行 · Tab补全 · Enter提交 · Esc取消"
+            elif columns >= 43:
+                line = "等待输入 · Ctrl+J换行 · Enter提交 · Esc取消"
+            elif columns >= 36:
+                line = "等待输入 · Ctrl+J换行 · Enter提交"
             elif columns >= 26:
                 line = "等待输入 · Enter提交"
             else:

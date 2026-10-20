@@ -24,6 +24,7 @@ from prompt_toolkit.data_structures import Size
 from wcwidth import wcswidth
 
 from cvfx_harness.cli import _StreamingSecretRedactor, _confirm_action, build_parser, run_console
+from cvfx_harness.input_limits import MAX_PROMPT_INPUT_BYTES
 from cvfx_harness.plans import PlanStore
 from cvfx_harness.profiles import TestProfileStore
 from cvfx_harness.providers import AssistantTurn, MockProvider, ProviderCancelled, ToolCall
@@ -1095,6 +1096,131 @@ class PromptToolkitTests(unittest.TestCase):
         self.assertEqual(received, ["第一行\n第二行"])
         self.assertIn("第一行\n第二行", ui._transcript)
 
+    def test_multiline_tui_paste_stays_a_draft_and_leading_slash_is_text(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-multiline-paste-") as workspace:
+            provider = MockProvider()
+            payload = "/退出\n中文宽字符🙂\ne\u0301组合字符\n粘贴尾标"
+
+            def send(pipe, ui: TerminalUI) -> None:
+                initial_request = ui._pending
+                pipe.send_bytes(b"\x1b[200~" + payload.encode("utf-8") + b"\x1b[201~")
+                self._wait_until(
+                    lambda: ui._input_buffer.text == payload,
+                    "bracketed paste did not remain intact in the chat draft",
+                )
+                self.assertIs(ui._pending, initial_request, "paste itself must not submit")
+                self.assertNotIn("[模拟模式]", ui._transcript)
+
+                pipe.send_bytes(b"\r")
+                self._wait_until(
+                    lambda: ui._pending is not None
+                    and ui._pending is not initial_request
+                    and "[模拟模式] 已收到：" + payload in ui._transcript,
+                    "multiline text beginning with a slash command was not sent as one prompt",
+                )
+                self.assertNotIn("未知命令", ui._transcript)
+                pipe.send_text("/退出\r")
+
+            ui, result = self._run_cli_ui(workspace, provider, send)
+        self.assertEqual(result, 0)
+        self.assertIn("你> " + payload, ui._transcript)
+        self.assertIn("[模拟模式] 已收到：" + payload, ui._transcript)
+
+    def test_oversized_bracketed_paste_preserves_existing_utf8_draft_and_cursor(self) -> None:
+        class NarrowDummyOutput(DummyOutput):
+            def get_size(self):
+                return Size(rows=12, columns=32)
+
+        received: list[str] = []
+        draft = "保留🙂e\u0301中文草稿"
+        overflow = "中" * (MAX_PROMPT_INPUT_BYTES // 3 + 1)
+
+        def worker(ui: TerminalUI) -> int:
+            received.append(ui.input("你> "))
+            return 0
+
+        def send(pipe, ui: TerminalUI) -> None:
+            pipe.send_text(draft)
+            self._wait_until(lambda: ui._input_buffer.text == draft, "valid UTF-8 draft was not accepted")
+            pipe.send_bytes(b"\x1b[D\x1b[D")
+            self._wait_until(
+                lambda: ui._input_buffer.cursor_position == len(draft) - 2,
+                "cursor did not move left before overflow test",
+            )
+            cursor_before = ui._input_buffer.cursor_position
+            pipe.send_bytes(b"\x1b[200~" + overflow.encode("utf-8") + b"\x1b[201~")
+            self._wait_until(
+                lambda: "超出 65536 UTF-8 bytes 上限" in ui._notice,
+                "oversized paste was not reported",
+            )
+            self.assertEqual(ui._input_buffer.text, draft)
+            self.assertEqual(ui._input_buffer.cursor_position, cursor_before)
+            status = ui._status_line()
+            self.assertLessEqual(wcswidth(status), 32)
+            self.assertIn("65536", status)
+            self.assertIn("草稿保留", status)
+            pipe.send_bytes(b"\r")
+
+        ui, result = self._run_ui(worker, send, output=NarrowDummyOutput())
+        self.assertEqual(result, 0)
+        self.assertEqual(received, [draft])
+        self.assertIn("原草稿已保留", ui._notice)
+
+    def test_path_completion_keyboard_edit_preserves_cjk_and_combining_prefix(self) -> None:
+        received: list[str] = []
+        expected_values: list[str] = []
+        prefix = "中文🙂e\u0301 保留内容 @{资料/"
+
+        def worker(ui: TerminalUI) -> int:
+            received.append(ui.input("你> "))
+            return 0
+
+        def send(pipe, ui: TerminalUI) -> None:
+            pipe.send_text(prefix)
+            self._wait_until(
+                lambda: ui._input_buffer.text == prefix,
+                f"Unicode path-completion draft was not accepted: {ui._input_buffer.text!r}",
+            )
+            self._wait_until(
+                lambda: ui._input_buffer.complete_state is not None
+                and len(ui._input_buffer.complete_state.completions) >= 2,
+                "path completion candidates did not appear",
+            )
+            pipe.send_bytes(b"\x1b[B\x1b[B")
+            self._wait_until(
+                lambda: ui._input_buffer.complete_state is not None
+                and ui._input_buffer.complete_state.current_completion is not None,
+                "arrow keys did not select a completion candidate",
+            )
+            state = ui._input_buffer.complete_state
+            assert state is not None and state.current_completion is not None
+            completion = state.current_completion
+            expected = prefix + completion.text
+            expected_values.append(expected)
+            pipe.send_bytes(b"\r")
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and ui._input_buffer.text != expected:
+                time.sleep(0.01)
+            self.assertEqual(
+                ui._input_buffer.text,
+                expected,
+                "Enter did not fill the selected candidate without changing the earlier draft; "
+                f"current={ui._input_buffer.text!r}, expected={expected!r}",
+            )
+            self.assertIsNotNone(ui._pending, "filling a candidate must not submit")
+            self.assertTrue(expected.startswith(prefix))
+            pipe.send_bytes(b"\r")
+
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-unicode-completion-") as workspace:
+            directory = Path(workspace) / "资料"
+            directory.mkdir()
+            (directory / "候选 文件.py").write_text("synthetic", encoding="utf-8")
+            (directory / "候选 对照.py").write_text("synthetic", encoding="utf-8")
+            ui, result = self._run_ui(worker, send, workspace_root=workspace)
+        self.assertEqual(result, 0)
+        self.assertEqual(received, expected_values)
+        self.assertTrue(received[0].startswith(prefix))
+
     def test_arrow_keys_move_cursor_when_no_completion_menu_is_open(self) -> None:
         received: list[str] = []
 
@@ -1379,7 +1505,12 @@ class PromptToolkitTests(unittest.TestCase):
                 line = ui._status_line()
                 self.assertLessEqual(wcswidth(line), columns)
                 self.assertIn("等待输入" if columns >= 26 else "输入", line)
-                self.assertIn("Tab补全" if columns >= 36 else "Enter", line)
+                if columns >= 53:
+                    self.assertIn("Tab补全", line)
+                elif columns >= 36:
+                    self.assertIn("Ctrl+J", line)
+                else:
+                    self.assertIn("Enter", line)
                 self.assertLessEqual(wcswidth(ui._empty_hint()), columns)
                 self.assertIn(
                     "查看命令" if columns >= 42 else "/命令", ui._empty_hint()
@@ -1606,7 +1737,7 @@ class PromptToolkitTests(unittest.TestCase):
             self.assertLess(title.ypos, 20)
             self.assertGreater(title.ypos, transcript.ypos)
             self.assertEqual(hint.ypos, title.ypos + 1)
-            self.assertNotIn("Ctrl+J", ui._status_line())
+            self.assertIn("Ctrl+J", ui._status_line())
             ui._resolve_pending(value="")
 
         ui, result = self._run_ui(worker, send, output=SizedDummyOutput())
@@ -2147,6 +2278,78 @@ class PromptToolkitTests(unittest.TestCase):
                 self.assertEqual(process.wait(timeout=2), 0)
                 self.assertIn("会话".encode("utf-8"), output)
                 self.assertIn("Enter".encode("utf-8"), output)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=2)
+                os.close(master_fd)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX pseudo-terminal bracketed paste test")
+    def test_real_posix_pty_bracketed_multiline_paste_waits_for_enter_and_preserves_unicode(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-paste-pty-") as temp:
+            received_path = Path(temp) / "received.json"
+            driver = (
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                "from cvfx_harness.tui import TerminalUI\n"
+                "def worker(ui):\n"
+                "    value = ui.input('你> ')\n"
+                "    Path(sys.argv[1]).write_text(json.dumps(value, ensure_ascii=False), encoding='utf-8')\n"
+                "    return 0\n"
+                "raise SystemExit(TerminalUI(worker).run())\n"
+            )
+            payload = (
+                "窄屏宽字符：" + "中文🙂" * 10
+                + "\n组合字符：e\u0301 保持原样\nPTY_PASTE_END"
+            )
+            environment = {
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "TERM": "xterm-256color",
+            }
+            master_fd, slave_fd = pty.openpty()
+            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 34, 0, 0))
+            process = subprocess.Popen(
+                [sys.executable, "-c", driver, str(received_path)],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=environment,
+                close_fds=True,
+            )
+            os.close(slave_fd)
+            terminal_output = bytearray()
+
+            def read_until(marker: bytes, *, timeout: float = 8.0) -> None:
+                deadline = time.monotonic() + timeout
+                while marker not in terminal_output:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self.fail(f"PTY timed out waiting for {marker!r}")
+                    ready, _, _ = select.select([master_fd], [], [], min(remaining, 0.1))
+                    if not ready:
+                        continue
+                    try:
+                        terminal_output.extend(os.read(master_fd, 8192))
+                    except OSError:
+                        break
+
+            try:
+                read_until("你> ".encode("utf-8"))
+                self.assertIn(b"\x1b[?2004h", terminal_output, "TUI should enable terminal bracketed-paste mode")
+                os.write(master_fd, b"\x1b[200~" + payload.encode("utf-8") + b"\x1b[201~")
+                read_until(b"PTY_PASTE_END")
+                time.sleep(0.05)
+                self.assertIsNone(process.poll(), "pasting must leave the prompt open")
+                self.assertFalse(received_path.exists(), "pasting must not submit the draft")
+                os.write(master_fd, b"\r")
+                self.assertEqual(process.wait(timeout=8), 0)
+                self.assertEqual(
+                    json.loads(received_path.read_text(encoding="utf-8")),
+                    payload,
+                )
             finally:
                 if process.poll() is None:
                     process.terminate()

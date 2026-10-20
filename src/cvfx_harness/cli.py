@@ -55,6 +55,7 @@ from .questions import (
     QuestionRequestError,
     validate_question_answers,
 )
+from .input_limits import MAX_PROMPT_INPUT_BYTES
 from .sessions import (
     describe_session_omissions,
     SessionError,
@@ -68,7 +69,7 @@ from .usage import DEFAULT_TOKEN_BUDGET, usage_breakdown
 
 _REFERENCE = re.compile(r"(?<![\w@])@(?:\{([^{}]+)\}|([^\s]+))", re.UNICODE)
 _TRAILING_PUNCTUATION = ",，。;；!?！？)]}"
-MAX_MULTILINE_INPUT_BYTES = 64 * 1024
+MAX_MULTILINE_INPUT_BYTES = MAX_PROMPT_INPUT_BYTES
 MAX_RESUME_CONTEXT_BYTES = 4 * 1024
 _CLI_COMMANDS = (
     "/帮助", "/命令", "/状态", "/项目说明", "/模式", "/目标", "/计划", "/保存", "/检查点",
@@ -892,7 +893,7 @@ def _help_text() -> str:
   /变更集 证据      只读检查批次日志/备份关联，孤立备份不会重建授权
   /变更集 恢复 <编号> 显示当前状态与完整恢复差异，单独确认后尝试恢复
   /撤销              预览并恢复最近一次 Harness 文件写入
-  /多行              开始多行提问；单独输入 /提交 发送，/取消 丢弃
+  /多行              纯文本模式开始多行提问；单独输入 /提交 发送，/取消 丢弃
   /退出              结束会话
 
 工作区在进程启动时固定，/状态 会显示完整路径和当前信任/审批边界；不会在运行中的任务之间切换根目录。
@@ -903,7 +904,11 @@ def _help_text() -> str:
 
 模型可在信息不足时使用结构化问卷询问 1–3 个非敏感问题；建议可选，用户可自由作答。TUI 按题编辑并审阅后显式提交，Esc 取消本问卷；Ctrl+C 取消当前模型请求。默认问答仅本次使用；当前上下文安全时，用户可在提交前明确允许把普通问答随 /保存 写入工作区本地会话；已有未存档上下文时本地会禁用该选项。未同意保存的回答及其影响的后续轮次会从存档中省略，并显示恢复提示。疑似密钥、密码或 Token 请求会被阻止。
 文件引用：在提问中写 @相对路径，或用 @{包含空格的相对路径}。
-多行提问以换行符合并，最多 64 KiB UTF-8；Ctrl+C 或 /取消 会丢弃草稿，EOF 会结束会话且不提交。
+每条提问最多 64 KiB UTF-8；超限时拒绝本次编辑/输入并保留 TUI 现有草稿。TUI 中 Enter 提交，Ctrl+J 换行；
+支持 bracketed paste 的终端会把多行粘贴填入同一草稿，不会逐行提交。若内容含换行，即使首行像斜杠命令，也按普通文本发送。
+建议栏打开时 Enter/Tab 填入未完成候选，再按 Enter 提交；精确完整命令可直接提交。Ctrl+C 首次清空草稿，再次取消输入；Esc 先关建议，再次取消输入。
+输入不会写入磁盘历史或应用内剪贴板缓存；粘贴内容属于当前草稿，并遵循本地会话保存规则。纯文本模式多行请先用 /多行；单独一行 /提交 发送，/取消 丢弃。要把字面 /提交 或 /取消 单独成行，请在前面多加一个 /。
+EOF 会结束会话且不提交未完成的多行草稿。
 TTY 且提供 Python readline 时，Tab 补全命令名和固定选项（如 /模式 计划|执行）；不补路径、自由文本或凭据。输入历史（包括审批回答）不会保存或重放。
 无 TTY 时可用逐行脚本输入；EOF 结束会话。所有审批仍需单独输入 y/yes/是。
 每次文件读取和写入都要人工确认；写入/撤销会先显示完整差异。
@@ -1148,7 +1153,8 @@ def _collect_multiline_input(
 ) -> tuple[str, str | None]:
     output(
         f"多行输入：每行继续，单独输入 /提交 发送，/取消 丢弃；"
-        f"上限 {MAX_MULTILINE_INPUT_BYTES} bytes。"
+        f"字面内容若整行等于 /提交 或 /取消，请在前面再加一个 /；"
+        f"上限 {MAX_MULTILINE_INPUT_BYTES} UTF-8 bytes。"
     )
     lines: list[str] = []
     total_bytes = 0
@@ -1163,17 +1169,28 @@ def _collect_multiline_input(
                 return "submitted", "\n".join(lines)
             if marker == "/取消":
                 return "cancelled", None
+            if marker in {"//提交", "//取消"}:
+                leading_space = len(line) - len(line.lstrip())
+                line = line[:leading_space] + line[leading_space + 1 :]
             if not over_limit:
                 try:
-                    line_bytes = len((line + "\n").encode("utf-8"))
+                    line_bytes = len(line.encode("utf-8")) + (1 if lines else 0)
                 except UnicodeEncodeError:
                     over_limit = True
                     lines.clear()
+                    output(
+                        "多行草稿含无法编码的字符；已丢弃此前内容，不会提交。"
+                        "请用 /提交 结束，或 /取消 返回。"
+                    )
                     continue
                 total_bytes += line_bytes
                 if total_bytes > MAX_MULTILINE_INPUT_BYTES:
                     over_limit = True
                     lines.clear()
+                    output(
+                        f"多行草稿超过 {MAX_MULTILINE_INPUT_BYTES} UTF-8 bytes；"
+                        "已丢弃此前内容，不会提交。请用 /提交 结束，或 /取消 返回。"
+                    )
                     continue
                 lines.append(line)
     except KeyboardInterrupt:
@@ -1644,11 +1661,28 @@ def run_console(
             output("\n已取消当前输入；没有提交问题，会话继续。")
             continue
 
+        try:
+            line_size = len(line.encode("utf-8", errors="strict"))
+        except UnicodeEncodeError:
+            output("输入包含无法编码的字符；问题未提交，请重新输入。")
+            continue
+        if line_size > MAX_PROMPT_INPUT_BYTES:
+            output(
+                f"本次输入超过 {MAX_PROMPT_INPUT_BYTES} UTF-8 bytes 上限；问题未提交。"
+                "请缩短后重试；纯文本模式的多行内容请先用 /多行。"
+            )
+            continue
+
         stripped = line.strip()
         if not stripped:
             continue
         command, _, argument = stripped.partition(" ")
         command = command.casefold()
+        if "\n" in line or "\r" in line or "\u2028" in line or "\u2029" in line:
+            # Do this before any local-command handler can consume the first
+            # line of a pasted prompt.
+            command = ""
+            argument = ""
         resume_confirmed = False
         resume_goal_override: str | None = None
 
@@ -1952,7 +1986,7 @@ def run_console(
                 output("收到 EOF；多行草稿已丢弃，会话结束。")
                 return 0
             if state == "too_large":
-                output(f"多行草稿超过 {MAX_MULTILINE_INPUT_BYTES} bytes；已丢弃，没有提交。")
+                output("多行输入未提交。")
                 continue
             line = multiline_text or ""
             if not line.strip():

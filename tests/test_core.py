@@ -3587,7 +3587,82 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(state, "too_large")
         self.assertIsNone(text_value)
-        self.assertIn("65536 bytes", outputs[0])
+        self.assertIn("65536 UTF-8 bytes", outputs[0])
+        self.assertTrue(any("不会提交" in line for line in outputs[1:]))
+
+    def test_multiline_input_counts_only_real_line_separators_at_byte_limit(self) -> None:
+        for rows in (
+            ["x" * MAX_MULTILINE_INPUT_BYTES],
+            ["a" * 32767, "b" * 32768],
+        ):
+            with self.subTest(row_count=len(rows)):
+                answers = iter([*rows, "/提交"])
+                state, text_value = _collect_multiline_input(
+                    lambda _prompt: next(answers), output=lambda _message: None
+                )
+                self.assertEqual(state, "submitted")
+                assert text_value is not None
+                self.assertEqual(len(text_value.encode("utf-8")), MAX_MULTILINE_INPUT_BYTES)
+
+        answers = iter(["a" * 32767, "b" * 32769, "/提交"])
+        outputs: list[str] = []
+        state, text_value = _collect_multiline_input(
+            lambda _prompt: next(answers), output=outputs.append
+        )
+        self.assertEqual(state, "too_large")
+        self.assertIsNone(text_value)
+        self.assertTrue(any("超过 65536 UTF-8 bytes" in line for line in outputs))
+
+    def test_multiline_input_escapes_literal_end_markers(self) -> None:
+        answers = iter(["代码示例", "  //提交  ", "//取消", "/提交"])
+        outputs: list[str] = []
+        state, text_value = _collect_multiline_input(
+            lambda _prompt: next(answers), output=outputs.append
+        )
+        self.assertEqual(state, "submitted")
+        self.assertEqual(text_value, "代码示例\n  /提交  \n/取消")
+        self.assertIn("在前面再加一个 /", outputs[0])
+
+    def test_cli_rejects_oversized_single_prompt_without_sending_it(self) -> None:
+        with make_test_temp(prefix="cli-input-limit-") as temp:
+            marker = "超限合成内容不应显示"
+            provider = ScriptedProvider([])
+            args = build_parser().parse_args([
+                "--workspace", temp, "--provider", "mock",
+            ])
+            inputs = iter([marker + ("中" * (MAX_MULTILINE_INPUT_BYTES // 3 + 1)), "/退出"])
+            outputs: list[str] = []
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                result = run_console(
+                    args,
+                    input_fn=lambda _prompt: next(inputs),
+                    output=outputs.append,
+                )
+        self.assertEqual(result, 0)
+        self.assertEqual(provider.requests, [])
+        self.assertTrue(any("超过 65536 UTF-8 bytes 上限" in line for line in outputs))
+        self.assertFalse(any(marker in line for line in outputs))
+
+    def test_multiline_prompt_starting_with_slash_is_ordinary_user_text(self) -> None:
+        with make_test_temp(prefix="cli-multiline-slash-boundary-") as temp:
+            provider = ScriptedProvider([AssistantTurn("普通文本路径已核验。")])
+            args = build_parser().parse_args([
+                "--workspace", temp, "--provider", "mock",
+            ])
+            prompt = "/继续\n这段是普通文本，不应进入本地续跑命令。"
+            inputs = iter([prompt, "/退出"])
+            outputs: list[str] = []
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                result = run_console(
+                    args,
+                    input_fn=lambda _prompt: next(inputs),
+                    output=outputs.append,
+                )
+        self.assertEqual(result, 0)
+        self.assertEqual(len(provider.requests), 1)
+        self.assertEqual(provider.requests[0][-1]["content"], prompt)
+        self.assertTrue(any("普通文本路径已核验" in line for line in outputs))
+        self.assertFalse(any("未知命令" in line for line in outputs))
 
     def test_cli_displays_streamed_chinese_safely(self) -> None:
         output_text: list[str] = []
