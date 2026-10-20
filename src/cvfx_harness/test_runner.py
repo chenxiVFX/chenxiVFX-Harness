@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -19,8 +21,15 @@ from .tools import ActionRequest, ApprovalCallback, Workspace, WorkspaceError
 MAX_TEST_RUNTIME_SECONDS = 120.0
 MAX_TEST_OUTPUT_BYTES = 32 * 1024
 MAX_SHARED_TEST_OUTPUT_BYTES = 16 * 1024
+MAX_EXECUTABLE_IDENTITY_BYTES = 256 * 1024 * 1024
+EXECUTABLE_IDENTITY_CHUNK_BYTES = 1024 * 1024
 PROCESS_POLL_SECONDS = 0.025
 POSIX_TERMINATE_GRACE_SECONDS = 0.35
+
+
+def _executable_identity_size_error() -> str:
+    limit_mib = MAX_EXECUTABLE_IDENTITY_BYTES // (1024 * 1024)
+    return f"命令可执行文件超过 {limit_mib} MiB 的身份校验上限；未启动测试进程。"
 
 
 @dataclass(frozen=True)
@@ -30,6 +39,22 @@ class TestRunResult:
     output: str
     output_bytes: int
     output_truncated: bool
+
+
+@dataclass(frozen=True)
+class _ExecutableIdentity:
+    configured_path: str
+    resolved_path: str
+    device: int
+    file_id: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+    sha256: str
+
+
+class ExecutableChangedError(TestProfileError):
+    """Safe-to-display rejection when a command executable changes after approval."""
 
 
 def _safe_output(data: bytes) -> str:
@@ -101,12 +126,131 @@ def _test_environment() -> dict[str, str]:
     return env
 
 
-def _command_for(profile: TestProfile, workspace: Workspace) -> tuple[list[str], Path]:
+def _path_key(path: str | Path) -> str:
+    return os.path.normcase(os.path.abspath(os.path.normpath(os.fspath(path))))
+
+
+def _file_identity_metadata(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(info.st_dev),
+        int(info.st_ino),
+        int(info.st_size),
+        int(info.st_mtime_ns),
+        int(info.st_ctime_ns),
+    )
+
+
+def _command_executable_identity(
+    value: str,
+    *,
+    expected_identity: _ExecutableIdentity | None = None,
+    cancellation_event: threading.Event | None = None,
+) -> _ExecutableIdentity:
+    if cancellation_event is not None and cancellation_event.is_set():
+        raise ProviderCancelled("test executable identity check cancelled")
+    configured = TestProfileStore._validate_command_executable(value, require_file=True)
+    configured_key = _path_key(configured)
+    descriptor: int | None = None
+    try:
+        resolved = Path(configured).resolve(strict=True)
+        if Workspace._is_reparse_point(resolved):
+            raise TestProfileError("命令可执行文件不能是 symlink/junction。")
+        before_path = resolved.stat()
+        if not stat.S_ISREG(before_path.st_mode):
+            raise TestProfileError("命令可执行文件必须是普通文件。")
+        before_metadata = _file_identity_metadata(before_path)
+        if expected_identity is not None and (
+            _path_key(resolved) != expected_identity.resolved_path
+            or before_metadata != (
+                expected_identity.device,
+                expected_identity.file_id,
+                expected_identity.size,
+                expected_identity.modified_ns,
+                expected_identity.changed_ns,
+            )
+        ):
+            raise ExecutableChangedError(
+                "命令可执行文件在审批后已更改；没有启动测试进程。"
+            )
+        if before_path.st_size > MAX_EXECUTABLE_IDENTITY_BYTES:
+            raise TestProfileError(_executable_identity_size_error())
+
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(resolved, flags)
+        opened = os.fstat(descriptor)
+        if _file_identity_metadata(opened) != before_metadata:
+            raise TestProfileError("命令可执行文件在身份校验期间发生变化；未启动测试进程。")
+
+        digest = hashlib.sha256()
+        read_bytes = 0
+        while True:
+            if cancellation_event is not None and cancellation_event.is_set():
+                raise ProviderCancelled("test executable identity check cancelled")
+            remaining = MAX_EXECUTABLE_IDENTITY_BYTES - read_bytes
+            chunk = os.read(descriptor, min(EXECUTABLE_IDENTITY_CHUNK_BYTES, remaining + 1))
+            if not chunk:
+                break
+            read_bytes += len(chunk)
+            if read_bytes > MAX_EXECUTABLE_IDENTITY_BYTES:
+                raise TestProfileError(_executable_identity_size_error())
+            digest.update(chunk)
+
+        after_open = os.fstat(descriptor)
+        after_path = resolved.stat()
+        resolved_again = Path(configured).resolve(strict=True)
+        stable_metadata = _file_identity_metadata(opened)
+        if (
+            read_bytes != opened.st_size
+            or _file_identity_metadata(after_open) != stable_metadata
+            or _file_identity_metadata(after_path) != stable_metadata
+            or _path_key(resolved_again) != _path_key(resolved)
+            or Workspace._is_reparse_point(resolved_again)
+        ):
+            raise TestProfileError("命令可执行文件在身份校验期间发生变化；未启动测试进程。")
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise ProviderCancelled("test executable identity check cancelled")
+
+        return _ExecutableIdentity(
+            configured_path=configured_key,
+            resolved_path=_path_key(resolved),
+            device=int(opened.st_dev),
+            file_id=int(opened.st_ino),
+            size=int(opened.st_size),
+            modified_ns=int(opened.st_mtime_ns),
+            changed_ns=int(opened.st_ctime_ns),
+            sha256=digest.hexdigest(),
+        )
+    except TestProfileError:
+        raise
+    except (OSError, RuntimeError, UnicodeError, ValueError):
+        raise TestProfileError("无法安全核验命令可执行文件身份；未启动测试进程。") from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _command_for(
+    profile: TestProfile,
+    workspace: Workspace,
+    *,
+    executable_identity: _ExecutableIdentity | None = None,
+) -> tuple[list[str], Path]:
     workspace.resolve_directory(".")
     if profile.kind == "command":
         executable = TestProfileStore._validate_command_executable(
-            profile.executable, require_file=True
+            profile.executable,
+            require_file=executable_identity is None,
         )
+        if executable_identity is None:
+            executable = _path_key(Path(executable).resolve(strict=True))
+        elif _path_key(executable) != executable_identity.configured_path:
+            raise TestProfileError("测试配置与已审批的命令可执行文件不匹配。")
+        else:
+            executable = executable_identity.resolved_path
         args = TestProfileStore._validate_command_args(list(profile.args))
         cwd = workspace.resolve_directory(profile.cwd)
         return [executable, *args], cwd
@@ -425,6 +569,7 @@ def execute_profile(
     *,
     cancellation_event: threading.Event | None = None,
     timeout_seconds: float = MAX_TEST_RUNTIME_SECONDS,
+    expected_executable_identity: _ExecutableIdentity | None = None,
 ) -> TestRunResult:
     if (
         isinstance(timeout_seconds, bool)
@@ -432,7 +577,34 @@ def execute_profile(
         or not 0 < timeout_seconds <= MAX_TEST_RUNTIME_SECONDS
     ):
         raise ValueError("test timeout outside hard limit")
-    argv, cwd = _command_for(profile, workspace)
+    executable_identity = expected_executable_identity
+    if profile.kind == "command" and executable_identity is None:
+        executable_identity = _command_executable_identity(
+            profile.executable,
+            cancellation_event=cancellation_event,
+        )
+    argv, cwd = _command_for(
+        profile,
+        workspace,
+        executable_identity=executable_identity,
+    )
+    if profile.kind == "command":
+        try:
+            current_identity = _command_executable_identity(
+                profile.executable,
+                expected_identity=executable_identity,
+                cancellation_event=cancellation_event,
+            )
+        except (TestProfileError, WorkspaceError):
+            raise ExecutableChangedError(
+                "命令可执行文件在审批后已更改或不可用；没有启动测试进程。"
+            ) from None
+        if current_identity != executable_identity:
+            raise ExecutableChangedError(
+                "命令可执行文件在审批后已更改；没有启动测试进程。"
+            )
+    if cancellation_event is not None and cancellation_event.is_set():
+        raise ProviderCancelled("test run cancelled")
     try:
         process, job = _start_process(argv, cwd)
     except Exception:
@@ -564,9 +736,23 @@ def run_test_profile_tool(
     emit_output: Any | None = None,
     share_output: bool = True,
 ) -> str:
+    if cancellation_event is not None and cancellation_event.is_set():
+        raise ProviderCancelled("test run cancelled")
     try:
         profile = profile_store.get(profile_id)
-        argv, cwd = _command_for(profile, workspace)
+        executable_identity = (
+            _command_executable_identity(
+                profile.executable,
+                cancellation_event=cancellation_event,
+            )
+            if profile.kind == "command"
+            else None
+        )
+        argv, cwd = _command_for(
+            profile,
+            workspace,
+            executable_identity=executable_identity,
+        )
     except TestProfileError as exc:
         return (
             f"测试配置无法运行：{exc} 可用 /测试 列表查看状态，"
@@ -587,6 +773,12 @@ def run_test_profile_tool(
         "不会继承凭据或其他运行时环境变量；Windows 仅传递系统路径和临时目录。\n"
         "每次执行均需单独批准；本次提问最多启动一个测试进程。"
     )
+    if executable_identity is not None:
+        preview += (
+            f"\n可执行文件大小：{executable_identity.size} bytes"
+            f"\n可执行文件 SHA-256：{executable_identity.sha256}"
+            "\n审批后将在启动前重新核验文件身份与摘要；单文件核验上限 256 MiB。"
+        )
     if cancellation_event is not None and cancellation_event.is_set():
         raise ProviderCancelled("test run cancelled")
     if not approve_action(
@@ -607,7 +799,14 @@ def run_test_profile_tool(
     if approved_profile != profile:
         return "审批后测试配置已更改；没有启动测试进程。"
     try:
-        result = execute_profile(profile, workspace, cancellation_event=cancellation_event)
+        result = execute_profile(
+            profile,
+            workspace,
+            cancellation_event=cancellation_event,
+            expected_executable_identity=executable_identity,
+        )
+    except ExecutableChangedError as exc:
+        return str(exc)
     except (TestProfileError, WorkspaceError, ValueError):
         return "测试进程未能安全启动；系统错误详情已隐藏。"
 

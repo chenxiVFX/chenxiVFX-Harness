@@ -25,7 +25,7 @@
 | 安全会话保存/恢复 | 已实现 / 离线可测 | `.harness/sessions/`；默认存安全完整轮次；TUI `/恢复 ` 可补全并选择本地会话名；恢复校验归档、标明历史上下文，不恢复审批/执行授权，也不执行旧工具调用；`/检查点` 另存用户手写脱敏摘要，预览确认后才保存；不复制工具结果 |
 | 可审核上下文压缩 | 已实现 / 离线可测 | 本地有损摘要经确认后应用；预览列出概括/合并/丢弃/保留的轮次和可读摘要；近期工具组原样保留，旧工具组整组丢弃；32 KiB 上限内自适应缩短摘录；当前进程内可恢复一次，成功继续对话后检查点失效 |
 | Token / 预算统计 | 已实现 / 离线可测 | 分开展示本地字符估算、provider usage 报告和 provider 缓存命中字段；缓存字段缺失/无效时命中量未知；发送前本地估算余量保护，阈值不代表 provider 窗口或账户额度 |
-| 用户测试配置与执行 | 已实现 / 离线可测 | 用户可配置外部 Python profile，或直接可执行文件、固定 JSON argv 和工作区相对 cwd 的命令 profile；模型只选择现有 ID，不读写配置或补参数。TUI 可补全可运行/可移除 ID；旧 Python profile 缺解释器时禁用。每次展示完整可执行文件/argv/cwd 与 120 秒、32 KiB 上限并逐次审批。Node 合成项目覆盖首测失败→单文件精确补丁→复测通过、审批期间 argv/cwd 变更失效、拒绝、取消/超时进程树清理与独立输出分享审批；Windows standalone 用打包 EXE 直接运行 Node 内置测试。`/测试 运行` 仅本地显示；模型工具分享最多 16 KiB 输出另需批准。Windows Job Object 先挂起启动、完成分配后再恢复，并在取消/超时/输出溢出后查询活动进程。非沙箱：Linux 普通进程组不保证捕获自行 `setsid` 脱离者；无 CPU/内存/磁盘配额。Windows 仅接受直接 `.exe`，拒绝 `.cmd`/`.bat` 与常见 shell；Node 24.19.0 使用官方锁定 setup-node action，不装 npm 或项目依赖 |
+| 用户测试配置与执行 | 已实现 / 离线可测 | 用户可配置外部 Python profile，或直接可执行文件、固定 JSON argv 和工作区相对 cwd 的命令 profile；模型只选择现有 ID，不读写配置或补参数。TUI 可补全可运行/可移除 ID；旧 Python profile 缺解释器时禁用。每次展示完整可执行文件/argv/cwd 与 120 秒、32 KiB 上限并逐次审批。命令可执行文件审批绑定文件身份和 SHA-256，按 1 MiB 块流式校验、单文件上限 256 MiB，审批后紧邻启动前复核；仍有校验到 OS 打开映像之间的窄 TOCTOU 窗口。Node 合成项目覆盖首测失败→单文件精确补丁→复测通过、审批期间 argv/cwd/可执行文件/符号链接变化失效、拒绝、取消/超时进程树清理与独立输出分享审批；Windows standalone 用打包 EXE 直接运行 Node 内置测试。`/测试 运行` 仅本地显示；模型工具分享最多 16 KiB 输出另需批准。Windows Job Object 先挂起启动、完成分配后再恢复，并在取消/超时/输出溢出后查询活动进程。非沙箱：Linux 普通进程组不保证捕获自行 `setsid` 脱离者；无 CPU/内存/磁盘配额。Windows 仅接受直接 `.exe`，拒绝 `.cmd`/`.bat` 与常见 shell；Node 24.19.0 使用官方锁定 setup-node action，不装 npm 或项目依赖 |
 | Cache-friendly 稳定前缀 | 部分实现 / 离线可测 | 静态 system prompt 与固定工具 schema 顺序稳定；用户测试配置会在末尾增加动态 ID 枚举 schema；本地分项不是缓存命中量；只显示 provider 明确报告的缓存 tokens；没有缓存命中率承诺或远端命中验证 |
 | 子代理 | 已实现 / 离线可测（Mock 与两个 DeepSeek 协议适配器） | 每会话最多 3 项、并发 2、最多 2 轮；独立审批与取消；只读工具限精确预授权路径；无写入/shell/递归；Anthropic 兼容远端行为未在线验证 |
 | PTC（Programmatic Tool Calling） | 待实现 / 术语假设 | 暂按“模型组合调用工具/程序化工具调用”记录；未实现脚本或工具执行链 |
@@ -231,7 +231,7 @@
 
 - 新增只接受用户 profile ID 的 `run_test_profile` 工具。`/测试` 配置仍由用户交互管理，模型文件工具不可访问 `.harness/config/test_profiles.json`；profile 只保存固定框架和工作区相对 cwd/target。每次用户明确要求运行时，先预览当前 Python、完整 argv、cwd、120 秒时限、32 KiB 合并输出上限、shell=false 和当前用户权限/非沙箱属性，再单独审批。一次提问最多启动一个测试进程，计划模式不提供且工具层仍拦截。
 - 环境白名单不包含运行时凭据；Linux 新建独立进程组并在超时/取消时终止普通进程树；Windows 以 `CREATE_SUSPENDED` 启动，分配 kill-on-close Job Object 后才恢复主线程，任何监督设置失败均在代码启动前失败关闭。输出最多保留 32 KiB；本地显示前做凭据样式脱敏和终端控制字符转义；向模型发送最多 16 KiB 输出要另行批准。拒绝分享时仅回传状态与退出码，工具轮次不可存档。
-- OpenAI 兼容 SSE loopback fixture 验证跨片段 ID/工具参数组装后按现有 Agent 循环执行 profile；fixture 只访问本机，不含认证头。合成静态测试项目覆盖正常/失败退出、输出截断、普通子进程超时和取消、子进程停止、重复模型请求拦截、审批期间 profile 变化和 Windows Job 成员关系。没有执行用户项目测试或真实模型请求；自动化结果不等于完整产品验收。
+- OpenAI 兼容 SSE loopback fixture 验证跨片段 ID/工具参数组装后按现有 Agent 循环执行 profile；fixture 只访问本机，不含认证头。合成静态测试项目覆盖正常/失败退出、输出截断、普通子进程超时和取消、子进程停止、重复模型请求拦截、审批期间 profile 与可执行文件身份变化、同摘要原子替换、symlink 目标变化、哈希读取上限和 Windows Job 成员关系。没有执行用户项目测试或真实模型请求；自动化结果不等于完整产品验收。
 - Linux / Python 3.12 清洁环境全量离线回归：206 项，205 通过、1 项 Windows-only junction 跳过；12 项受限测试运行器用例、`compileall`、安装自检和 `git diff --check` 均通过。提交 `c955e7e0f7ba51ba840aa2edcd74014798d0d79b` 的 Windows/Linux × Python 3.11/3.12 四矩阵 CI 已成功（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39262256476)）；Windows standalone 构建、审查、smoke 和 artifact 上传已成功（[运行记录](https://github.com/chenxiVFX/chenxiVFX-Harness/actions/runs/39262256497)）。这些自动测试不等同完整产品验收。
 
 ## Standalone 用户测试解释器与真实打包 profile 验证（2026-10-19）

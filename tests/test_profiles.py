@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -14,8 +15,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cvfx_harness.cli import build_parser, run_console
 from cvfx_harness.profiles import TestProfileError, TestProfileStore
-from cvfx_harness.providers import MockProvider
-from cvfx_harness.test_runner import TestRunResult, run_test_profile_tool
+from cvfx_harness.providers import MockProvider, ProviderCancelled
+from cvfx_harness.test_runner import (
+    TestRunResult,
+    _command_executable_identity,
+    run_test_profile_tool,
+)
 from cvfx_harness.tui import CommandCompleter
 from cvfx_harness.tools import ToolCall, Workspace, WorkspaceError, build_tool_schemas, run_tool
 
@@ -495,6 +500,153 @@ class TestProfileStoreTests(unittest.TestCase):
             self.assertEqual(len(approval_requests), 1)
             execute.assert_not_called()
             self.assertFalse((project / "executed.flag").exists())
+
+    def test_command_executable_replacement_during_approval_is_rejected_before_launch(self) -> None:
+        with self._synthetic_project() as root:
+            project = Path(root)
+            executable = project / ("synthetic-runner.exe" if os.name == "nt" else "synthetic-runner")
+            executable.write_bytes(b"approved executable contents")
+            if os.name != "nt":
+                executable.chmod(0o755)
+            workspace = Workspace(project)
+            store = TestProfileStore(workspace)
+            profile = store.add_command("identity", str(executable), "[]", ".")
+            approved_identity = _command_executable_identity(str(executable))
+            approval_previews = []
+
+            def replace_during_approval(request):
+                approval_previews.append(request.diff)
+                executable.write_bytes(b"replacement executable contents")
+                if os.name != "nt":
+                    executable.chmod(0o755)
+                return True
+
+            with patch(
+                "cvfx_harness.test_runner._start_process",
+                side_effect=AssertionError("changed executable reached process launch"),
+            ) as start_process:
+                result = run_test_profile_tool(
+                    workspace,
+                    store,
+                    profile.profile_id,
+                    approve_action=replace_during_approval,
+                    share_output=False,
+                )
+
+            self.assertIn("可执行文件在审批后已更改", result)
+            start_process.assert_not_called()
+            self.assertEqual(len(approval_previews), 1)
+            self.assertIn(approved_identity.sha256, approval_previews[0])
+
+    def test_command_executable_identity_detects_atomic_replacement_with_same_digest(self) -> None:
+        with self._synthetic_project() as root:
+            project = Path(root)
+            suffix = ".exe" if os.name == "nt" else ""
+            executable = project / f"synthetic-runner{suffix}"
+            replacement = project / f"replacement{suffix}"
+            executable.write_bytes(b"identical executable contents")
+            replacement.write_bytes(b"identical executable contents")
+            if os.name != "nt":
+                executable.chmod(0o755)
+                replacement.chmod(0o755)
+            workspace = Workspace(project)
+            store = TestProfileStore(workspace)
+            profile = store.add_command("same-digest", str(executable), "[]", ".")
+            before_identity = _command_executable_identity(str(executable))
+
+            def replace_during_approval(_request):
+                os.replace(replacement, executable)
+                return True
+
+            with patch(
+                "cvfx_harness.test_runner._start_process",
+                side_effect=AssertionError("replaced executable reached process launch"),
+            ) as start_process:
+                result = run_test_profile_tool(
+                    workspace,
+                    store,
+                    profile.profile_id,
+                    approve_action=replace_during_approval,
+                    share_output=False,
+                )
+
+            self.assertIn("可执行文件在审批后已更改", result)
+            start_process.assert_not_called()
+            after_identity = _command_executable_identity(str(executable))
+            self.assertEqual(before_identity.sha256, after_identity.sha256)
+            self.assertNotEqual(before_identity.file_id, after_identity.file_id)
+
+    def test_command_executable_identity_rejects_oversized_file_before_open(self) -> None:
+        with self._synthetic_project() as root:
+            project = Path(root)
+            executable = project / ("large-runner.exe" if os.name == "nt" else "large-runner")
+            executable.write_bytes(b"x" * 33)
+            if os.name != "nt":
+                executable.chmod(0o755)
+            with (
+                patch("cvfx_harness.test_runner.MAX_EXECUTABLE_IDENTITY_BYTES", 32),
+                patch("cvfx_harness.test_runner.os.open") as open_file,
+            ):
+                with self.assertRaises(TestProfileError):
+                    _command_executable_identity(str(executable))
+            open_file.assert_not_called()
+
+    def test_command_executable_identity_cancellation_stops_before_file_access(self) -> None:
+        with self._synthetic_project() as root:
+            executable = Path(root) / ("cancelled-runner.exe" if os.name == "nt" else "cancelled-runner")
+            executable.write_bytes(b"synthetic executable")
+            if os.name != "nt":
+                executable.chmod(0o755)
+            cancellation = threading.Event()
+            cancellation.set()
+            with patch(
+                "cvfx_harness.test_runner.TestProfileStore._validate_command_executable"
+            ) as validate:
+                with self.assertRaises(ProviderCancelled):
+                    _command_executable_identity(
+                        str(executable),
+                        cancellation_event=cancellation,
+                    )
+            validate.assert_not_called()
+
+    def test_command_symlink_target_change_during_approval_is_rejected(self) -> None:
+        with self._synthetic_project() as root:
+            project = Path(root)
+            first_target = project / "first-runner.exe"
+            second_target = project / "second-runner.exe"
+            alias = project / "runner-alias.exe"
+            first_target.write_bytes(b"first executable contents")
+            second_target.write_bytes(b"second executable contents")
+            if os.name != "nt":
+                first_target.chmod(0o755)
+                second_target.chmod(0o755)
+            try:
+                alias.symlink_to(first_target)
+            except OSError as exc:
+                self.skipTest(f"symlink creation is unavailable on this host: {type(exc).__name__}")
+            workspace = Workspace(project)
+            store = TestProfileStore(workspace)
+            profile = store.add_command("symlink", str(alias), "[]", ".")
+
+            def change_target_during_approval(_request):
+                alias.unlink()
+                alias.symlink_to(second_target)
+                return True
+
+            with patch(
+                "cvfx_harness.test_runner._start_process",
+                side_effect=AssertionError("changed symlink target reached process launch"),
+            ) as start_process:
+                result = run_test_profile_tool(
+                    workspace,
+                    store,
+                    profile.profile_id,
+                    approve_action=change_target_during_approval,
+                    share_output=False,
+                )
+
+            self.assertIn("可执行文件在审批后已更改", result)
+            start_process.assert_not_called()
 
     def test_fixed_command_output_sharing_has_a_separate_approval(self) -> None:
         executable = shutil.which("node")
