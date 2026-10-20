@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .providers import AssistantTurn, Provider, ProviderCancelled, ProviderError, ToolCall
+from .providers import AssistantTurn, Provider, ProviderCancelled, ProviderError, ToolCall, _strict_json_loads
 from .sessions import (
     SESSION_OMISSION_REASONS,
     contains_likely_secret,
@@ -371,6 +371,20 @@ class Agent:
                 if consumed_output_tokens > self.max_output_tokens:
                     raise ProviderError("模型响应超过本地输出预算；本轮工具未执行。")
 
+                finish_reason = response.finish_reason
+                if finish_reason is not None and not isinstance(finish_reason, str):
+                    raise ProviderError("模型完成状态格式无效；本轮工具未执行。")
+                if finish_reason in {"length", "max_tokens"}:
+                    raise ProviderError("模型响应被长度上限截断；本轮工具未执行。")
+                normal_finish_reasons = {None, "stop", "end_turn", "stop_sequence"}
+                tool_finish_reasons = {"tool_calls", "tool_use"}
+                if finish_reason not in normal_finish_reasons | tool_finish_reasons:
+                    raise ProviderError("模型响应未正常结束；本轮工具未执行。")
+                if response.tool_calls and finish_reason not in {None, *tool_finish_reasons}:
+                    raise ProviderError("模型工具调用与完成状态不一致；本轮没有执行工具。")
+                if not response.tool_calls and finish_reason in tool_finish_reasons:
+                    raise ProviderError("模型完成状态要求工具调用，但未返回调用。")
+
                 assistant_message = response.assistant_message or {
                     "role": "assistant",
                     "content": response.content,
@@ -406,15 +420,19 @@ class Agent:
                             raise ProviderError("模型返回了格式无效的工具调用。")
                         for raw_call, call in zip(raw_calls, response.tool_calls):
                             try:
-                                raw_args = raw_call["function"]["arguments"]
-                                parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else None
+                                if not isinstance(raw_call, dict) or raw_call.get("type") != "function":
+                                    raise ValueError
+                                raw_function = raw_call["function"]
+                                if not isinstance(raw_function, dict):
+                                    raise ValueError
+                                raw_args = raw_function["arguments"]
+                                parsed_args = _strict_json_loads(raw_args) if isinstance(raw_args, str) else None
                                 matches = (
-                                    isinstance(raw_call, dict)
-                                    and raw_call.get("id") == call.call_id
-                                    and raw_call["function"].get("name") == call.name
+                                    raw_call.get("id") == call.call_id
+                                    and raw_function.get("name") == call.name
                                     and parsed_args == call.arguments
                                 )
-                            except (KeyError, TypeError, json.JSONDecodeError, RecursionError):
+                            except (KeyError, TypeError, ValueError, RecursionError):
                                 matches = False
                             if not matches:
                                 raise ProviderError("模型返回了格式无效的工具调用。")
@@ -972,7 +990,12 @@ class Agent:
             current_ids.add(call.call_id)
             try:
                 arguments_size = len(
-                    json.dumps(call.arguments, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                    json.dumps(
+                        call.arguments,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
                 )
             except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
                 raise ProviderError("模型返回了格式无效的工具调用。") from None

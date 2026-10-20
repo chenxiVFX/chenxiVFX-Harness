@@ -77,6 +77,7 @@ from cvfx_harness.project_guidance import (
     format_sha256_for_display,
 )
 from cvfx_harness.subagents import SubagentManager, build_delegation_plan
+from cvfx_harness.plans import PlanError
 from cvfx_harness.tools import (
     ActionRequest,
     DIRECTORY_SCAN_LIMIT,
@@ -2430,6 +2431,70 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(agent.usage.estimated_output_tokens, 128)
             self.assertEqual(agent.turns, [])
 
+    def test_main_agent_rejects_truncated_or_inconsistent_finish_before_tool_approval(self) -> None:
+        tool = ToolCall("finish-check", "read_file", {"path": "safe.txt"})
+        cases = (
+            (AssistantTurn("partial", [tool], finish_reason="length"), "长度上限截断"),
+            (AssistantTurn("filtered", finish_reason="content_filter"), "未正常结束"),
+            (AssistantTurn("mismatch", [tool], finish_reason="stop"), "工具调用与完成状态不一致"),
+        )
+        for response, message in cases:
+            with self.subTest(finish_reason=response.finish_reason), make_test_temp(prefix="agent-finish-") as temp:
+                approvals: list[ActionRequest] = []
+                agent = Agent(
+                    ScriptedProvider([response]), Workspace(temp),
+                    approve_action=lambda request: approvals.append(request) or True,
+                )
+                with self.assertRaisesRegex(ProviderError, message):
+                    agent.ask("检查合成文件")
+                self.assertEqual(approvals, [])
+                self.assertEqual(agent.turns, [])
+
+    def test_plan_generation_rejects_length_finished_response(self) -> None:
+        proposal = json.dumps({"steps": [{
+            "description": "检查本地内容",
+            "completion_criteria": "用户可核验",
+            "required_tools": ["read_file"],
+        }]}, ensure_ascii=False)
+        provider = ScriptedProvider([AssistantTurn(proposal, finish_reason="length")])
+        with make_test_temp(prefix="plan-truncated-") as temp:
+            agent = Agent(provider, Workspace(temp), approve_action=lambda _request: self.fail("plan cannot execute tools"))
+            with self.assertRaisesRegex(PlanError, "不完整协议"):
+                agent.propose_plan("检查本地内容")
+        self.assertEqual(provider.tool_schemas, [[]])
+
+    def test_subagent_rejects_inconsistent_provider_usage_before_scoped_read(self) -> None:
+        from cvfx_harness.subagents import _run_one
+
+        tool_call = ToolCall("child-usage", "read_file", {"path": "safe.txt"})
+        response = AssistantTurn(
+            "",
+            [tool_call],
+            assistant_message={"role": "assistant", "content": None, "tool_calls": [{
+                "id": tool_call.call_id,
+                "type": "function",
+                "function": {"name": tool_call.name, "arguments": '{"path":"safe.txt"}'},
+            }]},
+            usage=ProviderUsage(4, 1, 99),
+            finish_reason="tool_calls",
+        )
+
+        class ChildProvider:
+            def complete_subagent(self, *_args, **_kwargs):
+                return response
+
+        with make_test_temp(prefix="child-invalid-usage-") as temp:
+            Path(temp, "safe.txt").write_text("synthetic only", encoding="utf-8")
+            with patch("cvfx_harness.subagents.run_tool", side_effect=AssertionError("must not read")) as execute:
+                result = _run_one(
+                    1, "读取 safe.txt", ChildProvider(), input_budget=512, output_budget=256,
+                    timeout_seconds=3, cancellation_event=threading.Event(), workspace=Workspace(temp),
+                    read_scopes=(("safe.txt", "read_file"),),
+                )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("用量格式无效", result.failure)
+        execute.assert_not_called()
+
     def test_tool_cycle_passes_result_and_requires_write_approval(self) -> None:
         with make_test_temp() as temp:
             workspace = Workspace(temp)
@@ -3716,6 +3781,71 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual([tool["name"] for tool in request["tools"]], ["read_file"])
         self.assertTrue(all(tool["name"] not in {"write_file", "execute_command"} for tool in request["tools"]))
 
+    def test_deepseek_anthropic_subagent_can_complete_a_scoped_read_tool_roundtrip(self) -> None:
+        responses = [
+            fixture_anthropic_sse([
+                {"type": "message_start", "message": {"type": "message", "role": "assistant", "content": []}},
+                {"type": "content_block_start", "index": 0, "content_block": {
+                    "type": "tool_use", "id": "child-read", "name": "read_file", "input": {},
+                }},
+                {"type": "content_block_delta", "index": 0, "delta": {
+                    "type": "input_json_delta", "partial_json": '{"path":"safe.txt"}',
+                }},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+                {"type": "message_stop"},
+            ]),
+            fixture_anthropic_sse([
+                {"type": "message_start", "message": {"type": "message", "role": "assistant", "content": []}},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "已核对获准文件。"}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+                {"type": "message_stop"},
+            ]),
+        ]
+        requests: list[dict[str, object]] = []
+
+        def serve(handler, request_body: bytes) -> None:
+            requests.append(json.loads(request_body.decode("utf-8")))
+            body = responses.pop(0)
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
+        server, worker = local_http_fixture(serve)
+        try:
+            provider = DeepSeekAnthropicProvider(
+                f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash",
+                timeout=2, stream_timeout=2,
+            )
+            with make_test_temp(prefix="anthropic-child-read-") as temp:
+                Path(temp, "safe.txt").write_text("只供本地子代理夹具读取", encoding="utf-8")
+                manager = SubagentManager(provider, Workspace(temp))
+                manager.submit(
+                    build_delegation_plan("读取 safe.txt 并概述内容"),
+                    read_paths=("safe.txt",),
+                    approve_action=lambda _request: True,
+                )
+                deadline = time.monotonic() + 4
+                terminal = {"completed", "failed", "timed_out", "cancelled", "budget_exhausted"}
+                while manager.snapshots()[0].status not in terminal and time.monotonic() < deadline:
+                    threading.Event().wait(0.01)
+                snapshot = manager.snapshots()[0]
+                self.assertEqual(snapshot.status, "completed", snapshot.result.failure if snapshot.result else "")
+                self.assertEqual(snapshot.result.content, "已核对获准文件。")
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+        self.assertEqual(len(requests), 2)
+        self.assertEqual([tool["name"] for tool in requests[0]["tools"]], ["read_file"])
+        self.assertEqual(requests[1]["messages"][-2]["role"], "assistant")
+        self.assertIn("tool_result", json.dumps(requests[1]["messages"], ensure_ascii=False))
+
     def test_deepseek_anthropic_rejects_malformed_stop_reason_and_incomplete_tool_stream(self) -> None:
         with self.assertRaisesRegex(ProviderError, "stop_reason"):
             DeepSeekAnthropicProvider(
@@ -3770,6 +3900,430 @@ class ProviderTests(unittest.TestCase):
             "prompt_cache_hit_tokens": 101,
         })
         self.assertEqual(invalid_cache, ProviderUsage(100, 12, 112, None))
+
+    def test_openai_usage_supports_documented_cache_shapes_and_rejects_inconsistent_totals(self) -> None:
+        nested_only = OpenAICompatibleProvider._parse_usage({
+            "prompt_tokens": 100,
+            "completion_tokens": 12,
+            "total_tokens": 112,
+            "prompt_tokens_details": {"cached_tokens": 80},
+            "prompt_cache_miss_tokens": 20,
+        })
+        self.assertEqual(nested_only, ProviderUsage(100, 12, 112, 80))
+
+        conflict = OpenAICompatibleProvider._parse_usage({
+            "prompt_tokens": 100,
+            "completion_tokens": 12,
+            "total_tokens": 112,
+            "prompt_cache_hit_tokens": 80,
+            "prompt_tokens_details": {"cached_tokens": 79},
+        })
+        self.assertEqual(conflict, ProviderUsage(100, 12, 112, None))
+
+        invalid_breakdown = OpenAICompatibleProvider._parse_usage({
+            "prompt_tokens": 100,
+            "completion_tokens": 12,
+            "total_tokens": 112,
+            "prompt_cache_hit_tokens": 80,
+            "prompt_cache_miss_tokens": 19,
+        })
+        self.assertEqual(invalid_breakdown, ProviderUsage(100, 12, 112, None))
+
+        self.assertIsNone(OpenAICompatibleProvider._parse_usage({
+            "prompt_tokens": 100,
+            "completion_tokens": 12,
+            "total_tokens": 1,
+        }))
+        self.assertEqual(
+            OpenAICompatibleProvider._parse_usage({"prompt_tokens": 100, "completion_tokens": 12}),
+            ProviderUsage(100, 12, 112, None),
+        )
+
+    def test_openai_nonstream_protocol_requires_one_consistent_choice_and_unique_tool_json(self) -> None:
+        provider = OpenAICompatibleProvider("https://api.deepseek.com", "TEST_KEY_ONLY", "deepseek-flash")
+        call = {
+            "id": "call-one",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": '{"path":"safe.txt"}'},
+        }
+        base_message = {"role": "assistant", "content": None, "tool_calls": [call]}
+        invalid_payloads = [
+            {"choices": [{"message": base_message, "finish_reason": "length"}]},
+            {"choices": [{"message": base_message, "finish_reason": "stop"}]},
+            {"choices": [{"message": {"role": "assistant", "content": "x"}, "finish_reason": "tool_calls"}]},
+            {"choices": [{"message": base_message, "finish_reason": "tool_calls"}] * 2},
+            {"choices": [{"index": 1, "message": base_message, "finish_reason": "tool_calls"}]},
+            {"choices": [{"message": {**base_message, "role": "user"}, "finish_reason": "tool_calls"}]},
+            {"choices": [{"message": base_message}]},
+        ]
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ProviderError):
+                    provider._turn_from_payload(payload)
+
+        malformed_argument_payloads = [
+            json.dumps({
+                "choices": [{"message": {
+                    "role": "assistant", "content": None,
+                    "tool_calls": [{**call, "function": {
+                        "name": "read_file", "arguments": '{"path":"first","path":"second"}',
+                    }}],
+                }, "finish_reason": "tool_calls"}]
+            }).encode("utf-8"),
+            json.dumps({
+                "choices": [{"message": {
+                    "role": "assistant", "content": None,
+                    "tool_calls": [{**call, "function": {
+                        "name": "read_file", "arguments": '{"path":NaN}',
+                    }}],
+                }, "finish_reason": "tool_calls"}]
+            }).encode("utf-8"),
+            b'{"choices":[],"choices":[{"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}]}',
+        ]
+
+        class FakeResponse:
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, _size):
+                return self.body
+
+        for body in malformed_argument_payloads:
+            with self.subTest(body=body), patch(
+                "cvfx_harness.providers._open_without_redirect",
+                return_value=FakeResponse(body),
+            ):
+                with self.assertRaises(ProviderError):
+                    provider.complete([{"role": "user", "content": "synthetic"}], [])
+
+    def test_both_stream_protocols_complete_the_same_chinese_multi_tool_task_offline(self) -> None:
+        list_args = '{"path":"."}'
+        read_args = '{"path":"配置.txt"}'
+        openai_first = fixture_sse_frames([
+            {"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 1, "id": "read-call", "type": "function", "function": {"name": "read_file", "arguments": read_args[:12]}},
+                {"index": 0, "id": "list-call", "type": "function", "function": {"name": "list_directory", "arguments": list_args[:9]}},
+            ]}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": list_args[9:]}},
+                {"index": 1, "function": {"arguments": read_args[12:]}},
+            ]}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+            {"choices": [], "usage": {
+                "prompt_tokens": 8, "completion_tokens": 5, "total_tokens": 13,
+                "prompt_cache_hit_tokens": 3,
+                "prompt_tokens_details": {"cached_tokens": 3},
+                "prompt_cache_miss_tokens": 5,
+            }},
+        ])
+        openai_final = fixture_sse_frames([
+            {"choices": [{"index": 0, "delta": {"content": "已列出目录并读取配置。"}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        ])
+
+        def anthropic_tool_reply() -> bytes:
+            return fixture_anthropic_sse([
+                {"type": "message_start", "message": {
+                    "type": "message", "role": "assistant", "content": [],
+                    "usage": {"input_tokens": 8, "output_tokens": 0, "cache_read_input_tokens": 3},
+                }},
+                {"type": "content_block_start", "index": 0, "content_block": {
+                    "type": "tool_use", "id": "list-call", "name": "list_directory", "input": {},
+                }},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": list_args[:8]}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": list_args[8:]}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "content_block_start", "index": 1, "content_block": {
+                    "type": "tool_use", "id": "read-call", "name": "read_file", "input": {},
+                }},
+                {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": read_args[:10]}},
+                {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": read_args[10:]}},
+                {"type": "content_block_stop", "index": 1},
+                {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {
+                    "output_tokens": 5, "cache_read_input_tokens": 3,
+                }},
+                {"type": "message_stop"},
+            ])
+
+        anthropic_final = fixture_anthropic_sse([
+            {"type": "message_start", "message": {
+                "type": "message", "role": "assistant", "content": [],
+            }},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "已列出目录并读取配置。"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+            {"type": "message_stop"},
+        ])
+
+        for anthropic in (False, True):
+            with self.subTest(anthropic=anthropic):
+                responses = [anthropic_tool_reply(), anthropic_final] if anthropic else [openai_first, openai_final]
+                request_bodies: list[dict[str, object]] = []
+
+                def serve(handler, request_body: bytes) -> None:
+                    request_bodies.append(json.loads(request_body.decode("utf-8")))
+                    response = responses.pop(0)
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    handler.send_header("Content-Length", str(len(response)))
+                    handler.end_headers()
+                    handler.wfile.write(response)
+
+                server, worker = local_http_fixture(serve)
+                approvals: list[ActionRequest] = []
+                executed_call_ids: list[str] = []
+                streamed: list[str] = []
+                try:
+                    if anthropic:
+                        provider = DeepSeekAnthropicProvider(
+                            f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash",
+                            timeout=2, stream_timeout=2,
+                        )
+                    else:
+                        provider = OpenAICompatibleProvider(
+                            f"http://127.0.0.1:{server.server_port}", "", "fixture-model",
+                            timeout=2, stream_timeout=2,
+                        )
+                    with make_test_temp(prefix="provider-contract-") as temp:
+                        Path(temp, "配置.txt").write_text("配置内容：长文本样本", encoding="utf-8")
+                        agent = Agent(
+                            provider,
+                            Workspace(temp),
+                            approve_action=lambda request: approvals.append(request) or True,
+                        )
+                        original_run_tool = run_tool
+
+                        def record_tool(workspace, call, **kwargs):
+                            executed_call_ids.append(call.call_id)
+                            return original_run_tool(workspace, call, **kwargs)
+
+                        with patch("cvfx_harness.agent.run_tool", side_effect=record_tool):
+                            answer = agent.ask("请列出工作区目录，并读取配置.txt 的中文内容。", on_text_delta=streamed.append)
+                    stats = agent.usage.to_dict()
+                finally:
+                    server.shutdown()
+                    worker.join(timeout=2)
+                    server.server_close()
+
+                self.assertEqual(answer, "已列出目录并读取配置。")
+                self.assertEqual(streamed, ["已列出目录并读取配置。"])
+                self.assertEqual([request.operation for request in approvals], ["list", "read"])
+                self.assertEqual(executed_call_ids, ["list-call", "read-call"])
+                self.assertEqual(len(request_bodies), 2, "one tool round plus one final answer; no protocol retry")
+                self.assertEqual(stats["requests"], 2)
+                self.assertEqual(stats["provider_usage_reports"], 1, "missing final-turn usage remains unreported")
+                self.assertEqual(stats["provider_prompt_tokens"], 8)
+                self.assertEqual(stats["provider_completion_tokens"], 5)
+                tool_results = json.dumps(request_bodies[1], ensure_ascii=False)
+                self.assertIn("配置内容：长文本样本", tool_results)
+                if anthropic:
+                    self.assertEqual(stats["provider_cached_prompt_reports"], 0)
+                    self.assertEqual(stats["provider_cached_prompt_tokens"], 0)
+                else:
+                    self.assertEqual(stats["provider_cached_prompt_reports"], 1)
+                    self.assertEqual(stats["provider_cached_prompt_tokens"], 3)
+
+    def test_malformed_streamed_tool_json_is_rejected_before_any_surface_can_execute(self) -> None:
+        malformed_openai = fixture_sse_frames([
+            {"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "bad-call", "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"safe.txt"'},
+            }]}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+        ])
+        malformed_anthropic = fixture_anthropic_sse([
+            {"type": "message_start", "message": {"type": "message", "role": "assistant", "content": []}},
+            {"type": "content_block_start", "index": 0, "content_block": {
+                "type": "tool_use", "id": "bad-call", "name": "read_file", "input": {},
+            }},
+            {"type": "content_block_delta", "index": 0, "delta": {
+                "type": "input_json_delta", "partial_json": '{"path":"safe.txt"',
+            }},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+            {"type": "message_stop"},
+        ])
+
+        for anthropic in (False, True):
+            with self.subTest(anthropic=anthropic):
+                request_bodies: list[dict[str, object]] = []
+                response = malformed_anthropic if anthropic else malformed_openai
+
+                def serve(handler, request_body: bytes) -> None:
+                    request_bodies.append(json.loads(request_body.decode("utf-8")))
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    handler.send_header("Content-Length", str(len(response)))
+                    handler.end_headers()
+                    handler.wfile.write(response)
+
+                server, worker = local_http_fixture(serve)
+                main_approvals: list[ActionRequest] = []
+                executed: list[str] = []
+                try:
+                    provider = (
+                        DeepSeekAnthropicProvider(
+                            f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash",
+                            timeout=2, stream_timeout=2,
+                        )
+                        if anthropic else OpenAICompatibleProvider(
+                            f"http://127.0.0.1:{server.server_port}", "", "fixture-model",
+                            timeout=2, stream_timeout=2,
+                        )
+                    )
+                    with make_test_temp(prefix="malformed-provider-") as temp:
+                        Path(temp, "safe.txt").write_text("只供协议夹具读取", encoding="utf-8")
+                        workspace = Workspace(temp)
+                        agent = Agent(
+                            provider, workspace,
+                            approve_action=lambda request: main_approvals.append(request) or True,
+                        )
+                        original_run_tool = run_tool
+
+                        def reject_if_executed(_workspace, call, **_kwargs):
+                            executed.append(call.call_id)
+                            return original_run_tool(_workspace, call)
+
+                        with patch("cvfx_harness.agent.run_tool", side_effect=reject_if_executed), patch(
+                            "cvfx_harness.subagents.run_tool", side_effect=reject_if_executed,
+                        ):
+                            with self.assertRaises(ProviderError):
+                                agent.ask("请读取 safe.txt", on_text_delta=lambda _fragment: None)
+                            self.assertEqual(agent.turns, [], "failed partial tool response must roll back the local turn")
+                            self.assertEqual(main_approvals, [])
+                            with self.assertRaises(ProviderError):
+                                agent.propose_plan("读取 safe.txt 并总结")
+                            manager = SubagentManager(provider, workspace)
+                            manager.submit(
+                                build_delegation_plan("读取 safe.txt 并总结"),
+                                read_paths=("safe.txt",),
+                                approve_action=lambda _request: True,
+                            )
+                            deadline = time.monotonic() + 4
+                            terminal = {"completed", "failed", "timed_out", "cancelled", "budget_exhausted"}
+                            while manager.snapshots()[0].status not in terminal and time.monotonic() < deadline:
+                                threading.Event().wait(0.01)
+                            self.assertEqual(manager.snapshots()[0].status, "failed")
+                            self.assertEqual(executed, [])
+                finally:
+                    server.shutdown()
+                    worker.join(timeout=2)
+                    server.server_close()
+
+                self.assertEqual(len(request_bodies), 3, "main, plan, and child each make one request without retry")
+                self.assertEqual(request_bodies[1].get("tools", []), [], "plan generation must not receive tools")
+                child_tools = request_bodies[2].get("tools", [])
+                if anthropic:
+                    child_tool_names = [item["name"] for item in child_tools]
+                else:
+                    child_tool_names = [item["function"]["name"] for item in child_tools]
+                self.assertEqual(child_tool_names, ["read_file"], "the child receives only its exact read scope")
+
+    def test_sse_error_events_are_safe_and_never_retried_for_both_protocols(self) -> None:
+        sentinel = "SYNTHETIC_PRIVATE_EVENT_DETAIL"
+        for anthropic in (False, True):
+            with self.subTest(anthropic=anthropic):
+                event = (
+                    f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'message': sentinel}})}\n\n"
+                    if anthropic else
+                    f"event: error\ndata: {json.dumps({'message': sentinel})}\n\n"
+                ).encode("utf-8")
+                requests: list[bytes] = []
+
+                def serve(handler, request_body: bytes) -> None:
+                    requests.append(request_body)
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    handler.send_header("Content-Length", str(len(event)))
+                    handler.end_headers()
+                    handler.wfile.write(event)
+
+                server, worker = local_http_fixture(serve)
+                deltas: list[str] = []
+                try:
+                    provider = (
+                        DeepSeekAnthropicProvider(
+                            f"http://127.0.0.1:{server.server_port}/anthropic", "", "deepseek-flash",
+                            timeout=2, stream_timeout=2,
+                        )
+                        if anthropic else OpenAICompatibleProvider(
+                            f"http://127.0.0.1:{server.server_port}", "", "fixture-model",
+                            timeout=2, stream_timeout=2,
+                        )
+                    )
+                    with self.assertRaises(ProviderStreamError) as caught:
+                        provider.complete_streaming(
+                            [{"role": "user", "content": "离线合成错误事件"}], [],
+                            on_text_delta=deltas.append,
+                        )
+                finally:
+                    server.shutdown()
+                    worker.join(timeout=2)
+                    server.server_close()
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(deltas, [])
+                self.assertNotIn(sentinel, str(caught.exception))
+
+    def test_openai_stream_rejects_content_after_finish_reason(self) -> None:
+        wire = fixture_sse_frames([
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {"choices": [{"index": 0, "delta": {"content": "late fragment"}, "finish_reason": None}]},
+        ])
+        requests: list[bytes] = []
+
+        def serve(handler, request_body: bytes) -> None:
+            requests.append(request_body)
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Length", str(len(wire)))
+            handler.end_headers()
+            handler.wfile.write(wire)
+
+        server, worker = local_http_fixture(serve)
+        deltas: list[str] = []
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "fixture-model", timeout=2, stream_timeout=2
+            )
+            with self.assertRaisesRegex(ProviderStreamError, "完成状态后收到额外候选内容"):
+                provider.complete_streaming(
+                    [{"role": "user", "content": "合成终止状态检查"}], [], on_text_delta=deltas.append
+                )
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(deltas, [])
+
+    def test_anthropic_invalid_later_usage_discards_earlier_valid_counts(self) -> None:
+        wire = fixture_anthropic_sse([
+            {"type": "message_start", "message": {
+                "type": "message", "role": "assistant", "content": [],
+                "usage": {"input_tokens": 7, "output_tokens": 0},
+            }},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "本地合成回复"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {
+                "input_tokens": "malformed", "output_tokens": 4,
+            }},
+            {"type": "message_stop"},
+        ])
+        accumulator = _AnthropicEventAccumulator(lambda _fragment: None)
+        parser = _SSEParser(accumulator.handle)
+        self.assertTrue(parser.feed(wire))
+        provider = DeepSeekAnthropicProvider("http://127.0.0.1:32123/anthropic", "", "deepseek-flash")
+        turn = provider._turn_from_payload(accumulator.payload())
+        self.assertEqual(turn.content, "本地合成回复")
+        self.assertIsNone(turn.usage)
 
     def test_sse_parser_handles_utf8_and_crlf_boundaries_across_byte_chunks(self) -> None:
         events: list[tuple[str, str]] = []
@@ -4700,7 +5254,7 @@ class ProviderTests(unittest.TestCase):
             def read(self, _size):
                 return json.dumps(
                     {
-                        "choices": [{"message": {"role": "assistant", "content": "收到"}}],
+                        "choices": [{"message": {"role": "assistant", "content": "收到"}, "finish_reason": "stop"}],
                         "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
                     }
                 ).encode("utf-8")
@@ -4734,7 +5288,8 @@ class ProviderTests(unittest.TestCase):
                 response = json.dumps(
                     {
                         "choices": [{
-                            "message": {"role": "assistant", "content": "本地模拟服务已响应"}
+                            "message": {"role": "assistant", "content": "本地模拟服务已响应"},
+                            "finish_reason": "stop",
                         }],
                         "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12},
                     }
@@ -4841,7 +5396,7 @@ class ProviderTests(unittest.TestCase):
                 return None
 
             def read(self, _size):
-                return b'{"choices":[{"message":{"role":"assistant","content":"stub"}}]}'
+                return b'{"choices":[{"message":{"role":"assistant","content":"stub"},"finish_reason":"stop"}]}'
 
         def fake_urlopen(request, timeout):
             del timeout
@@ -4970,11 +5525,11 @@ class ProviderTests(unittest.TestCase):
                         "type": "function",
                         "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'},
                     }],
-                }}],
+                }, "finish_reason": "tool_calls"}],
                 "usage": {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
             },
             {
-                "choices": [{"message": {"role": "assistant", "content": "读取完成"}}],
+                "choices": [{"message": {"role": "assistant", "content": "读取完成"}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 17, "completion_tokens": 2, "total_tokens": 19},
             },
         ]
@@ -5083,7 +5638,7 @@ class ProviderTests(unittest.TestCase):
                 return None
 
             def read(self, _size):
-                return b'{"choices":[{"message":{"role":"assistant","content":"ok"}}]}'
+                return b'{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}'
 
         def fake_urlopen(request, timeout):
             del timeout

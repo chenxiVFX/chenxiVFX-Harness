@@ -17,11 +17,13 @@ from .providers import (
     MAX_SUBAGENT_TASK_CHARS,
     MAX_SUBAGENT_TOOL_CALLS_PER_TURN,
     MAX_SUBAGENT_TURNS,
+    MAX_PROVIDER_TOOL_ARGUMENT_BYTES,
     AssistantTurn,
     ProviderCancelled,
     ProviderError,
     ProviderUsage,
     ToolCall,
+    _strict_json_loads,
 )
 from .sessions import redact_likely_secrets
 from .tools import (
@@ -264,15 +266,20 @@ def _run_one(
             return SubagentResult(index, task, "cancelled", "", total_input_tokens, total_output_tokens)
         if not isinstance(turn, AssistantTurn):
             return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型响应格式无效")
-        if turn.finish_reason == "length":
+        finish_reason = turn.finish_reason
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型完成状态格式无效")
+        if finish_reason in {"length", "max_tokens"}:
             return SubagentResult(index, task, "budget_exhausted", "", total_input_tokens, total_output_tokens, "模型输出被长度上限截断")
-        if turn.finish_reason == "content_filter":
+        if finish_reason == "content_filter":
             return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型响应被内容过滤")
-        if turn.finish_reason not in (None, "stop", "tool_calls"):
+        normal_finish_reasons = {None, "stop", "end_turn", "stop_sequence"}
+        tool_finish_reasons = {"tool_calls", "tool_use"}
+        if finish_reason not in normal_finish_reasons | tool_finish_reasons:
             return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型完成状态不受支持")
-        if turn.finish_reason == "tool_calls" and not turn.tool_calls:
-            return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型工具响应格式无效")
-        if turn.finish_reason == "stop" and turn.tool_calls:
+        if (turn.tool_calls and finish_reason not in {None, *tool_finish_reasons}) or (
+            not turn.tool_calls and finish_reason in tool_finish_reasons
+        ):
             return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型工具响应格式无效")
         if (
             not isinstance(turn.tool_calls, list)
@@ -287,28 +294,113 @@ def _run_one(
             return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型响应格式无效")
         if turn.usage is not None and (
             not isinstance(turn.usage, ProviderUsage)
+            or type(turn.usage.prompt_tokens) is not int
+            or turn.usage.prompt_tokens < 0
             or type(turn.usage.completion_tokens) is not int
             or turn.usage.completion_tokens < 0
+            or type(turn.usage.total_tokens) is not int
+            or turn.usage.total_tokens != turn.usage.prompt_tokens + turn.usage.completion_tokens
+            or (
+                turn.usage.cached_prompt_tokens is not None
+                and (
+                    type(turn.usage.cached_prompt_tokens) is not int
+                    or not 0 <= turn.usage.cached_prompt_tokens <= turn.usage.prompt_tokens
+                )
+            )
         ):
             return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型用量格式无效")
-        if set(turn.assistant_message) - {"role", "content", "reasoning_content", "tool_calls"}:
+        if set(turn.assistant_message) - {
+            "role", "content", "reasoning_content", "tool_calls", "deepseek_anthropic_content",
+        }:
             return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型响应格式无效")
+        seen_call_ids: set[str] = set()
+        for call in turn.tool_calls:
+            if (
+                not isinstance(call, ToolCall)
+                or not isinstance(call.call_id, str)
+                or not call.call_id
+                or len(call.call_id) > 128
+                or call.call_id in seen_call_ids
+                or not isinstance(call.name, str)
+                or not call.name
+                or len(call.name) > 128
+                or not isinstance(call.arguments, dict)
+            ):
+                return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型工具响应格式无效")
+            seen_call_ids.add(call.call_id)
+            try:
+                argument_size = len(
+                    json.dumps(
+                        call.arguments,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                )
+            except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+                return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型工具参数格式无效")
+            if argument_size > MAX_PROVIDER_TOOL_ARGUMENT_BYTES:
+                return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型工具参数超过本地大小上限")
+        native_content = turn.assistant_message.get("deepseek_anthropic_content")
         raw_calls = turn.assistant_message.get("tool_calls")
-        if turn.tool_calls:
+        if native_content is not None:
+            if "tool_calls" in turn.assistant_message or not isinstance(native_content, list) or len(native_content) > 256:
+                return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "Anthropic 原生响应格式无效")
+            native_text: list[str] = []
+            native_calls: list[tuple[str, str, dict[str, Any]]] = []
+            valid_native = True
+            for block in native_content:
+                if not isinstance(block, dict):
+                    valid_native = False
+                    break
+                if block.get("type") == "text" and set(block) == {"type", "text"} and isinstance(block.get("text"), str):
+                    native_text.append(block["text"])
+                elif (
+                    block.get("type") == "thinking"
+                    and set(block) == {"type", "thinking", "signature"}
+                    and isinstance(block.get("thinking"), str)
+                    and isinstance(block.get("signature"), str)
+                    and bool(block.get("signature"))
+                ):
+                    continue
+                elif (
+                    block.get("type") == "tool_use"
+                    and set(block) == {"type", "id", "name", "input"}
+                    and isinstance(block.get("id"), str)
+                    and isinstance(block.get("name"), str)
+                    and isinstance(block.get("input"), dict)
+                ):
+                    native_calls.append((block["id"], block["name"], block["input"]))
+                else:
+                    valid_native = False
+                    break
+            if (
+                not valid_native
+                or "".join(native_text) != turn.content
+                or len(native_calls) != len(turn.tool_calls)
+                or any(
+                    native_id != call.call_id or native_name != call.name or native_args != call.arguments
+                    for (native_id, native_name, native_args), call in zip(native_calls, turn.tool_calls)
+                )
+            ):
+                return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "Anthropic 原生工具响应格式无效")
+        elif turn.tool_calls:
             if not isinstance(raw_calls, list) or len(raw_calls) != len(turn.tool_calls):
                 return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型工具响应格式无效")
             for raw_call, call in zip(raw_calls, turn.tool_calls):
                 try:
+                    if not isinstance(raw_call, dict) or raw_call.get("type") != "function":
+                        raise ValueError
                     raw_function = raw_call["function"]
-                    raw_args = json.loads(raw_function["arguments"])
+                    if not isinstance(raw_function, dict):
+                        raise ValueError
+                    raw_args = _strict_json_loads(raw_function["arguments"])
                     matches = (
-                        isinstance(raw_call, dict)
-                        and raw_call.get("id") == call.call_id
-                        and isinstance(raw_function, dict)
+                        raw_call.get("id") == call.call_id
                         and raw_function.get("name") == call.name
                         and raw_args == call.arguments
                     )
-                except (KeyError, TypeError, json.JSONDecodeError, RecursionError):
+                except (KeyError, TypeError, ValueError, RecursionError):
                     matches = False
                 if not matches:
                     return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型工具响应格式无效")
@@ -330,7 +422,9 @@ def _run_one(
             return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "只读工具调用数超过上限")
 
         try:
-            assistant_output = json.dumps(turn.assistant_message or {"content": turn.content}, ensure_ascii=False)
+            assistant_output = json.dumps(
+                turn.assistant_message or {"content": turn.content}, ensure_ascii=False, allow_nan=False
+            )
         except (TypeError, ValueError, RecursionError):
             return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型响应格式无效")
         estimated_response_tokens = (

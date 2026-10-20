@@ -43,11 +43,13 @@ Agent 的 system message 在每个请求、恢复和压缩后保持固定文本�
 
 ## SSE 流式传输
 
-OpenAI 兼容 CLI 通过 `complete_streaming` 使用 `text/event-stream`。SSE 解析器增量解码严格 UTF-8，并识别 LF、CRLF、多行 `data` 和注释行；每条事件经完成空行分发，必须收到合法 finish reason 与 `[DONE]`。响应最多 4 MiB、助手文本/推理合计 2 MiB、单行或事件 512 KiB、16,384 个事件，截止时间配置最多 120 秒。响应体由调用线程使用 urllib 的 HTTP 解码器读取；每个响应另有一个 watchdog，以最多 250 ms 的间隔检查取消，并在取消或截止时间到达时 shutdown 该响应 socket。读取、解析和文本回调不切换线程；所有退出路径停止并 join watchdog，不使用无界队列或后台请求重试。
+OpenAI 兼容和 DeepSeek Anthropic 兼容 provider 均通过 `complete_streaming` 使用 `text/event-stream`。SSE 解析器增量解码严格 UTF-8，并识别 LF、CRLF、多行 `data` 和注释行；OpenAI 流必须收到合法 finish reason 与 `[DONE]`，Anthropic 流必须收到闭合的 `message_stop`。响应最多 4 MiB、助手文本/推理合计 2 MiB、单行或事件 512 KiB、16,384 个事件，截止时间配置最多 120 秒。响应体由调用线程使用 urllib 的 HTTP 解码器读取；每个响应另有一个 watchdog，以最多 250 ms 的间隔检查取消，并在取消或截止时间到达时 shutdown 该响应 socket。读取、解析和文本回调不切换线程；所有退出路径停止并 join watchdog，不使用无界队列或后台请求重试。
 
 socket 的读取超时设为剩余截止时间，不以短超时轮询后恢复读取。[Python 文档](https://docs.python.org/3.12/library/socket.html#socket.socket.makefile)明确说明 socket 文件缓冲在超时后可能失效；真正的读取超时必须终止该响应。建连、代理 CONNECT、TLS 和响应头阶段仍由 urllib 的网络超时约束，取消需等这些调用返回才能检查；DNS 或多阶段、慢滴响应头不能承诺与响应体相同的主动硬截止边界。
 
-普通内容片段可立即交给 CLI；reasoning 内容不显示。流式函数工具调用按索引累积，结束后复用已有完整消息/参数校验，之后 Agent 才执行原有逐次人工审批。用户测试 profile 工具沿用相同流程，且再执行独立的测试与输出分享审批。未收到完整终止标记、格式错误或超限时，Provider 抛出安全的流错误，Agent 清除未完成轮次且不返回工具调用。流式文字可能已显示一部分，错误后不会撤回；终端输出先脱敏疑似凭据并转义控制字符。当前拒绝多候选项、多模态、logprobs、未知 delta 字段和不支持流式的 provider。
+普通内容片段可立即交给 CLI；reasoning 内容不显示。OpenAI 工具调用片段按索引累积，Anthropic `input_json_delta` 在内容块结束时才解析。两种协议均校验完整 JSON、唯一键、参数大小、调用编号和工具结束状态；畸形或截断的调用在完整校验前不会交给 Agent。OpenAI 一个回复可含多个工具调用，子代理仍只接收本轮限制内的精确只读工具。之后 Agent 才执行原有逐次人工审批。用户测试 profile 工具沿用相同流程，且再执行独立的测试与输出分享审批。协议错误、缺少终止标记或超限时，Provider 抛出安全的流错误，Agent 清除未完成轮次且不返回工具调用；解析完成但响应因长度截断或完成状态不匹配时，也不执行工具。流式文字可能已显示一部分，错误后不会撤回；终端输出先脱敏疑似凭据并转义控制字符。当前拒绝多候选项、多模态、logprobs、未知 delta 字段和不支持流式的 provider。
+
+本地字符估算、provider 返回的 prompt/completion usage 和 provider 明确报告的缓存命中分开计数。缺少或格式无效的 usage 不会冒充真实用量；缓存字段缺失或互相冲突时显示未知。OpenAI 兼容响应接受 `prompt_cache_hit_tokens` 或 `prompt_tokens_details.cached_tokens` 的一致报告；Anthropic 兼容路由当前未提供本地确认的缓存字段映射，因此其缓存统计保持未知，不推算节省。
 
 ## 会话格式
 
@@ -91,10 +93,10 @@ socket 的读取超时设为剩余截止时间，不以短超时轮询后恢复�
 - 用户测试 profile 放在 `.harness/config/test_profiles.json`，模型文件工具不能读取或修改。profile 只保存用户独立选择并校验的外部 Python 绝对路径、ID、`unittest`/`pytest` 框架和工作区相对 cwd/target；命令固定为 `<python> -m unittest discover -s <target>` 或 `<python> -m pytest -q <target>`，`shell=False`，不接受模型 argv、脚本、解释器路径、环境变量或工作目录。冻结 EXE 的 `sys.executable` 是 Harness 本身，因此测试执行明确使用外部解释器；没有配置解释器的旧 profile 保持禁用。
 - 每次测试都显示确切解释器、argv、cwd、120 秒总限时和 32 KiB 合并 stdout/stderr 上限，并要求用户逐次批准。输出在本地脱敏、转义控制字符后展示；分享最多 16 KiB 输出另需用户批准，拒绝时只回传状态和退出码。一次用户提问最多启动一次测试，没有持久授权或自动重试。
 - 测试代码以当前用户 OS 权限运行，不是沙箱；网络访问没有被屏蔽，测试代码可访问用户权限范围内的其他文件和资源。子进程不会继承凭据或其他运行时环境变量；Windows 仅传递系统路径和临时目录。Linux 用 `start_new_session=True` 和进程组终止普通子进程，恶意/自行 `setsid` 脱离的后代不保证受控；Windows 使用 `CREATE_SUSPENDED`，先将进程放入不允许 breakaway 的 kill-on-close Job Object，再恢复主线程，启动失败时在用户代码运行前终止。Windows 合成测试会从被运行的 fixture 中验证 Job Object 成员关系。
-- `.harness/config/settings.json` 只存 provider/model/Base URL/预算等非敏感设置，拒绝重复键、未识别字段和疑似凭据，不包含 API Key；仅支持 Mock 与 DeepSeek OpenAI 兼容模式。`--ignore-config` 只跳过此文件以便修复损坏配置。
+- `.harness/config/settings.json` 只存 provider/model/Base URL/预算等非敏感设置，拒绝重复键、未识别字段和疑似凭据，不包含 API Key；支持 Mock、DeepSeek OpenAI 兼容和 DeepSeek Anthropic 兼容模式。`--ignore-config` 只跳过此文件以便修复损坏配置。
 - 目录 symlink 与硬链接逃逸通过实际链接 fixture 集成测试覆盖；junction 仅适用于 Windows。当前 Linux/Windows 与 Python 3.11/3.12 跨平台 CI 矩阵全部通过；若 Windows 系统拒绝创建测试 fixture，对应 Windows 用例会明确跳过。
 - 普通 Python 进程不能提供 OS 级沙箱。若未来加入 shell，须先设计并实测工作区隔离，不能把路径检查误称为进程沙箱。
-- 子代理通过 CLI 明确创建；每项任务启动前都展示任务文本和只读路径并单独审批。Mock 与 OpenAI provider 都使用同一 `complete_subagent` 受限入口；OpenAI 子代理只发送独立的子任务消息和该任务授权范围内返回的读取结果，不复制父上下文。Provider 认证仍只走既有 HTTPS Authorization header。
+- 子代理通过 CLI 明确创建；每项任务启动前都展示任务文本和只读路径并单独审批。Mock 与两种 DeepSeek provider 都使用同一 `complete_subagent` 受限入口；子代理只发送独立的子任务消息和该任务授权范围内返回的读取结果，不复制父上下文。Provider 认证仍只走既有 HTTPS Authorization 或 `x-api-key` header。
 - 默认不提供文件工具。提交时可预授权最多 4 个现存工作区相对路径：文件对应 `read_file`，目录对应 `list_directory`；调用前再次通过 `Workspace` 校验，路径必须与授权路径完全匹配。工具 schema 过滤掉 `write_file` 和 `patch_file`，首轮最多 2 个只读调用，第二轮只用于最终答复；没有 shell、递归委派或任意代码入口。子代理只执行最多 2 轮模型请求，深度为 0。
 - 每会话最多 3 项，最多 2 项并发；单项任务最多 240 字符，单请求估算输入最多 512 tokens，全会话最多 3072 估算输入 tokens，每项输出最多 256 tokens，全会话保留输出上限最多 768 tokens。子代理总运行时限默认 60 秒，可设为 5–120 秒，从该任务首个 provider 请求开始；逐项审批和执行前排队不计入。OpenAI 每次 SSE 请求默认受 45 秒总时限限制，可配置为 5–120 秒；时限从建连开始，响应读取期间每 250 ms 检查取消。任务总体 deadline 跨模型/工具轮次共享，每任务最多 2 轮。超时、取消、失败、拒绝和预算耗尽为不同终态。
 - 结果先做疑似凭据脱敏，再 JSON 编码并转义可能伪造的封装标记。用户用 `收取` 后，结果以 `kind=subagent`、`persistable=False` 的 user 消息附加到父 Agent；不自动解析结果内的 `@` 文件引用。父会话的普通引用流程仍会对每个读取请求独立审批，子代理审批不等同父代理文件审批。
@@ -107,6 +109,6 @@ socket 的读取超时设为剩余截止时间，不以短超时轮询后恢复�
 
 - 用户目标仍只作为上下文；只有用户显式要求时，计划生成才产生待审阅候选。候选或已保存计划不授予工具权限，计划执行仍需针对每项工具单独审批。
 - “PTC”暂指 Programmatic Tool Calling。当前没有 PTC 运行时；脚本、批量工具调用或命令执行需要用户澄清并另行设计权限模型。
-- “子代理”限制为会话最多 3 项、深度 0、最多 2 轮，只能使用 Mock 或 OpenAI 兼容 provider 和预授权精确路径中的只读文件工具；无 shell、无写入、无递归。token 估算不等同 provider tokenizer；本机 fixture 覆盖接口路径，不代表线上模型行为或完整产品验收。
+- “子代理”限制为会话最多 3 项、深度 0、最多 2 轮，只能使用 Mock 或两种 DeepSeek provider 和预授权精确路径中的只读文件工具；无 shell、无写入、无递归。token 估算不等同 provider tokenizer；本机 fixture 覆盖协议边界，不代表线上模型行为或完整产品验收。
 
 详细实现矩阵与续作步骤见 [ROADMAP.md](ROADMAP.md)。

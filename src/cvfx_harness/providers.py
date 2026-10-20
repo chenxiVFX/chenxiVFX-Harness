@@ -58,6 +58,34 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON number: {value}")
+
+
+def _strict_json_loads(value: str | bytes) -> Any:
+    return json.loads(
+        value,
+        object_pairs_hook=_unique_json_object,
+        parse_constant=_reject_json_constant,
+    )
+
+
+def _openai_finish_reason_error(finish_reason: Any, has_tool_calls: bool) -> str | None:
+    supported = {
+        "stop",
+        "length",
+        "content_filter",
+        "tool_calls",
+        "insufficient_system_resource",
+        "aborted",
+    }
+    if not isinstance(finish_reason, str) or finish_reason not in supported:
+        return "模型完成状态格式无效。"
+    if has_tool_calls != (finish_reason == "tool_calls"):
+        return "模型工具调用与完成状态不一致；未执行工具。"
+    return None
+
+
 class ProviderError(RuntimeError):
     """A user-safe provider error. Never includes request headers or bodies."""
 
@@ -609,8 +637,8 @@ class OpenAICompatibleProvider:
         if len(raw) > 4 * 1024 * 1024:
             raise ProviderError("模型响应超过 4 MiB 上限。")
         try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            payload = _strict_json_loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
             raise ProviderError("模型响应格式无效。") from None
         return self._turn_from_payload(payload)
 
@@ -698,16 +726,13 @@ class OpenAICompatibleProvider:
             if event_name == "error":
                 raise ProviderStreamError("模型服务返回 SSE 错误事件。")
             if data == "[DONE]":
-                if finish_reason is None:
-                    raise ProviderStreamError("SSE 流在结束前缺少完成状态。")
-                if tool_parts and finish_reason != "tool_calls":
-                    raise ProviderStreamError("SSE 工具调用与完成状态不一致。")
-                if finish_reason == "tool_calls" and not tool_parts:
-                    raise ProviderStreamError("SSE 完成状态要求工具调用，但未收到调用内容。")
+                completion_error = _openai_finish_reason_error(finish_reason, bool(tool_parts))
+                if completion_error is not None:
+                    raise ProviderStreamError(completion_error)
                 return True
             try:
-                chunk = json.loads(data)
-            except (json.JSONDecodeError, RecursionError):
+                chunk = _strict_json_loads(data)
+            except (ValueError, RecursionError):
                 raise ProviderStreamError("SSE 事件 JSON 格式无效。", category="parse_error") from None
             if not isinstance(chunk, dict) or "error" in chunk:
                 raise ProviderStreamError("模型服务返回格式无效的 SSE 事件。")
@@ -724,6 +749,8 @@ class OpenAICompatibleProvider:
                 if "usage" in chunk:
                     return False
                 raise ProviderStreamError("SSE choices 为空。")
+            if finish_reason is not None:
+                raise ProviderStreamError("SSE 完成状态后收到额外候选内容。")
             choice = choices[0]
             if not isinstance(choice, dict) or choice.get("index", 0) != 0:
                 raise ProviderStreamError("SSE 候选项格式无效。")
@@ -786,7 +813,8 @@ class OpenAICompatibleProvider:
             current_finish_reason = choice.get("finish_reason")
             if current_finish_reason is not None:
                 if not isinstance(current_finish_reason, str) or current_finish_reason not in {
-                    "stop", "length", "tool_calls", "content_filter"
+                    "stop", "length", "tool_calls", "content_filter",
+                    "insufficient_system_resource", "aborted",
                 }:
                     raise ProviderStreamError("SSE 完成状态尚未支持。")
                 if finish_reason is not None and finish_reason != current_finish_reason:
@@ -1038,18 +1066,20 @@ class OpenAICompatibleProvider:
         return turn
 
     def _turn_from_payload(self, payload: Any) -> AssistantTurn:
-        try:
-            choice = payload["choices"][0]
-            message = choice["message"]
-        except (KeyError, IndexError, TypeError, RecursionError):
-            raise ProviderError("模型响应格式无效。") from None
-        if not isinstance(choice, dict):
+        if not isinstance(payload, dict):
             raise ProviderError("模型响应格式无效。")
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+            raise ProviderError("模型响应格式无效。")
+        choice = choices[0]
+        if choice.get("index", 0) != 0:
+            raise ProviderError("模型候选项格式无效。")
         finish_reason = choice.get("finish_reason")
-        if finish_reason is not None and not isinstance(finish_reason, str):
-            raise ProviderError("模型完成状态无效。")
+        message = choice.get("message")
         if not isinstance(message, dict):
             raise ProviderError("模型响应格式无效。")
+        if message.get("role") != "assistant":
+            raise ProviderError("模型响应角色无效。")
 
         content_value = message.get("content")
         if content_value is not None and not isinstance(content_value, str):
@@ -1078,6 +1108,7 @@ class OpenAICompatibleProvider:
                     or len(call_id) > 128
                     or any(ord(char) < 32 for char in call_id)
                     or call_id in seen_call_ids
+                    or raw_call.get("type") != "function"
                     or not isinstance(name, str)
                     or not name
                     or len(name) > 128
@@ -1085,10 +1116,10 @@ class OpenAICompatibleProvider:
                     or len(raw_arguments.encode("utf-8")) > MAX_PROVIDER_TOOL_ARGUMENT_BYTES
                 ):
                     raise ValueError("invalid tool metadata")
-                arguments = json.loads(raw_arguments)
+                arguments = _strict_json_loads(raw_arguments)
                 if not isinstance(arguments, dict):
                     raise ValueError("tool arguments must be an object")
-                if len(json.dumps(arguments, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_PROVIDER_TOOL_ARGUMENT_BYTES:
+                if len(json.dumps(arguments, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")) > MAX_PROVIDER_TOOL_ARGUMENT_BYTES:
                     raise ValueError("tool arguments exceed size limit")
                 seen_call_ids.add(call_id)
                 calls.append(
@@ -1098,10 +1129,14 @@ class OpenAICompatibleProvider:
                         arguments=arguments,
                     )
                 )
-            except (KeyError, TypeError, json.JSONDecodeError, ValueError, UnicodeEncodeError, RecursionError):
+            except (KeyError, TypeError, ValueError, UnicodeEncodeError, RecursionError):
                 # Preserve the assistant response but surface malformed tool calls
                 # as an ordinary answer; never try to execute partial arguments.
                 raise ProviderError("模型返回了格式无效的工具调用。") from None
+
+        completion_error = _openai_finish_reason_error(finish_reason, bool(calls))
+        if completion_error is not None:
+            raise ProviderError(completion_error)
 
         assistant_message: dict[str, Any] = {"role": "assistant", "content": content_value}
         reasoning_content = message.get("reasoning_content")
@@ -1125,16 +1160,54 @@ class OpenAICompatibleProvider:
             return None
         prompt = value.get("prompt_tokens")
         completion = value.get("completion_tokens")
-        total = value.get("total_tokens")
-        if type(prompt) is not int or type(completion) is not int:
+        if (
+            type(prompt) is not int
+            or type(completion) is not int
+            or not 0 <= prompt <= 2_000_000_000
+            or not 0 <= completion <= 2_000_000_000
+        ):
             return None
-        if prompt < 0 or completion < 0:
-            return None
-        if type(total) is not int or total < 0:
-            total = prompt + completion
-        cached_prompt = value.get("prompt_cache_hit_tokens")
-        if type(cached_prompt) is not int or not 0 <= cached_prompt <= prompt:
-            cached_prompt = None
+        total = prompt + completion
+        if "total_tokens" in value:
+            reported_total = value["total_tokens"]
+            if type(reported_total) is not int or reported_total != total:
+                return None
+
+        cache_values: list[int] = []
+        cache_invalid = False
+        if "prompt_cache_hit_tokens" in value and value["prompt_cache_hit_tokens"] is not None:
+            cache_value = value["prompt_cache_hit_tokens"]
+            if type(cache_value) is not int or not 0 <= cache_value <= prompt:
+                cache_invalid = True
+            else:
+                cache_values.append(cache_value)
+
+        if "prompt_tokens_details" in value:
+            details = value["prompt_tokens_details"]
+            if not isinstance(details, dict):
+                cache_invalid = True
+            elif details.get("cached_tokens") is not None:
+                cache_value = details["cached_tokens"]
+                if type(cache_value) is not int or not 0 <= cache_value <= prompt:
+                    cache_invalid = True
+                else:
+                    cache_values.append(cache_value)
+
+        if "prompt_cache_miss_tokens" in value and value["prompt_cache_miss_tokens"] is not None:
+            cache_miss = value["prompt_cache_miss_tokens"]
+            if (
+                type(cache_miss) is not int
+                or not 0 <= cache_miss <= prompt
+                or not cache_values
+                or cache_values[-1] + cache_miss != prompt
+            ):
+                cache_invalid = True
+
+        cached_prompt = (
+            cache_values[0]
+            if cache_values and not cache_invalid and all(item == cache_values[0] for item in cache_values)
+            else None
+        )
         return ProviderUsage(prompt, completion, total, cached_prompt)
 
 
@@ -1149,6 +1222,7 @@ class _AnthropicEventAccumulator:
         self.stop_reason: str | None = None
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
+        self.usage_invalid = False
         self.blocks: dict[int, dict[str, Any]] = {}
         self.open_blocks: set[int] = set()
         self._assistant_bytes = 0
@@ -1160,12 +1234,18 @@ class _AnthropicEventAccumulator:
     def _read_usage(self, usage: Any, *, final: bool = False) -> None:
         if not isinstance(usage, dict):
             return
-        input_tokens = self._token_count(usage.get("input_tokens"))
-        output_tokens = self._token_count(usage.get("output_tokens"))
-        if input_tokens is not None:
-            self.input_tokens = input_tokens
-        if final and output_tokens is not None:
-            self.output_tokens = output_tokens
+        if "input_tokens" in usage:
+            input_tokens = self._token_count(usage["input_tokens"])
+            if input_tokens is None:
+                self.usage_invalid = True
+            else:
+                self.input_tokens = input_tokens
+        if final and "output_tokens" in usage:
+            output_tokens = self._token_count(usage["output_tokens"])
+            if output_tokens is None:
+                self.usage_invalid = True
+            else:
+                self.output_tokens = output_tokens
 
     def _add_assistant_bytes(self, value: str) -> None:
         try:
@@ -1179,7 +1259,7 @@ class _AnthropicEventAccumulator:
         if event_name == "error":
             raise ProviderStreamError("DeepSeek Anthropic 接口返回 SSE 错误事件。")
         try:
-            event = json.loads(data, object_pairs_hook=_unique_json_object)
+            event = _strict_json_loads(data)
         except (ValueError, RecursionError):
             raise ProviderStreamError("Anthropic SSE 事件 JSON 格式无效。", category="parse_error") from None
         if not isinstance(event, dict) or not isinstance(event.get("type"), str):
@@ -1419,7 +1499,11 @@ class _AnthropicEventAccumulator:
                     "input": block["input"],
                 })
         usage: dict[str, int] | None = None
-        if self.input_tokens is not None and self.output_tokens is not None:
+        if (
+            not self.usage_invalid
+            and self.input_tokens is not None
+            and self.output_tokens is not None
+        ):
             usage = {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens}
         return {
             "type": "message",
@@ -1524,7 +1608,7 @@ class DeepSeekAnthropicProvider:
                 for call in message["tool_calls"]:
                     try:
                         function = call["function"]
-                        args = json.loads(function["arguments"])
+                        args = _strict_json_loads(function["arguments"])
                         if not isinstance(args, dict):
                             raise ValueError
                         content.append({
@@ -1633,7 +1717,7 @@ class DeepSeekAnthropicProvider:
         if len(raw) > MAX_STREAM_RESPONSE_BYTES:
             raise ProviderError("Anthropic 响应超过 4 MiB 上限。")
         try:
-            payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_object)
+            payload = _strict_json_loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError, RecursionError):
             raise ProviderError("Anthropic 响应格式无效。") from None
         return self._turn_from_payload(payload)
