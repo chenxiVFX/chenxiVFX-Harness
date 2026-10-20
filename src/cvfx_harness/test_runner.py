@@ -140,6 +140,10 @@ def _file_identity_metadata(info: os.stat_result) -> tuple[int, int, int, int, i
     )
 
 
+def _file_identity_key(info: os.stat_result) -> tuple[int, int, int]:
+    return int(info.st_dev), int(info.st_ino), int(info.st_size)
+
+
 def _command_executable_identity(
     value: str,
     *,
@@ -179,7 +183,7 @@ def _command_executable_identity(
         flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(resolved, flags)
         opened = os.fstat(descriptor)
-        if _file_identity_metadata(opened) != before_metadata:
+        if _file_identity_key(opened) != _file_identity_key(before_path):
             raise TestProfileError("命令可执行文件在身份校验期间发生变化；未启动测试进程。")
 
         digest = hashlib.sha256()
@@ -199,12 +203,13 @@ def _command_executable_identity(
         after_open = os.fstat(descriptor)
         after_path = resolved.stat()
         resolved_again = Path(configured).resolve(strict=True)
-        stable_metadata = _file_identity_metadata(opened)
         if read_bytes != opened.st_size:
             raise TestProfileError("命令可执行文件身份校验读取长度不一致；未启动测试进程。")
-        if _file_identity_metadata(after_open) != stable_metadata:
+        if _file_identity_key(after_open) != _file_identity_key(opened):
             raise TestProfileError("命令可执行文件在身份校验期间发生变化；未启动测试进程。")
-        if _file_identity_metadata(after_path) != stable_metadata:
+        if _file_identity_metadata(after_path) != before_metadata:
+            raise TestProfileError("命令可执行文件路径在身份校验期间发生变化；未启动测试进程。")
+        if _file_identity_key(after_path) != _file_identity_key(opened):
             raise TestProfileError("命令可执行文件路径在身份校验期间发生变化；未启动测试进程。")
         if _path_key(resolved_again) != _path_key(resolved):
             raise TestProfileError("命令可执行文件符号链接目标在身份校验期间发生变化；未启动测试进程。")
@@ -219,8 +224,8 @@ def _command_executable_identity(
             device=int(opened.st_dev),
             file_id=int(opened.st_ino),
             size=int(opened.st_size),
-            modified_ns=int(opened.st_mtime_ns),
-            changed_ns=int(opened.st_ctime_ns),
+            modified_ns=int(before_path.st_mtime_ns),
+            changed_ns=int(before_path.st_ctime_ns),
             sha256=digest.hexdigest(),
         )
     except TestProfileError:

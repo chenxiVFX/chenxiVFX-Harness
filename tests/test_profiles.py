@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -590,6 +591,34 @@ class TestProfileStoreTests(unittest.TestCase):
                 with self.assertRaises(TestProfileError):
                     _command_executable_identity(str(executable))
             open_file.assert_not_called()
+
+    def test_command_identity_tolerates_file_descriptor_timestamp_precision(self) -> None:
+        with self._synthetic_project() as root:
+            executable = Path(root) / ("runner.exe" if os.name == "nt" else "runner")
+            executable.write_bytes(b"timestamp precision fixture")
+            if os.name != "nt":
+                executable.chmod(0o755)
+            original_fstat = os.fstat
+
+            def lower_precision_fstat(descriptor):
+                info = original_fstat(descriptor)
+                return SimpleNamespace(
+                    st_dev=info.st_dev,
+                    st_ino=info.st_ino,
+                    st_size=info.st_size,
+                    st_mtime_ns=info.st_mtime_ns + 1_000_000,
+                    st_ctime_ns=info.st_ctime_ns + 1_000_000,
+                )
+
+            with patch("cvfx_harness.test_runner.os.fstat", side_effect=lower_precision_fstat):
+                identity = _command_executable_identity(str(executable))
+
+            self.assertEqual(identity.size, executable.stat().st_size)
+            self.assertEqual(identity.modified_ns, executable.stat().st_mtime_ns)
+            self.assertEqual(
+                identity.sha256,
+                hashlib.sha256(executable.read_bytes()).hexdigest(),
+            )
 
     def test_command_executable_identity_cancellation_stops_before_file_access(self) -> None:
         with self._synthetic_project() as root:
