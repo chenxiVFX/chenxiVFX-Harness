@@ -4494,6 +4494,203 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(turn.content, "本地合成回复")
         self.assertIsNone(turn.usage)
 
+    def test_anthropic_message_delta_usage_is_cumulative_and_must_not_decrease(self) -> None:
+        cases = (
+            ([1, 7, 11, 11], ProviderUsage(13, 11, 24)),
+            ([1, 7, 6], None),
+        )
+        provider = DeepSeekAnthropicProvider("http://127.0.0.1:32123/anthropic", "", "deepseek-flash")
+        for output_counts, expected_usage in cases:
+            with self.subTest(output_counts=output_counts):
+                events: list[dict[str, object]] = [
+                    {"type": "message_start", "message": {
+                        "type": "message", "role": "assistant", "content": [],
+                        "usage": {"input_tokens": 13, "output_tokens": output_counts[0]},
+                    }},
+                    {"type": "content_block_start", "index": 0, "content_block": {
+                        "type": "text", "text": "",
+                    }},
+                    {"type": "content_block_delta", "index": 0, "delta": {
+                        "type": "text_delta", "text": "累计用量 fixture",
+                    }},
+                    {"type": "content_block_stop", "index": 0},
+                ]
+                events.extend({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": count},
+                } for count in output_counts[1:])
+                events.append({"type": "message_stop"})
+                accumulator = _AnthropicEventAccumulator(lambda _fragment: None)
+                parser = _SSEParser(accumulator.handle)
+                self.assertTrue(parser.feed(fixture_anthropic_sse(events)))
+                turn = provider._turn_from_payload(accumulator.payload())
+                self.assertEqual(turn.content, "累计用量 fixture")
+                self.assertEqual(turn.usage, expected_usage)
+
+    def test_openai_stream_duplicate_usage_is_idempotent_conflicts_become_unknown(self) -> None:
+        report = {
+            "prompt_tokens": 12,
+            "completion_tokens": 3,
+            "total_tokens": 15,
+            "prompt_cache_hit_tokens": 4,
+        }
+        cases = (
+            ([], None),
+            ([None], None),
+            ([report, dict(report)], ProviderUsage(12, 3, 15, 4)),
+            ([report, {**report, "completion_tokens": 30, "total_tokens": 42}], None),
+            ([report, {**report, "prompt_cache_hit_tokens": 5}], ProviderUsage(12, 3, 15)),
+            ([report, {"prompt_tokens": "invalid", "completion_tokens": 3}], None),
+        )
+        for reports, expected_usage in cases:
+            with self.subTest(reports=reports):
+                body = fixture_sse_frames([
+                    {"choices": [{"index": 0, "delta": {"content": "usage fixture"}, "finish_reason": "stop"}]},
+                    *({"choices": [], "usage": item} for item in reports),
+                ])
+
+                def serve(handler, _request_body: bytes) -> None:
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", "text/event-stream")
+                    handler.send_header("Content-Length", str(len(body)))
+                    handler.end_headers()
+                    handler.wfile.write(body)
+
+                server, worker = local_http_fixture(serve)
+                try:
+                    provider = OpenAICompatibleProvider(
+                        f"http://127.0.0.1:{server.server_port}", "", "fixture-model", timeout=2, stream_timeout=2
+                    )
+                    turn = provider.complete_streaming(
+                        [{"role": "user", "content": "合成 usage 校验"}], [], on_text_delta=lambda _text: None
+                    )
+                finally:
+                    server.shutdown()
+                    worker.join(timeout=2)
+                    server.server_close()
+                self.assertEqual(turn.content, "usage fixture")
+                self.assertEqual(turn.usage, expected_usage)
+
+    def test_conflicting_openai_usage_keeps_tool_turn_and_main_stats_unknown(self) -> None:
+        from cvfx_harness.agent import run_tool
+
+        first = fixture_sse_frames([
+            {"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "usage-read-once", "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"safe.txt"}'},
+            }]}, "finish_reason": "tool_calls"}]},
+            {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}},
+            {"choices": [], "usage": {"prompt_tokens": 999, "completion_tokens": 99, "total_tokens": 1098}},
+        ])
+        final = fixture_sse_frames([
+            {"choices": [{"index": 0, "delta": {"content": "工具只执行一次。"}, "finish_reason": "stop"}]},
+        ])
+        responses = [first, final]
+        requests: list[bool] = []
+
+        def serve(handler, _request_body: bytes) -> None:
+            requests.append(True)
+            body = responses.pop(0)
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
+        server, worker = local_http_fixture(serve)
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "fixture-model", timeout=2, stream_timeout=2
+            )
+            with make_test_temp(prefix="duplicate-usage-main-") as temp:
+                Path(temp, "safe.txt").write_text("本地合成只读数据", encoding="utf-8")
+                executed: list[str] = []
+                original_run_tool = run_tool
+
+                def track_tool(workspace, call, **kwargs):
+                    executed.append(call.call_id)
+                    return original_run_tool(workspace, call, **kwargs)
+
+                agent = Agent(
+                    provider, Workspace(temp), approve_action=lambda _request: True,
+                    max_output_tokens=512, max_provider_requests=2,
+                )
+                with patch("cvfx_harness.agent.run_tool", side_effect=track_tool):
+                    answer = agent.ask("读取 safe.txt 后总结", on_text_delta=lambda _text: None)
+                stats = agent.usage.to_dict()
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+        self.assertEqual(answer, "工具只执行一次。")
+        self.assertEqual(executed, ["usage-read-once"])
+        self.assertEqual(requests, [True, True])
+        self.assertEqual(stats["requests"], 2)
+        self.assertEqual(stats["provider_usage_reports"], 0)
+        self.assertGreater(stats["estimated_output_tokens"], 0)
+
+    def test_conflicting_openai_usage_keeps_subagent_read_once_and_uses_estimate(self) -> None:
+        from cvfx_harness.subagents import _run_one
+        from cvfx_harness.tools import run_tool
+
+        first = fixture_sse_frames([
+            {"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "child-usage-read-once", "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"safe.txt"}'},
+            }]}, "finish_reason": "tool_calls"}]},
+            {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}},
+            {"choices": [], "usage": {"prompt_tokens": 999, "completion_tokens": 99, "total_tokens": 1098}},
+        ])
+        final = fixture_sse_frames([
+            {"choices": [{"index": 0, "delta": {"content": "子代理 fixture 完成。"}, "finish_reason": "stop"}]},
+        ])
+        responses = [first, final]
+        requests: list[bool] = []
+
+        def serve(handler, _request_body: bytes) -> None:
+            requests.append(True)
+            body = responses.pop(0)
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
+        server, worker = local_http_fixture(serve)
+        try:
+            provider = OpenAICompatibleProvider(
+                f"http://127.0.0.1:{server.server_port}", "", "fixture-model", timeout=2, stream_timeout=2
+            )
+            with make_test_temp(prefix="duplicate-usage-child-") as temp:
+                Path(temp, "safe.txt").write_text("本地合成子代理数据", encoding="utf-8")
+                executed: list[str] = []
+                original_run_tool = run_tool
+
+                def track_tool(workspace, call, **kwargs):
+                    executed.append(call.call_id)
+                    return original_run_tool(workspace, call, **kwargs)
+
+                with patch("cvfx_harness.subagents.run_tool", side_effect=track_tool):
+                    result = _run_one(
+                        1, "读取 safe.txt 并总结", provider,
+                        input_budget=1024, output_budget=256, timeout_seconds=5,
+                        cancellation_event=threading.Event(), workspace=Workspace(temp),
+                        read_scopes=(("safe.txt", "read_file"),),
+                    )
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+            server.server_close()
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.content, "子代理 fixture 完成。")
+        self.assertEqual(executed, ["child-usage-read-once"])
+        self.assertEqual(requests, [True, True])
+        self.assertGreater(result.output_tokens, 0)
+        self.assertLess(result.output_tokens, 99, "conflicting usage must not inflate child accounting")
+
     def test_sse_parser_handles_utf8_and_crlf_boundaries_across_byte_chunks(self) -> None:
         events: list[tuple[str, str]] = []
         parser = _SSEParser(lambda name, data: events.append((name, data)) or data == "[DONE]")

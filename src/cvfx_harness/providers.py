@@ -697,9 +697,48 @@ class OpenAICompatibleProvider:
         reasoning_parts: list[str] = []
         tool_parts: dict[int, dict[str, list[str]]] = {}
         tool_sizes: dict[int, dict[str, int]] = {}
-        usage_value: Any = None
+        usage_base: ProviderUsage | None = None
+        usage_cached_prompt: int | None = None
+        usage_invalid = False
+        usage_cache_invalid = False
         finish_reason: str | None = None
         assistant_bytes = 0
+
+        def collect_usage(value: Any) -> None:
+            nonlocal usage_base, usage_cached_prompt, usage_invalid, usage_cache_invalid
+            # OpenAI-compatible streams commonly send usage=null on ordinary
+            # chunks. Only non-null reports participate in duplicate checks.
+            if value is None or usage_invalid:
+                return
+            parsed, cache_invalid = self._parse_usage_report(value)
+            if parsed is None:
+                usage_invalid = True
+                return
+            if usage_base is None:
+                usage_base = ProviderUsage(
+                    parsed.prompt_tokens, parsed.completion_tokens, parsed.total_tokens
+                )
+            elif (
+                parsed.prompt_tokens != usage_base.prompt_tokens
+                or parsed.completion_tokens != usage_base.completion_tokens
+                or parsed.total_tokens != usage_base.total_tokens
+            ):
+                # A second, conflicting full-usage report makes this turn's
+                # provider usage unknown. Keep the response and any tools valid.
+                usage_invalid = True
+                return
+            if cache_invalid:
+                usage_cache_invalid = True
+                usage_cached_prompt = None
+            elif parsed.cached_prompt_tokens is not None:
+                if (
+                    usage_cached_prompt is not None
+                    and parsed.cached_prompt_tokens != usage_cached_prompt
+                ):
+                    usage_cache_invalid = True
+                    usage_cached_prompt = None
+                elif not usage_cache_invalid:
+                    usage_cached_prompt = parsed.cached_prompt_tokens
 
         def append_text(target: list[str], value: Any, *, display: bool) -> None:
             nonlocal assistant_bytes
@@ -722,7 +761,7 @@ class OpenAICompatibleProvider:
                     raise ProviderStreamError("无法显示 SSE 流式文本。", category="local_output_error") from None
 
         def collect_event(event_name: str, data: str) -> bool:
-            nonlocal usage_value, finish_reason
+            nonlocal finish_reason
             if event_name == "error":
                 raise ProviderStreamError("模型服务返回 SSE 错误事件。")
             if data == "[DONE]":
@@ -737,7 +776,7 @@ class OpenAICompatibleProvider:
             if not isinstance(chunk, dict) or "error" in chunk:
                 raise ProviderStreamError("模型服务返回格式无效的 SSE 事件。")
             if "usage" in chunk:
-                usage_value = chunk["usage"]
+                collect_usage(chunk["usage"])
             choices = chunk.get("choices")
             if choices is None:
                 if "usage" in chunk:
@@ -968,6 +1007,15 @@ class OpenAICompatibleProvider:
                 }
                 for index in sorted(tool_parts)
             ]
+        usage_value: dict[str, int] | None = None
+        if not usage_invalid and usage_base is not None:
+            usage_value = {
+                "prompt_tokens": usage_base.prompt_tokens,
+                "completion_tokens": usage_base.completion_tokens,
+                "total_tokens": usage_base.total_tokens,
+            }
+            if not usage_cache_invalid and usage_cached_prompt is not None:
+                usage_value["prompt_cache_hit_tokens"] = usage_cached_prompt
         return self._turn_from_payload(
             {
                 "choices": [{"message": message, "finish_reason": finish_reason}],
@@ -1156,8 +1204,13 @@ class OpenAICompatibleProvider:
 
     @staticmethod
     def _parse_usage(value: Any) -> ProviderUsage | None:
+        usage, _cache_invalid = OpenAICompatibleProvider._parse_usage_report(value)
+        return usage
+
+    @staticmethod
+    def _parse_usage_report(value: Any) -> tuple[ProviderUsage | None, bool]:
         if not isinstance(value, dict):
-            return None
+            return None, False
         prompt = value.get("prompt_tokens")
         completion = value.get("completion_tokens")
         if (
@@ -1166,12 +1219,12 @@ class OpenAICompatibleProvider:
             or not 0 <= prompt <= 2_000_000_000
             or not 0 <= completion <= 2_000_000_000
         ):
-            return None
+            return None, False
         total = prompt + completion
         if "total_tokens" in value:
             reported_total = value["total_tokens"]
             if type(reported_total) is not int or reported_total != total:
-                return None
+                return None, False
 
         cache_values: list[int] = []
         cache_invalid = False
@@ -1208,7 +1261,7 @@ class OpenAICompatibleProvider:
             if cache_values and not cache_invalid and all(item == cache_values[0] for item in cache_values)
             else None
         )
-        return ProviderUsage(prompt, completion, total, cached_prompt)
+        return ProviderUsage(prompt, completion, total, cached_prompt), cache_invalid
 
 
 class _AnthropicEventAccumulator:
@@ -1222,6 +1275,7 @@ class _AnthropicEventAccumulator:
         self.stop_reason: str | None = None
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
+        self.output_tokens_seen_final = False
         self.usage_invalid = False
         self.blocks: dict[int, dict[str, Any]] = {}
         self.open_blocks: set[int] = set()
@@ -1232,20 +1286,29 @@ class _AnthropicEventAccumulator:
         return value if type(value) is int and 0 <= value <= 2_000_000_000 else None
 
     def _read_usage(self, usage: Any, *, final: bool = False) -> None:
+        if usage is None:
+            return
         if not isinstance(usage, dict):
+            self.usage_invalid = True
             return
         if "input_tokens" in usage:
             input_tokens = self._token_count(usage["input_tokens"])
             if input_tokens is None:
                 self.usage_invalid = True
+            elif self.input_tokens is not None and input_tokens != self.input_tokens:
+                self.usage_invalid = True
             else:
                 self.input_tokens = input_tokens
-        if final and "output_tokens" in usage:
+        if "output_tokens" in usage:
             output_tokens = self._token_count(usage["output_tokens"])
             if output_tokens is None:
                 self.usage_invalid = True
+            elif self.output_tokens is not None and output_tokens < self.output_tokens:
+                self.usage_invalid = True
             else:
                 self.output_tokens = output_tokens
+                if final:
+                    self.output_tokens_seen_final = True
 
     def _add_assistant_bytes(self, value: str) -> None:
         try:
@@ -1503,6 +1566,7 @@ class _AnthropicEventAccumulator:
             not self.usage_invalid
             and self.input_tokens is not None
             and self.output_tokens is not None
+            and self.output_tokens_seen_final
         ):
             usage = {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens}
         return {
