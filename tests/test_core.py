@@ -2848,7 +2848,7 @@ class AgentTests(unittest.TestCase):
                 max_provider_requests=1,
             )
             answer = agent.ask("寫入文件")
-            self.assertIn("输出上限", answer)
+            self.assertIn("输出预算上限", answer)
             self.assertFalse(Path(temp, "blocked.txt").exists())
             self.assertIn("未执行", agent.messages[-2]["content"])
 
@@ -2880,11 +2880,11 @@ class AgentTests(unittest.TestCase):
             approvals: list[ActionRequest] = []
             agent = Agent(provider, Workspace(temp), approve_action=self._approval(approvals))
             answer = agent.ask("列出工作区")
-            self.assertIn("工具轮数上限", answer)
+            self.assertIn("模型请求次数上限", answer)
             self.assertEqual(len(provider.requests), 4)
             self.assertEqual(len(approvals), 3)
             self.assertEqual(agent.messages[-2]["tool_call_id"], "list-3")
-            self.assertIn("该调用未执行", agent.messages[-2]["content"])
+            self.assertIn("该工具调用未执行", agent.messages[-2]["content"])
 
     def test_plan_mode_blocks_model_write_and_unknown_command_tool(self) -> None:
         with make_test_temp() as temp:
@@ -3651,7 +3651,7 @@ class CliTests(unittest.TestCase):
                 result = run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append)
         self.assertEqual(result, 0)
         error_line = next(line for line in outputs if "模型流失败" in line)
-        self.assertIn("SSE 网络读取失败。未完成轮次", error_line)
+        self.assertIn("SSE 网络读取失败。不完整轮次", error_line)
         self.assertNotIn("失败。。", error_line)
 
     def test_cli_previews_write_and_undo_before_each_confirmation(self) -> None:

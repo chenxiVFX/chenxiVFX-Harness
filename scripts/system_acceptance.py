@@ -106,6 +106,11 @@ CORRECT_MARKER = "根据上一轮实际失败输出"
 REJECT_MARKER = "拒绝路径验收"
 RACE_MARKER = "并发版本验收"
 CANCEL_MARKER = "取消边界验收"
+BUDGET_MARKER = "请求额度耗尽验收"
+BUDGET_CONTINUE_MARKER = "预算后续继续验收"
+TOOL_FAILURE_MARKER = "本地工具失败验收"
+CONTEXT_FIRST_MARKER = "预算预检首轮验收"
+CONTEXT_LIMIT_MARKER = "预算预检拒绝验收"
 
 
 def _sha(text: str) -> str:
@@ -146,6 +151,9 @@ class DeterministicScenarioProvider:
         self.correction_round = 0
         self.failure_round = 0
         self.scenario_round = 0
+        self.budget_round = 0
+        self.budget_continue_round = 0
+        self.tool_failure_round = 0
 
     def complete(
         self,
@@ -257,8 +265,63 @@ class DeterministicScenarioProvider:
                 return _turn("复测退出码为 0，既有 unittest 全部通过。每行先按 ROUND_HALF_UP 取整到分，再汇总；两处修改均经过审批。")
             raise AssertionError("修正轮次超出预期")
 
+        if BUDGET_MARKER in request_text:
+            self.budget_round += 1
+            results = "\n".join(_tool_messages(messages))
+            if self.budget_round == 1:
+                return _turn("", [ToolCall("budget-read-amount", "read_file", {"path": AMOUNT_PATH})])
+            if self.budget_round == 2:
+                if "SHA256=" not in results or INITIAL_AMOUNT not in results:
+                    raise AssertionError("预算中止前未保留已完成读取")
+                return _turn("", [ToolCall("budget-search-order", "search_text", {
+                    "query": "line_total", "path": "商城", "glob": "*.py",
+                })])
+            if self.budget_round == 3:
+                if "line_total" not in results:
+                    raise AssertionError("预算中止前未保留已完成搜索")
+                return _turn("", [ToolCall("budget-change-set", "apply_change_set", {
+                    "changes": self._changes(correct_rounding=True),
+                })])
+            raise AssertionError("预算中止轮次超出预期")
+
+        if BUDGET_CONTINUE_MARKER in request_text:
+            self.budget_continue_round += 1
+            transcript = json.dumps(messages, ensure_ascii=False)
+            results = "\n".join(_tool_messages(messages))
+            if self.budget_continue_round == 1:
+                if "模型请求次数上限" not in transcript or "SHA256=" not in transcript or "line_total" not in transcript:
+                    raise AssertionError("后续提问没有继承已完成结果和预算未执行状态")
+                return _turn("", [ToolCall("continued-change-set", "apply_change_set", {
+                    "changes": self._changes(correct_rounding=True),
+                })])
+            if self.budget_continue_round == 2:
+                if "已应用全部文件变更" not in results:
+                    raise AssertionError("预算后续的两文件审批未成功提交")
+                return _turn("", [ToolCall("continued-test", "run_test_profile", {"profile_id": PROFILE_ID})])
+            if self.budget_continue_round == 3:
+                if "退出码为 0" not in "\n".join(_tool_messages(messages)) or "OK" not in "\n".join(_tool_messages(messages)):
+                    raise AssertionError("预算后续测试未以 exit 0 结束")
+                return _turn("后续提问完成了获批修改并运行既有测试，退出码为 0；本次之前的中止轮次并未自动重试。")
+            raise AssertionError("预算后续轮次超出预期")
+
+        if TOOL_FAILURE_MARKER in request_text:
+            self.tool_failure_round += 1
+            if self.tool_failure_round == 1:
+                return _turn("", [ToolCall("missing-file-read", "read_file", {"path": "商城/不存在.py"})])
+            if self.tool_failure_round == 2:
+                if "操作被工作区策略阻止" not in "\n".join(_tool_messages(messages)):
+                    raise AssertionError("本地工具失败没有返回到模型上下文")
+                return _turn("缺失文件已成功读取，代码检查已完成。")
+            raise AssertionError("本地工具失败轮次超出预期")
+
+        if CONTEXT_FIRST_MARKER in request_text:
+            return _turn("预算预检前的合成短答复。")
+
+        if CONTEXT_LIMIT_MARKER in request_text:
+            raise AssertionError("上下文预检应在发送 provider 请求前拒绝本轮")
+
         if REJECT_MARKER in request_text:
-            return self._change_set_scenario(messages, "已收到拒绝结果；整批修改未应用，文件保持原样，也没有运行测试。", 3)
+            return self._change_set_scenario(messages, "变更已完成，两个文件均已修改，测试也已通过。", 3)
 
         if RACE_MARKER in request_text:
             return self._change_set_scenario(messages, "工作区在审批期间发生外部变化；整批被拒绝，竞争版本没有被覆盖。", 3)
@@ -298,13 +361,17 @@ class DeterministicScenarioProvider:
         raise AssertionError("拒绝/并发场景模型轮次超出预期")
 
     @staticmethod
-    def _changes() -> list[dict[str, str]]:
+    def _changes(*, correct_rounding: bool = False) -> list[dict[str, str]]:
+        amount_after = (
+            FIRST_AMOUNT.replace("ROUND_HALF_EVEN", "ROUND_HALF_UP")
+            if correct_rounding else FIRST_AMOUNT
+        )
         return [
             {
                 "path": AMOUNT_PATH,
                 "expected_sha256": _sha(INITIAL_AMOUNT),
                 "old_text": INITIAL_AMOUNT,
-                "new_text": FIRST_AMOUNT,
+                "new_text": amount_after,
             },
             {
                 "path": ORDER_PATH,
@@ -393,6 +460,9 @@ def _run_console_case(
     scenario: str,
     commands: list[str],
     cancellation_event: threading.Event | None = None,
+    max_model_requests: int = 4,
+    token_budget: int | None = None,
+    max_output_tokens: int | None = None,
 ) -> tuple[int, Path, tempfile.TemporaryDirectory[str], DeterministicScenarioProvider, list[str], _InteractiveInput]:
     temporary = tempfile.TemporaryDirectory(prefix="cvfx-synthetic-acceptance-")
     root = Path(temporary.name) / "验收 工作区"
@@ -403,7 +473,11 @@ def _run_console_case(
     input_driver = _InteractiveInput(
         commands, scenario=scenario, root=root, cancellation_event=cancellation_event
     )
-    args = SimpleNamespace(workspace=str(root), provider="mock", model=None, max_model_requests=4)
+    args = SimpleNamespace(
+        workspace=str(root), provider="mock", model=None,
+        max_model_requests=max_model_requests, token_budget=token_budget,
+        max_output_tokens=max_output_tokens,
+    )
     with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
         result = run_console(
             args,
@@ -493,10 +567,13 @@ def _assert_rejection_path() -> None:
         assert (root / ORDER_PATH).read_text(encoding="utf-8") == INITIAL_ORDER
         assert not (root / ".harness" / "backups").exists()
         combined = "\n".join(outputs)
-        assert "整批修改未应用，文件保持原样" in combined
+        assert "变更已完成，两个文件均已修改，测试也已通过" in combined
+        assert "多文件变更集 1 项被拒绝、未执行" in combined
+        assert "模型答复不能将其视为已完成" in combined
+        assert combined.index("变更已完成") < combined.index("模型答复不能将其视为已完成")
         assert "测试进程结束" not in combined
         assert any("用户拒绝整个变更集" in tool for call in provider.requests for tool in _tool_messages(call["messages"]))
-        print("拒绝路径：整批审批拒绝后两文件字节保持原值，无备份写入，主 Agent 未报告修改成功。")
+        print("拒绝路径：整批审批拒绝后两文件保持原值；即使合成模型误报成功，CLI 仍显示拒绝的本地状态。")
     finally:
         temporary.cleanup()
 
@@ -540,11 +617,101 @@ def _assert_cancel_path() -> None:
         temporary.cleanup()
 
 
+def _assert_request_budget_resume_path() -> None:
+    rc, root, temporary, provider, outputs, input_driver = _run_console_case(
+        scenario="budgeted",
+        commands=[
+            "/项目说明",
+            f"{BUDGET_MARKER}：先读和搜索，再审阅修改并运行已有测试。",
+            f"{BUDGET_CONTINUE_MARKER}：继续完成未做的修改、运行测试并汇报。",
+            "/退出",
+        ],
+        max_model_requests=3,
+        max_output_tokens=4096,
+    )
+    try:
+        combined = "\n".join(outputs)
+        source = (root / AMOUNT_PATH).read_text(encoding="utf-8")
+        request_limit_at = combined.index("模型请求次数上限（3 次）")
+        resumed_success_at = combined.index("后续提问完成了获批修改")
+        resume_requests = provider.requests[3:]
+
+        assert rc == 0
+        assert "当前任务尚未确认完成" in combined
+        assert "本轮工具调用均未执行" in combined
+        assert "检查工作区状态，再用新问题继续" in combined
+        assert request_limit_at < resumed_success_at
+        assert "退出码为 0" in combined and "OK" in combined
+        assert source == FIRST_AMOUNT.replace("ROUND_HALF_EVEN", "ROUND_HALF_UP")
+        assert "return round_money(net_amount * (Decimal(\"1\") + tax_rate))" in (
+            root / ORDER_PATH
+        ).read_text(encoding="utf-8")
+        assert len(provider.requests) == 6
+        assert len(resume_requests) == 3
+        assert input_driver.prompts.count("以上所有文件共用这一次审批；确认应用整批变更？[y/N] ") == 1
+        assert input_driver.prompts.count("确认启动这一次用户配置测试？[y/N] ") == 1
+        assert "模型请求次数上限" in json.dumps(resume_requests[0]["messages"], ensure_ascii=False)
+        assert "SHA256=" in json.dumps(resume_requests[0]["messages"], ensure_ascii=False)
+        assert "line_total" in json.dumps(resume_requests[0]["messages"], ensure_ascii=False)
+        print("预算续接：达到 3 次请求时保留已完成读取/搜索结果，末次变更调用未执行；用户另提新问题后获批修改并通过既有测试。")
+    finally:
+        temporary.cleanup()
+
+
+def _assert_tool_failure_summary_path() -> None:
+    rc, root, temporary, provider, outputs, _input_driver = _run_console_case(
+        scenario="tool-failure",
+        commands=["/项目说明", f"{TOOL_FAILURE_MARKER}：读取不存在的合成模块。", "/退出"],
+    )
+    try:
+        combined = "\n".join(outputs)
+        assert rc == 0
+        assert "缺失文件已成功读取，代码检查已完成" in combined
+        assert "读取文件 1 项本地执行失败" in combined
+        assert "模型答复不能将其视为已完成" in combined
+        assert not (root / "商城" / "不存在.py").exists()
+        assert "操作被工作区策略阻止" in json.dumps(provider.requests, ensure_ascii=False)
+        print("工具失败：即使合成模型误报成功，CLI 仍明确显示本地读取失败状态。")
+    finally:
+        temporary.cleanup()
+
+
+def _assert_context_budget_preflight_path() -> None:
+    long_prompt = f"{CONTEXT_FIRST_MARKER}：合成背景内容。" + "长中文上下文" * 1200
+    rc, _root, temporary, provider, outputs, _input_driver = _run_console_case(
+        scenario="context-budget",
+        commands=[
+            "/项目说明",
+            long_prompt,
+            "/预算 1024",
+            f"{CONTEXT_LIMIT_MARKER}：请继续修复未完成事项。",
+            "/退出",
+        ],
+    )
+    try:
+        combined = "\n".join(outputs)
+        sent_requests = json.dumps(provider.requests, ensure_ascii=False)
+        assert rc == 0
+        assert len(provider.requests) == 1, (len(provider.requests), combined[-3000:])
+        assert CONTEXT_LIMIT_MARKER not in sent_requests
+        assert "本地估算的上下文已接近预算阈值" in combined
+        assert "请求未发送" in combined and "原问题未保留" in combined
+        assert "请先用 /压缩" in combined and "之后重新输入" in combined
+        assert "重新输入问题" in combined
+        assert "模型请求失败" not in combined
+        print("上下文预检：超阈值问题未发送且未留在历史中；提示先审阅压缩/调预算，再重新输入。")
+    finally:
+        temporary.cleanup()
+
+
 def main() -> int:
     _assert_happy_path()
+    _assert_request_budget_resume_path()
     _assert_rejection_path()
+    _assert_tool_failure_summary_path()
     _assert_external_conflict_path()
     _assert_cancel_path()
+    _assert_context_budget_preflight_path()
     print("全部合成系统验收通过。仅使用临时项目、确定性 provider 和本地 unittest 进程；没有调用真实 API 或读取凭据。")
     return 0
 

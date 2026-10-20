@@ -799,6 +799,35 @@ def _plan_snapshot_text(snapshot: PlanSnapshot) -> str:
     return "\n".join(lines)
 
 
+def _local_tool_outcome_notice(outcomes: list[tuple[str, str | None]]) -> str | None:
+    labels = {
+        "read_file": "读取文件",
+        "list_directory": "列出目录",
+        "search_text": "工作区搜索",
+        "write_file": "写入文件",
+        "patch_file": "精确补丁",
+        "apply_change_set": "多文件变更集",
+        "run_test_profile": "用户测试",
+        "ask_user": "问卷",
+    }
+    states = {"tool_denied": "被拒绝、未执行", "tool_error": "本地执行失败"}
+    counts: dict[tuple[str, str], int] = {}
+    for event, tool in outcomes:
+        if event in states and tool is not None:
+            key = (labels.get(tool, "本地工具"), states[event])
+            counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return None
+    details = "、".join(
+        f"{label} {count} 项{state}"
+        for (label, state), count in sorted(counts.items())
+    )
+    return (
+        f"本地执行状态：{details}。这些具体调用没有成功完成；模型答复不能将其视为已完成。"
+        "请核对当前工作区或本地测试结果后，再决定是否用新问题继续。"
+    )
+
+
 def _plan_continue_command(snapshot: PlanSnapshot, index: int) -> str:
     progress = snapshot.progress
     if (
@@ -885,6 +914,7 @@ apply_change_set 仅用于用户要求的 2–5 个现有 UTF-8 文件精确修�
 工作区配置保存在 .harness/config/settings.json；优先级为默认值、工作区配置、环境变量、命令行。
 配置不接受或保存密钥；目前支持 mock、DeepSeek OpenAI 兼容模式，以及 DeepSeek 专用 Anthropic Messages 兼容入口。它不连接官方 Claude 账号或接受 Anthropic 密钥。
 OpenAI 与 DeepSeek Anthropic 兼容模式使用各自协议的有界 SSE；工具片段完整校验后仍走现有逐次审批循环。
+每次用户提问最多发送 1–4 次模型请求（默认 4），不会自动重试。若请求或输出预算耗尽时仍有工具调用，本轮会明确显示任务尚未确认完成且这些调用未执行；检查已完成操作后用新问题继续。上下文预算预检失败时会说明请求未发送，原问题需在压缩或调整阈值后重新输入。计划步骤须由你按完成条件检查并显式更新，不会自动标记完成。
 """
 
 
@@ -2570,7 +2600,8 @@ def run_console(
                     output(_safe_terminal_text(safe_answer))
                 output(
                     f"第 {index} 步保持 in-progress，等待你检查结果后执行 /计划 完成 {index}；"
-                    "模型输出和工具结果未保存。"
+                    "只有完成条件经你核实满足后才标记完成；未满足时可用 /计划 阻塞 <编号>，"
+                    "再用 /继续 <编号> 审阅后续工作。模型输出和工具结果未保存。"
                 )
             except PlanError as exc:
                 output(f"计划操作失败：{exc}")
@@ -3043,6 +3074,15 @@ def run_console(
             if sse_streaming and stream_state["visible"]:
                 _write_stream_text("\n", stream_write)
 
+        requests_before_ask = agent.usage.requests
+        tool_outcomes: list[tuple[str, str | None]] = []
+
+        def on_agent_progress(event: str, tool_name: str | None) -> None:
+            if event == "provider_request":
+                before_project_guidance_request()
+            elif event in {"tool_denied", "tool_error"}:
+                tool_outcomes.append((event, tool_name))
+
         try:
             answer = agent.ask(
                 prompt,
@@ -3051,11 +3091,7 @@ def run_console(
                 plan_only=mode == "计划",
                 cancellation_event=cancellation_event,
                 on_text_delta=on_text_delta if sse_streaming else None,
-                on_progress=(
-                    lambda event, _tool: before_project_guidance_request()
-                    if event == "provider_request"
-                    else None
-                ),
+                on_progress=on_agent_progress,
             )
         except ProjectGuidanceChanged:
             end_stream_line()
@@ -3067,22 +3103,51 @@ def run_console(
             continue
         except KeyboardInterrupt:
             end_stream_line()
-            output("\n已取消当前模型请求；不完整轮次不会写入会话存档。前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。")
+            output(
+                "\n已取消当前模型请求，任务未确认完成；不完整轮次不会写入会话存档。"
+                "前序已批准并完成的文件操作不会自动回滚。请检查工作区后再用新问题继续；需要时用 /撤销检查。"
+            )
+            notice = _local_tool_outcome_notice(tool_outcomes)
+            if notice:
+                output(notice)
             continue
         except ProviderStreamError as exc:
             end_stream_line()
             output(
-                f"模型流失败：{_safe_error_text(exc)}。未完成轮次不会写入会话；未完成的工具调用不会执行。"
-                "前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。"
+                f"本次提问未完成，模型流失败：{_safe_error_text(exc)}。"
+                "不完整轮次不会写入会话；未完成的工具调用不会执行。"
+                "前序已批准并完成的文件操作不会自动回滚。请检查工作区后用新问题继续；需要时用 /撤销检查。"
             )
+            notice = _local_tool_outcome_notice(tool_outcomes)
+            if notice:
+                output(notice)
             continue
         except ProviderError as exc:
             end_stream_line()
-            output(f"模型请求失败：{_safe_error_text(exc)}。前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。")
+            if agent.usage.requests == requests_before_ask:
+                output(
+                    f"本次提问未发送：{_safe_error_text(exc)}。原问题未保留；"
+                    "按提示调整后，请重新输入问题。"
+                )
+            else:
+                output(
+                    f"本次提问未完成，请求或响应处理失败：{_safe_error_text(exc)}。"
+                    "未完成的工具调用不会执行；前序已批准并完成的文件操作不会自动回滚。"
+                    "请检查工作区后用新问题继续；需要时用 /撤销检查。"
+                )
+            notice = _local_tool_outcome_notice(tool_outcomes)
+            if notice:
+                output(notice)
             continue
         except ProviderCancelled:
             end_stream_line()
-            output("已取消当前模型请求；不完整轮次不会写入会话存档。前序已批准并完成的文件操作不会自动回滚，可用 /撤销检查。")
+            output(
+                "已取消当前模型请求，任务未确认完成；不完整轮次不会写入会话存档。"
+                "前序已批准并完成的文件操作不会自动回滚。请检查工作区后再用新问题继续；需要时用 /撤销检查。"
+            )
+            notice = _local_tool_outcome_notice(tool_outcomes)
+            if notice:
+                output(notice)
             continue
         if sse_streaming and stream_state["received"]:
             tail = _safe_terminal_text(stream_redactor.finish())
@@ -3093,6 +3158,9 @@ def run_console(
         else:
             safe_answer = redact_likely_secrets(answer)[0]
             output(_safe_terminal_text(safe_answer))
+        notice = _local_tool_outcome_notice(tool_outcomes)
+        if notice:
+            output(notice)
 
 
 def main(argv: list[str] | None = None) -> int:

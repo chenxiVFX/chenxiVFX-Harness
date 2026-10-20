@@ -295,7 +295,8 @@ class Agent:
                         f"本次输入约 {estimated_input} tokens，阈值 {self.token_budget}，"
                         f"仅剩 {max(0, context_headroom)} tokens；至少需要保留 "
                         f"{MIN_CONTEXT_COMPLETION_HEADROOM} tokens 的生成空间，因此请求未发送。"
-                        "请先用 /压缩 [保留轮数] 预览并确认，之后重试；也可用 /预算 调整本地阈值。"
+                        "当前问题未保留；请先用 /压缩 [保留轮数] 预览并确认，之后重新输入。"
+                        "也可先用 /预算 调整本地阈值，再重新提交问题。"
                         "本地估算不是提供商的 tokenizer、上下文窗口或账户额度。"
                     )
                 request_max_tokens = min(request_max_tokens, context_headroom)
@@ -477,7 +478,7 @@ class Agent:
                     approval_state: dict[str, bool | None] = {"seen": False, "approved": None}
                     tool_not_executed = False
                     if reached_round_limit:
-                        result = "已达到工具轮数上限；该调用未执行。"
+                        result = "本次提问的模型请求次数已达上限；该工具调用未执行。"
                     elif reached_output_limit:
                         result = "已达到本次提问输出上限；该调用未执行。"
                     elif index >= MAX_TOOL_CALLS_PER_ROUND:
@@ -559,12 +560,20 @@ class Agent:
                     )
                 self._rebuild_messages()
                 if reached_round_limit or reached_output_limit:
+                    limits: list[str] = []
+                    if reached_round_limit:
+                        limits.append(f"模型请求次数上限（{self.max_provider_requests} 次）")
+                    if reached_output_limit:
+                        limits.append("模型输出预算上限")
+                    limit_text = "和".join(limits)
                     if reached_round_limit and reached_output_limit:
-                        answer = "已达到工具轮数上限和本次提问输出上限；本轮工具调用未执行。"
-                    elif reached_output_limit:
-                        answer = "已达到本次提问输出上限。本轮工具调用未执行。"
+                        answer = f"本次提问已达到{limit_text}；本轮工具调用均未执行。"
                     else:
-                        answer = "已达到工具轮数上限。本次未执行最后一轮工具调用。"
+                        answer = f"本次提问已达到{limit_text}；本轮工具调用均未执行。"
+                    answer += (
+                        "当前任务尚未确认完成。此前已完成的操作不会自动回滚，工具结果仍保留在当前会话上下文。"
+                        "请先检查工作区状态，再用新问题继续；本次不会自动重试或执行这些调用。"
+                    )
                     turn.messages.append({"role": "assistant", "content": answer})
                     if on_progress is not None:
                         on_progress("finished", None)
