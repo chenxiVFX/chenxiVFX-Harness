@@ -4122,10 +4122,10 @@ def build_tool_schemas(test_profile_ids: list[str] | tuple[str, ...] = ()) -> li
                 "function": {
                     "name": "run_test_profile",
                     "description": (
-                        "Run one exact user-owned Python test profile only when the user explicitly asks to run tests. "
-                        "The user configured and validated its external Python interpreter; never request or invent a path. "
+                        "Run one exact user-owned Python or fixed-command test profile only when the user explicitly asks to run tests. "
+                        "The user configured a Python interpreter and fixed framework or a direct executable and fixed arguments, plus the workspace cwd; never request or invent them. "
                         "The local harness asks for per-run approval and separately asks before sharing redacted output. "
-                        "This is not a shell and accepts no command, path, or arguments."
+                        "The model supplies only the profile ID; it cannot add or change the configured executable, arguments, or cwd."
                     ),
                     "parameters": {
                         "type": "object",

@@ -213,10 +213,11 @@ TUI 可在 /配置 编辑 中审阅设置有限的 F2–F8 中文命令快捷键
 需要修改文件时，核对目标路径和完整差异后再批准；TUI 默认拒绝，选“是”并按 Enter 才批准一次。
 若模型需先读取文件，读取也会单独审批。没有永久授权。
 
-项目测试只支持 unittest 和 pytest。运行 Harness 无需外部 Python；运行项目测试时用 /测试 添加 <ID>
-选择一个外部 python.exe，再用 /测试 运行 <ID>。不能选择本 Harness EXE。pytest 必须已在所选
-解释器中安装，Harness 不会安装 Python、pytest 或项目依赖。每次运行都要核对解释器、参数和工作目录
-并审批。测试代码以当前用户权限运行，不是 OS 沙箱，可访问该用户能访问的文件与网络；只运行你信任的项目测试。
+Python 测试支持 unittest 和 pytest；非 Python 项目可用 /测试 添加命令 <ID> 保存外部直接可执行文件、
+固定参数 JSON 数组和工作区相对工作目录（例如用户已安装的 node.exe 和 ["--test"]）。
+命令 profile 不运行 .cmd/.bat 或常见 shell，不安装 Node/npm/项目依赖。每次运行都显示完整可执行文件、
+argv 和工作目录并逐次审批。测试代码以当前用户权限运行，不是 OS 沙箱，可访问该用户能访问的文件与网络；
+只运行你信任的项目测试。不能选择本 Harness EXE。
 
 可用 /保存 首次试用 保存安全的普通对话，然后 /退出。会话是工作区 .harness/sessions/ 中未加密的
 JSON；不要存入敏感信息。提交项目之前，确认项目自身的 .gitignore 已忽略 .harness/。
@@ -490,7 +491,7 @@ def main() -> int:
             ):
                 _fail("打包 EXE 冷启动续跑没有将合成步骤设为进行中")
 
-        _record_stage("EXE 外部解释器合成 unittest/pytest profile 闭环")
+        _record_stage("EXE 外部 Python 与 Node 合成 profile 闭环")
         fixtures = repository_root / "tests" / "fixtures" / "test_profile_runner"
         with tempfile.TemporaryDirectory(prefix="cvfx test runner 中文 ") as temporary_workspace:
             workspace = Path(temporary_workspace) / "用户测试工作区 with spaces"
@@ -503,6 +504,10 @@ def main() -> int:
                 fixtures / "pytest", workspace / "pytest-tests",
                 ignore=shutil.ignore_patterns("__pycache__"),
             )
+            node_executable = shutil.which("node.exe")
+            if not node_executable:
+                _fail("CI 未提供 Node .exe，无法验证固定命令 profile")
+            shutil.copy2(fixtures / "node" / "smoke.test.cjs", workspace / "smoke.test.cjs")
             profile_input = "\n".join([
                 "/测试 添加 ci-unit",
                 "unittest",
@@ -517,6 +522,12 @@ def main() -> int:
                 "/测试 运行 ci-unit",
                 "是",
                 "/测试 运行 ci-pytest",
+                "是",
+                "/测试 添加命令 ci-node",
+                node_executable,
+                '["--test"]',
+                ".",
+                "/测试 运行 ci-node",
                 "是",
                 "/退出",
                 "",
@@ -534,10 +545,12 @@ def main() -> int:
         if (
             "合成测试通过" not in runner_result.stdout
             or "1 passed" not in runner_result.stdout
-            or runner_result.stdout.count("退出码为 0") < 2
+            or runner_result.stdout.count("退出码为 0") < 3
             or "pytest" not in runner_result.stdout
+            or "Node 固定命令 profile 合成测试通过" not in runner_result.stdout
+            or "固定命令可执行文件：" not in runner_result.stdout
         ):
-            _fail("打包 EXE 未用用户选择的外部解释器完成 unittest 与 pytest fixture")
+            _fail("打包 EXE 未完成外部 Python unittest/pytest 与 Node 固定命令 profile fixture")
 
         shutil.copy2(executable, output_dir / executable.name)
 
@@ -582,7 +595,7 @@ def main() -> int:
         f"首次 {values['help_first_ms']} ms；5 次中位数 {values['help_median_ms']} ms；"
         f"范围 {values['help_min_ms']}–{values['help_max_ms']} ms。"
     )
-    print("单文件 --help、UTF-8 Mock、中文路径、TUI、冷启动计划续跑上下文审阅和外部解释器 unittest/pytest profile 合成自检通过。")
+    print("单文件 --help、UTF-8 Mock、中文路径、TUI、冷启动计划续跑上下文审阅，以及外部 Python unittest/pytest 与 Node 固定命令 profile 合成自检通过。")
     return 0
 
 

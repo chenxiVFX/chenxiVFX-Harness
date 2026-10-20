@@ -48,16 +48,24 @@ if (-not (Test-Path -LiteralPath $workspace -PathType Container)) { throw '工�
 
 输入一个范围清楚的小修改请求，并使用工作区相对路径说明目标。如果模型需要先读取文件，会单独显示读取审批；写入前会显示目标与完整差异。仔细核对后再批准：TUI 默认拒绝，选择“是”并按 Enter；纯文本模式输入 `y`、`yes` 或 `是`。每次写入都单独审批，没有永久授权。
 
-## 为 Python 项目配置并运行测试
+## 为项目配置并运行测试
 
-项目测试仅支持 `unittest` 和 `pytest`。运行 Harness 本身不需要系统 Python；运行项目测试时才需要用户单独选择一个现存的外部 `python.exe`，不能选 Harness 自己的 `cvfx-harness.exe`。例如：
+Python 项目可使用 `unittest`/`pytest` profile；其他项目可用固定命令 profile，例如 Node 内置测试 runner。Harness 自身不需要系统 Python；运行 Python 测试时要选择独立外部 `python.exe`，不能选 `cvfx-harness.exe`。Node 例子：
 
 ```text
-/测试 添加 smoke
-/测试 运行 smoke
+/测试 添加命令 node-tests
+/测试 列表
+/测试 运行 node-tests
 ```
 
-按提示选择框架、外部 Python、工作目录和测试目标。用 `pytest` 时，必须已在所选解释器中安装 pytest；Harness 不会安装 Python、pytest 或项目依赖。每次运行前先核对显示的解释器、参数和工作目录再批准。测试代码以当前用户权限运行，**不是 OS 沙箱**，可能访问该用户可访问的文件与网络；只运行你信任的项目测试。若需要把测试输出发给模型，还会另行询问。
+Node profile 不使用 npm 或安装项目依赖；项目需已有可被 `node --test` 发现的测试文件。也可配置 Python profile：
+
+```text
+/测试 添加 python-smoke
+/测试 运行 python-smoke
+```
+
+Python 命令按提示选择框架、外部 Python、工作目录和测试目标。用 `pytest` 时，必须已在所选解释器中安装 pytest；Harness 不会安装 Python、pytest、Node 或项目依赖。固定命令 profile 必须使用直接可执行文件、JSON 参数数组和工作区相对目录；不接受 `.cmd`/`.bat` 或常见 shell，模型不能修改这些配置。每次运行前核对完整可执行文件、argv、工作目录、时限和输出上限并批准。测试代码以当前用户权限运行，**不是 OS 沙箱**，可能访问该用户可访问的其他文件与网络；工作目录不是隔离边界，只运行你信任的项目测试。若需要把测试输出发给模型，还会另行询问。
 
 ## 保存并退出
 

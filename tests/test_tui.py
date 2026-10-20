@@ -624,6 +624,7 @@ class PromptToolkitTests(unittest.TestCase):
             workspace = Workspace(project)
             store = TestProfileStore(workspace)
             store.add("unit-main", "unittest", sys.executable, ".", "tests")
+            store.add_command("command-main", sys.executable, '["--version"]', ".")
             config_path = project / ".harness" / "config" / "test_profiles.json"
             payload = json.loads(config_path.read_text(encoding="utf-8"))
             payload["profiles"].append(
@@ -642,10 +643,18 @@ class PromptToolkitTests(unittest.TestCase):
             )
             after = config_path.read_bytes()
 
-        self.assertEqual([item.text for item in runnable], ["unit-main"])
-        self.assertEqual(runnable[0].display_meta_text, "unittest，可运行")
-        self.assertEqual([item.text for item in removable], ["legacy-unit", "unit-main"])
-        self.assertEqual(removable[0].display_meta_text, "旧配置，需重新添加解释器")
+        self.assertEqual([item.text for item in runnable], ["command-main", "unit-main"])
+        self.assertEqual(runnable[0].display_meta_text, "固定命令，可运行")
+        self.assertEqual(runnable[1].display_meta_text, "unittest，可运行")
+        self.assertEqual([item.text for item in removable], ["command-main", "legacy-unit", "unit-main"])
+        self.assertEqual(
+            next(item for item in removable if item.text == "command-main").display_meta_text,
+            "固定命令",
+        )
+        self.assertEqual(
+            next(item for item in removable if item.text == "legacy-unit").display_meta_text,
+            "旧配置，需重新添加解释器",
+        )
         self.assertEqual(before, after)
 
     def test_workspace_reference_completer_handles_braces_paths_and_filters(self) -> None:

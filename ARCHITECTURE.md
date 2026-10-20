@@ -2,7 +2,7 @@
 
 ## 运行边界
 
-项目使用 Python 3.11+ 标准库，提供 Windows PowerShell 启动脚本。默认 Mock provider；Mock 不查询 DeepSeek 密钥变量。工作区非敏感设置位于 `.harness/config/settings.json`，按默认值、工作区配置、环境变量、CLI 参数的顺序覆盖。远端 HTTP 只会在用户显式选择 DeepSeek OpenAI 兼容 provider 并提供凭据时调用；本机 loopback HTTP 可用无凭据 fixture 验证协议。没有 shell 工具、任意模型代码执行、自动文件写权限或常驻后台服务。唯一的代码运行入口是用户明确配置并逐次批准的固定 Python 测试 profile；它以当前用户权限运行，不是沙箱。
+项目使用 Python 3.11+ 标准库，提供 Windows PowerShell 启动脚本。默认 Mock provider；Mock 不查询 DeepSeek 密钥变量。工作区非敏感设置位于 `.harness/config/settings.json`，按默认值、工作区配置、环境变量、CLI 参数的顺序覆盖。远端 HTTP 只会在用户显式选择 DeepSeek OpenAI 兼容 provider 并提供凭据时调用；本机 loopback HTTP 可用无凭据 fixture 验证协议。没有模型控制的 shell/任意命令工具、任意模型代码执行、自动文件写权限或常驻后台服务。代码运行入口仅为用户预先配置并逐次批准的 Python 测试或固定可执行文件 profile；它们以当前用户权限运行，不是沙箱。
 
 工作区仅在启动时通过 `--workspace <目录>` 选择，必须是已有目录，根目录本身不能是 symlink/junction；不自动创建目录、扫描主目录或记录路径历史。`Workspace` 固定根目录身份，后续文件操作在根路径被替换时停止。普通 CLI 和 TUI 共用同一启动参数与命令循环；进程中不提供换根操作。`/状态` 显示完整路径与审批边界。结束进程再以另一目录启动会建立隔离会话：目标、消息、项目说明、文件引用、审批、候选计划和子代理状态留在原进程；会话不自动恢复，计划/配置/变更记录按工作区分别保存，所选工作区自己的计划也不会自动执行。
 
@@ -20,7 +20,7 @@ CLI：中文命令、文件引用/项目说明、权限确认、压缩预览和�
       ├── CompressionPreview：本地确定性摘录、摘要预览和确认后替换
       ├── PlanStore：有界结构化步骤；接受后保存，恢复不自动执行
       ├── SubagentManager：逐项授权、最多 2 并发的只读子代理
-      └── TestProfileStore / ProcessRunner：用户维护的 ID-only Python profile；运行前审批与独立输出分享审批
+      └── TestProfileStore / ProcessRunner：用户维护的 ID-only Python/固定命令 profile；运行前审批与独立输出分享审批
 ```
 
 ## 对话与稳定前缀
@@ -29,7 +29,7 @@ Agent 的 system message 在每个请求、恢复和压缩后保持固定文本�
 
 `ask_user` 是当前 Agent 的结构化澄清工具，可请求 1–3 个短问题、每题最多 4 个建议。schema、重复 ID、文本控制字符、字节/字符上限和疑似凭据在展示前校验；界面回调发生在一次 Provider 请求结束后，因此本地等待不占用该次网络请求时限。TUI 独立显示问题草稿，建议只填值，多行 Enter 不提交；审阅后显式提交才形成工具结果。默认仅本次使用；在当前会话上下文仍可安全存档时，提交前用户可明确允许普通问答随之后的 `/保存` 写入工作区会话。若历史含未存档回答、文件引用、敏感内容或工具结果，界面会禁用问卷存档选择，防止把受先前私有上下文影响的问题和回答写入会话。Esc 返回空的 `cancelled` 结果，Ctrl+C 抛出当前模型轮次取消并恢复普通输入。答案作为不可信工具结果追加在当前轮，仅可被后续模型请求消费；问卷草稿和回答不出现在 TUI transcript/history/clipboard。仅本次回答及其影响的后续上下文不会存档，CLI 会显示省略状态；有明确保存同意的回答可按不可信上下文保存，永不恢复成工具调用或授权。答案本身不会触发审批或扩大任何能力。计划模式仍提供该澄清工具；子代理仅获 read/list 工具，遇到 ask_user 会以明确失败状态要求主会话补充信息。
 
-计划生成使用独立 `Agent.propose_plan` 请求，不携带对话历史、普通文件引用或工具 schema；用户已明确确认的根目录项目说明可作为单独标记的不可信背景随请求发送。本地输出预算限制为一个模型请求。模型必须返回严格 JSON，解析器校验唯一键、字段、大小、步骤数、字符、疑似凭据和工具枚举。候选保留在进程内，只有用户接受才由 `PlanStore` 原子保存；拒绝不写存档，修订仅修改内存候选。存档 v3 保留步骤说明、完成条件、建议工具、状态和固定执行里程碑；v1/v2 兼容读取。旧版未完成步骤不带阶段记录，迁移时逐项列为待核验，完成逐项核验前不能启动 Agent。步骤执行时只将当前步骤交给新 Agent，最多 2 次请求/512 输出 tokens；当前进程内的已确认项目说明也可随请求发送。建议工具不限制或预授权运行能力，实际工具仍走原有逐次审批，且没有 shell、任意代码或删除工具。
+计划生成使用独立 `Agent.propose_plan` 请求，不携带对话历史、普通文件引用或工具 schema；用户已明确确认的根目录项目说明可作为单独标记的不可信背景随请求发送。本地输出预算限制为一个模型请求。模型必须返回严格 JSON，解析器校验唯一键、字段、大小、步骤数、字符、疑似凭据和工具枚举。候选保留在进程内，只有用户接受才由 `PlanStore` 原子保存；拒绝不写存档，修订仅修改内存候选。存档 v3 保留步骤说明、完成条件、建议工具、状态和固定执行里程碑；v1/v2 兼容读取。旧版未完成步骤不带阶段记录，迁移时逐项列为待核验，完成逐项核验前不能启动 Agent。步骤执行时只将当前步骤交给新 Agent，最多 2 次请求/512 输出 tokens；当前进程内的已确认项目说明也可随请求发送。建议工具不限制或预授权运行能力，实际工具仍走原有逐次审批；没有模型提供的 shell/任意代码或删除工具，测试只能选择用户已配置 profile ID 并逐次审批。
 
 每次提问的输出预算默认为 2048 tokens，跨模型请求累计；默认最多 4 次请求。每次请求的 `max_tokens` 按剩余预算和剩余请求数分配，并从总预算中预留完整额度，使发送的单次上限之和不超过总预算。Provider usage 用于统计和检查单次上限；缺少 usage 时，字符估算只用于发现明显超限响应，不承担精确计量。超预算、取消、provider 错误或格式错误会清除当前未完成对话轮次，避免把断开的工具交换带到下一次请求。已经由用户批准并完成的文件操作不会因后续请求取消或失败自动回滚；CLI 会提示用户用 `/撤销` 检查写入。该估算不是 tokenizer，因此不能保证与远端计量完全一致。
 
@@ -98,12 +98,12 @@ DeepSeek [KV 缓存文档](https://api-docs.deepseek.com/guides/kv_cache/)说明
 - 新备份额外保存权限语义摘要，用于在 Harness 自身写入/撤销导致 Windows 重算 ACL 元数据后核对同一权限版本，避免连续撤销被误判为外部权限更改。原始 DACL 摘要仍保留，单次审批与最终替换仍逐次检查原始快照。旧备份缺少语义摘要时继续保守使用原始摘要；无法核验的新 Windows 备份在撤销时拒绝执行。
 - 写入只支持工作区内≤64 KiB 的 UTF-8 文本，拒绝 NUL/控制字符、二进制、链接路径和敏感路径；没有模型删除工具。多个模型写调用各自询问，不批量批准。撤销仍预览并再次确认，计划模式的工具层继续拒绝写入。
 - `.harness/backups`、`.harness/change-sets` 与 `.harness/sessions` 是 Harness 私有状态，不能通过模型工具访问。
-- 用户测试 profile 放在 `.harness/config/test_profiles.json`，模型文件工具不能读取或修改。profile 只保存用户独立选择并校验的外部 Python 绝对路径、ID、`unittest`/`pytest` 框架和工作区相对 cwd/target；命令固定为 `<python> -m unittest discover -s <target>` 或 `<python> -m pytest -q <target>`，`shell=False`，不接受模型 argv、脚本、解释器路径、环境变量或工作目录。冻结 EXE 的 `sys.executable` 是 Harness 本身，因此测试执行明确使用外部解释器；没有配置解释器的旧 profile 保持禁用。
-- 每次测试都显示确切解释器、argv、cwd、120 秒总限时和 32 KiB 合并 stdout/stderr 上限，并要求用户逐次批准。输出在本地脱敏、转义控制字符后展示；分享最多 16 KiB 输出另需用户批准，拒绝时只回传状态和退出码。一次用户提问最多启动一次测试，没有持久授权或自动重试。
+- 用户测试 profile 放在 `.harness/config/test_profiles.json`，模型文件工具不能读取或修改。Python profile 固定为用户选择并校验的外部 Python 绝对路径、`unittest`/`pytest` 框架和工作区相对 cwd/target；运行参数固定为 `<python> -m unittest discover -s <target>` 或 `<python> -m pytest -q <target>`。命令 profile 只接受用户保存的外部绝对可执行文件、最多 64 个固定 JSON argv 字符串和工作区相对 cwd；Windows 只接受 `.exe`，拒绝 `.cmd`/`.bat` 与常见命令解释器。两类 profile 均用 `shell=False`；模型只选择可运行 ID，不能读取/改写配置或提供可执行文件、argv、环境变量和工作目录。配置格式 v3 仍兼容读取 Python v1/v2；旧 Python profile 未选择解释器时保持禁用。冻结 EXE 的 `sys.executable` 是 Harness 本身，不能作为所选 Python 或运行可执行文件。
+- 每次运行都显示确切可执行文件、完整 argv、cwd、120 秒总限时、32 KiB 合并 stdout/stderr 上限和当前用户权限风险，并要求逐次批准。输出在本地脱敏、转义控制字符后展示；分享最多 16 KiB 输出另需用户批准，拒绝时只回传状态和退出码。一次用户提问最多启动一次测试，没有持久授权或自动重试。
 - 测试代码以当前用户 OS 权限运行，不是沙箱；网络访问没有被屏蔽，测试代码可访问用户权限范围内的其他文件和资源。子进程不会继承凭据或其他运行时环境变量；Windows 仅传递系统路径和临时目录。Linux 用 `start_new_session=True` 和进程组终止普通子进程，恶意/自行 `setsid` 脱离的后代不保证受控；Windows 使用 `CREATE_SUSPENDED`，先将进程放入不允许 breakaway 的 kill-on-close Job Object，再恢复主线程，启动失败时在用户代码运行前终止。Windows 合成测试会从被运行的 fixture 中验证 Job Object 成员关系。
 - `.harness/config/settings.json` 只存 provider/model/Base URL/预算等非敏感设置，拒绝重复键、未识别字段和疑似凭据，不包含 API Key；支持 Mock、DeepSeek OpenAI 兼容和 DeepSeek Anthropic 兼容模式。`--ignore-config` 只跳过此文件以便修复损坏配置。
 - 目录 symlink 与硬链接逃逸通过实际链接 fixture 集成测试覆盖；junction 仅适用于 Windows。当前 Linux/Windows 与 Python 3.11/3.12 跨平台 CI 矩阵全部通过；若 Windows 系统拒绝创建测试 fixture，对应 Windows 用例会明确跳过。
-- 普通 Python 进程不能提供 OS 级沙箱。若未来加入 shell，须先设计并实测工作区隔离，不能把路径检查误称为进程沙箱。
+- 固定命令 profile 不是 OS 沙箱：工作目录只设置子进程 cwd，不能限制进程访问当前用户的其他文件、网络或资源。项目代码以当前用户权限执行；不会自动安装 Node/npm/项目依赖。PowerShell、cmd、`.cmd` 与 `.bat` shell 工具仍未实现。
 - 子代理通过 CLI 明确创建；每项任务启动前都展示任务文本和只读路径并单独审批。Mock 与两种 DeepSeek provider 都使用同一 `complete_subagent` 受限入口；子代理只发送独立的子任务消息和该任务授权范围内返回的读取结果，不复制父上下文。Provider 认证仍只走既有 HTTPS Authorization 或 `x-api-key` header。
 - 默认不提供文件工具。提交时可预授权最多 4 个现存工作区相对路径：文件对应 `read_file`，目录对应 `list_directory`；调用前再次通过 `Workspace` 校验，路径必须与授权路径完全匹配。工具 schema 过滤掉 `write_file` 和 `patch_file`，首轮最多 2 个只读调用，第二轮只用于最终答复；没有 shell、递归委派或任意代码入口。子代理只执行最多 2 轮模型请求，深度为 0。
 - 每会话最多 3 项，最多 2 项并发；单项任务最多 240 字符，单请求估算输入最多 512 tokens，全会话最多 3072 估算输入 tokens，每项输出最多 256 tokens，全会话保留输出上限最多 768 tokens。子代理总运行时限默认 60 秒，可设为 5–120 秒，从该任务首个 provider 请求开始；逐项审批和执行前排队不计入。OpenAI 每次 SSE 请求默认受 45 秒总时限限制，可配置为 5–120 秒；时限从建连开始，响应读取期间每 250 ms 检查取消。任务总体 deadline 跨模型/工具轮次共享，每任务最多 2 轮。超时、取消、失败、拒绝和预算耗尽为不同终态。

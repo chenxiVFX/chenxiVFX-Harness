@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -15,7 +16,7 @@ from cvfx_harness.profiles import TestProfileError, TestProfileStore
 from cvfx_harness.providers import MockProvider
 from cvfx_harness.test_runner import TestRunResult
 from cvfx_harness.tui import CommandCompleter
-from cvfx_harness.tools import ToolCall, Workspace, WorkspaceError, run_tool
+from cvfx_harness.tools import ToolCall, Workspace, WorkspaceError, build_tool_schemas, run_tool
 
 
 class TestProfileStoreTests(unittest.TestCase):
@@ -83,7 +84,7 @@ class TestProfileStoreTests(unittest.TestCase):
                     Document("/测试 添"), CompleteEvent()
                 )
             ]
-            self.assertEqual(suggestions, ["添加"])
+            self.assertEqual(suggestions, ["添加", "添加命令"])
 
             payload["profiles"][0]["argv"] = ["-c", "synthetic arbitrary code"]
             config_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -113,6 +114,38 @@ class TestProfileStoreTests(unittest.TestCase):
                 store.get("old")
             replaced = store.add("old", "unittest", sys.executable, ".", "tests")
             self.assertEqual(store.get("old"), replaced)
+
+    def test_version_two_python_profiles_survive_command_profile_migration(self) -> None:
+        with self._synthetic_project() as root:
+            project = Path(root)
+            (project / "tests").mkdir()
+            store = TestProfileStore(Workspace(project))
+            config_path = project / ".harness" / "config" / "test_profiles.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                json.dumps({
+                    "version": 2,
+                    "profiles": [{
+                        "id": "python-old",
+                        "framework": "unittest",
+                        "cwd": ".",
+                        "target": "tests",
+                        "python": os.path.abspath(sys.executable),
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            original = store.get("python-old")
+            command = store.add_command("direct", sys.executable, '["--version"]', ".")
+            migrated = json.loads(config_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(migrated["version"], 3)
+            self.assertEqual(store.get("python-old"), original)
+            self.assertEqual(store.get("direct"), command)
+            self.assertEqual(
+                [item["id"] for item in migrated["profiles"]],
+                ["python-old", "direct"],
+            )
 
     def test_stale_interpreter_is_not_offered_and_user_can_remove_profile(self) -> None:
         with self._synthetic_project() as root:
@@ -315,6 +348,111 @@ class TestProfileStoreTests(unittest.TestCase):
         execute.assert_called_once()
         self.assertTrue(any("/测试 运行 unit-suite 重新开始" in line for line in outputs))
         self.assertTrue(any("不会自动重试" in line for line in outputs))
+
+    def test_node_command_profile_is_fixed_user_owned_and_runs_after_approval(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node is installed by CI; local host has no Node executable")
+        with self._synthetic_project() as root:
+            project = Path(root)
+            shutil.copy2(
+                Path(__file__).parent / "fixtures" / "test_profile_runner" / "node" / "smoke.test.cjs",
+                project / "smoke.test.cjs",
+            )
+            outputs: list[str] = []
+            inputs = iter([
+                "/测试 添加命令 node-smoke",
+                node,
+                '["--test"]',
+                ".",
+                "/测试 列表",
+                "/测试 运行 node-smoke",
+                "是",
+                "/退出",
+            ])
+            args = build_parser().parse_args(
+                ["--workspace", str(project), "--provider", "mock"]
+            )
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()):
+                result = run_console(
+                    args,
+                    input_fn=lambda _prompt: next(inputs),
+                    output=outputs.append,
+                )
+
+            store = TestProfileStore(Workspace(project))
+            profile = store.get("NODE-SMOKE")
+            config_path = project / ".harness" / "config" / "test_profiles.json"
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(result, 0)
+            self.assertEqual(profile.kind, "command")
+            self.assertEqual(profile.args, ("--test",))
+            self.assertEqual(store.runnable(), [profile])
+            self.assertEqual(payload["version"], 3)
+            self.assertEqual(
+                payload["profiles"][0],
+                {
+                    "id": "node-smoke",
+                    "kind": "command",
+                    "executable": os.path.abspath(node),
+                    "args": ["--test"],
+                    "cwd": ".",
+                },
+            )
+            self.assertTrue(any("只保存配置，不会运行" in line for line in outputs))
+            self.assertTrue(any("固定命令" in line and "node-smoke" in line for line in outputs))
+            self.assertTrue(any("固定命令可执行文件：" in line for line in outputs))
+            self.assertTrue(any('"--test"' in line for line in outputs))
+            self.assertTrue(any("工作目录" in line for line in outputs))
+            self.assertTrue(any("shell=False" in line for line in outputs))
+            self.assertTrue(any("不是沙箱" in line for line in outputs))
+            self.assertTrue(any("120 秒" in line for line in outputs))
+            self.assertTrue(any("32768 bytes" in line for line in outputs))
+            self.assertTrue(any("中文合成 Node 测试" in line for line in outputs))
+            self.assertTrue(any("Node 固定命令 profile 合成测试通过" in line for line in outputs))
+            self.assertTrue(any("1..1" in line or "tests 1" in line for line in outputs))
+
+    def test_command_profile_rejects_shells_bad_json_and_model_supplied_fields(self) -> None:
+        executable = shutil.which("node")
+        if executable is None:
+            self.skipTest("Node is installed by CI; local host has no Node executable")
+        with self._synthetic_project() as root:
+            project = Path(root)
+            workspace = Workspace(project)
+            store = TestProfileStore(workspace)
+            shell = shutil.which("cmd.exe") or shutil.which("sh") or shutil.which("bash")
+            if shell is not None:
+                with self.assertRaisesRegex(TestProfileError, "shell 或命令解释器"):
+                    store.add_command("shell", shell, '["-c", "echo unsafe"]', ".")
+            with self.assertRaisesRegex(TestProfileError, "合法 JSON"):
+                store.add_command("bad-json", executable, "--test", ".")
+            profile = store.add_command("fixed", executable, '["--test"]', ".")
+            runner_schema = next(
+                item for item in build_tool_schemas([profile.profile_id])
+                if item["function"]["name"] == "run_test_profile"
+            )
+            self.assertEqual(
+                runner_schema["function"]["parameters"]["properties"]["profile_id"]["enum"],
+                [profile.profile_id],
+            )
+            self.assertEqual(
+                set(runner_schema["function"]["parameters"]["properties"]),
+                {"profile_id"},
+            )
+            approvals: list[object] = []
+            with self.assertRaisesRegex(WorkspaceError, "缺失或包含未授权字段"):
+                run_tool(
+                    workspace,
+                    ToolCall(
+                        "invalid-command-args",
+                        "run_test_profile",
+                        {"profile_id": profile.profile_id, "args": ["--eval"]},
+                    ),
+                    approve_action=lambda request: approvals.append(request) or True,
+                    test_profile_store=store,
+                )
+            self.assertEqual(approvals, [])
 
 
 if __name__ == "__main__":

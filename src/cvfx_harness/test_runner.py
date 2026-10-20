@@ -103,6 +103,15 @@ def _test_environment() -> dict[str, str]:
 
 def _command_for(profile: TestProfile, workspace: Workspace) -> tuple[list[str], Path]:
     workspace.resolve_directory(".")
+    if profile.kind == "command":
+        executable = TestProfileStore._validate_command_executable(
+            profile.executable, require_file=True
+        )
+        args = TestProfileStore._validate_command_args(list(profile.args))
+        cwd = workspace.resolve_directory(profile.cwd)
+        return [executable, *args], cwd
+    if profile.kind != "python":
+        raise TestProfileError("测试配置类型无效；未启动测试进程。")
     if not profile.python:
         raise TestProfileError("测试配置尚未选择外部 Python 解释器。")
     interpreter = TestProfileStore._validate_interpreter_path(
@@ -565,14 +574,15 @@ def run_test_profile_tool(
         )
     except WorkspaceError:
         return "测试配置路径不可用；未启动测试进程。可用 /测试 列表检查配置，或重新添加配置。"
+    executable_label = "Python 解释器" if profile.kind == "python" else "固定命令可执行文件"
     preview = (
         f"用户配置 ID：{profile.profile_id}\n"
-        f"Python 解释器：{argv[0]}\n"
+        f"{executable_label}：{argv[0]}\n"
         f"argv：{json.dumps(argv, ensure_ascii=False)}\n"
         f"工作目录：{cwd}\n"
         f"运行时限：{MAX_TEST_RUNTIME_SECONDS:g} 秒\n"
         f"合并标准输出/错误上限：{MAX_TEST_OUTPUT_BYTES} bytes\n"
-        "使用 shell=False；不执行模型提供的命令或代码。\n"
+        "使用 shell=False；只运行用户保存的固定参数，不接受模型提供的命令或参数。\n"
         "测试代码以当前用户权限运行，不是沙箱；网络访问没有被屏蔽，"
         "不会继承凭据或其他运行时环境变量；Windows 仅传递系统路径和临时目录。\n"
         "每次执行均需单独批准；本次提问最多启动一个测试进程。"

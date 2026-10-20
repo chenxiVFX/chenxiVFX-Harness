@@ -5,6 +5,7 @@ import os
 import re
 import stat
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -12,13 +13,26 @@ from typing import Any
 from .sessions import contains_likely_secret
 from .tools import Workspace, WorkspaceError
 
-TEST_PROFILE_VERSION = 2
+TEST_PROFILE_VERSION = 3
 MAX_TEST_PROFILES = 20
 MAX_TEST_PROFILE_BYTES = 32 * 1024
 _PROFILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$")
 _PYTHON_EXECUTABLE_NAME = re.compile(r"^(?:python(?:3(?:\.\d+)?)?|pypy3(?:\.\d+)?)$")
 _PROFILE_FIELDS_V1 = {"id", "framework", "cwd", "target"}
 _PROFILE_FIELDS = {*_PROFILE_FIELDS_V1, "python"}
+_COMMAND_PROFILE_FIELDS = {"id", "kind", "executable", "args", "cwd"}
+_SHELL_EXECUTABLES = {
+    "ash", "bash", "busybox", "cmd", "csh", "dash", "fish", "ksh", "powershell",
+    "pwsh", "sh", "tcsh", "wscript", "cscript", "zsh",
+}
+
+
+def _has_unsafe_text_character(value: str) -> bool:
+    return any(
+        unicodedata.category(char).startswith("C")
+        or unicodedata.category(char) in {"Zl", "Zp"}
+        for char in value
+    )
 
 
 class TestProfileError(RuntimeError):
@@ -30,14 +44,17 @@ class TestProfile:
     __test__ = False
 
     profile_id: str
-    framework: str
+    framework: str | None
     cwd: str
-    target: str
+    target: str | None
     python: str | None
+    kind: str = "python"
+    executable: str | None = None
+    args: tuple[str, ...] = ()
 
 
 class TestProfileStore:
-    """User-managed Python test profiles; model tools cannot access this file."""
+    """User-managed test profiles; model tools can select IDs but cannot read config."""
 
     __test__ = False
 
@@ -92,7 +109,7 @@ class TestProfileStore:
             or not value
             or len(value) > 4096
             or "\x00" in value
-            or any(ord(char) < 32 for char in value)
+            or _has_unsafe_text_character(value)
             or contains_likely_secret(value)
             or not Path(value).is_absolute()
             or (os.name == "nt" and Path(value).suffix.casefold() != ".exe")
@@ -131,12 +148,116 @@ class TestProfileStore:
         except (OSError, RuntimeError, UnicodeError, WorkspaceError):
             raise TestProfileError("Python 解释器不可用；请选择现存的外部 Python 可执行文件。") from None
 
-    def _validate_profile(self, value: Any, *, require_interpreter: bool = False) -> TestProfile:
-        if not isinstance(value, dict) or not (
-            set(value) == _PROFILE_FIELDS or set(value) == _PROFILE_FIELDS_V1
+    @staticmethod
+    def _validate_command_executable(value: Any, *, require_file: bool) -> str:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 4096
+            or "\x00" in value
+            or _has_unsafe_text_character(value)
+            or contains_likely_secret(value)
+            or not Path(value).is_absolute()
+            or (os.name == "nt" and Path(value).suffix.casefold() != ".exe")
         ):
-            raise TestProfileError("测试配置结构无效；仅支持用户定义的固定 Python 测试配置。")
+            raise TestProfileError("命令可执行文件必须是无凭据的绝对可执行文件路径；Windows 仅支持 .exe。")
+        executable_name = Path(value).stem if os.name == "nt" else Path(value).name
+        if executable_name.casefold() in _SHELL_EXECUTABLES:
+            raise TestProfileError("命令 profile 不接受 shell 或命令解释器；请选择直接可执行文件。")
+        if not require_file:
+            return value
+        try:
+            resolved = Path(value).resolve(strict=True)
+            info = resolved.stat()
+            usable = stat.S_ISREG(info.st_mode) and not Workspace._is_reparse_point(resolved)
+            if os.name == "nt":
+                usable = usable and os.access(resolved, os.R_OK)
+            else:
+                usable = usable and os.access(resolved, os.X_OK)
+            if not usable:
+                raise OSError("not an executable regular file")
+            if getattr(sys, "frozen", False):
+                try:
+                    harness_executable = Path(sys.executable).resolve(strict=True)
+                except (OSError, RuntimeError):
+                    harness_executable = None
+                if harness_executable == resolved:
+                    raise TestProfileError("该路径是 Harness 自身；请另选外部项目工具。")
+            return os.path.abspath(os.path.normpath(value))
+        except TestProfileError:
+            raise
+        except (OSError, RuntimeError, UnicodeError, WorkspaceError):
+            raise TestProfileError("命令可执行文件不可用；请选择现存的外部可执行文件。") from None
+
+    def _validate_cwd(self, value: Any) -> str:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 4096
+            or "\x00" in value
+            or _has_unsafe_text_character(value)
+            or contains_likely_secret(value)
+            or Path(value).is_absolute()
+            or PureWindowsPath(value).is_absolute()
+            or PureWindowsPath(value).drive
+            or ":" in value
+            or ".." in re.split(r"[\\/]+", value)
+        ):
+            raise TestProfileError("工作目录必须是无控制字符、无凭据的工作区相对路径。")
+        try:
+            cwd_path = self.workspace.resolve_directory(value)
+            return cwd_path.relative_to(self.workspace.root).as_posix() or "."
+        except (OSError, WorkspaceError):
+            raise TestProfileError("测试工作目录不可用；只允许工作区内的现存目录。") from None
+
+    @staticmethod
+    def _validate_command_args(value: Any) -> tuple[str, ...]:
+        if not isinstance(value, list) or len(value) > 64:
+            raise TestProfileError("固定参数必须是最多 64 项的 JSON 字符串数组。")
+        if any(
+            not isinstance(item, str)
+            or len(item) > 4096
+            or "\x00" in item
+            or _has_unsafe_text_character(item)
+            or contains_likely_secret(item)
+            for item in value
+        ):
+            raise TestProfileError("固定参数必须是无控制字符、无明显凭据的 JSON 字符串数组。")
+        if sum(len(item.encode("utf-8")) for item in value) > 16 * 1024:
+            raise TestProfileError("固定参数总长度超过 16 KiB。")
+        return tuple(value)
+
+    def _validate_profile(
+        self,
+        value: Any,
+        *,
+        require_interpreter: bool = False,
+        require_executable: bool = False,
+        allow_command: bool = True,
+    ) -> TestProfile:
+        if not isinstance(value, dict):
+            raise TestProfileError("测试配置结构无效；没有使用其中的配置。")
         profile_id = self.validate_id(value.get("id"))
+        if set(value) == _COMMAND_PROFILE_FIELDS and value.get("kind") == "command":
+            if not allow_command:
+                raise TestProfileError("该测试配置版本不支持命令 profile。")
+            executable = self._validate_command_executable(
+                value.get("executable"), require_file=require_executable
+            )
+            cwd = self._validate_cwd(value.get("cwd"))
+            args = self._validate_command_args(value.get("args"))
+            return TestProfile(
+                profile_id=profile_id,
+                framework=None,
+                cwd=cwd,
+                target=None,
+                python=None,
+                kind="command",
+                executable=executable,
+                args=args,
+            )
+        if set(value) != _PROFILE_FIELDS and set(value) != _PROFILE_FIELDS_V1:
+            raise TestProfileError("测试配置结构无效；只允许固定 Python 或命令 profile。")
         framework = value.get("framework")
         if not isinstance(framework, str) or framework not in {"unittest", "pytest"}:
             raise TestProfileError("测试框架只允许 unittest 或 pytest。")
@@ -193,6 +314,7 @@ class TestProfileStore:
             cwd=cwd_path.relative_to(self.workspace.root).as_posix() or ".",
             target=target_path.relative_to(self.workspace.root).as_posix() or ".",
             python=interpreter,
+            kind="python",
         )
 
     def load(self) -> list[TestProfile]:
@@ -215,12 +337,15 @@ class TestProfileStore:
             not isinstance(payload, dict)
             or set(payload) != {"version", "profiles"}
             or type(payload.get("version")) is not int
-            or payload.get("version") not in {1, TEST_PROFILE_VERSION}
+            or payload.get("version") not in {1, 2, TEST_PROFILE_VERSION}
             or not isinstance(payload.get("profiles"), list)
             or len(payload["profiles"]) > MAX_TEST_PROFILES
         ):
             raise TestProfileError("测试配置版本、结构或条目数量无效。")
-        profiles = [self._validate_profile(item) for item in payload["profiles"]]
+        profiles = [
+            self._validate_profile(item, allow_command=payload["version"] >= 3)
+            for item in payload["profiles"]
+        ]
         folded_ids = [profile.profile_id.casefold() for profile in profiles]
         if len(set(folded_ids)) != len(folded_ids):
             raise TestProfileError("测试配置 ID 重复。")
@@ -232,13 +357,23 @@ class TestProfileStore:
         payload = {
             "version": TEST_PROFILE_VERSION,
             "profiles": [
-                {
-                    "id": profile.profile_id,
-                    "framework": profile.framework,
-                    "cwd": profile.cwd,
-                    "target": profile.target,
-                    "python": profile.python,
-                }
+                (
+                    {
+                        "id": profile.profile_id,
+                        "kind": "command",
+                        "executable": profile.executable,
+                        "args": list(profile.args),
+                        "cwd": profile.cwd,
+                    }
+                    if profile.kind == "command"
+                    else {
+                        "id": profile.profile_id,
+                        "framework": profile.framework,
+                        "cwd": profile.cwd,
+                        "target": profile.target,
+                        "python": profile.python,
+                    }
+                )
                 for profile in profiles
             ],
         }
@@ -268,7 +403,7 @@ class TestProfileStore:
             item for item in profiles
             if item.profile_id.casefold() == profile.profile_id.casefold()
         ]
-        if any(item.python is not None for item in matching):
+        if any(item.kind != "python" or item.python is not None for item in matching):
             raise TestProfileError("该测试配置 ID 已存在；请先移除或选择其他 ID。")
         # A version-1 profile cannot run because it has no independently selected
         # interpreter. Let the user re-enter the same ID to complete that profile.
@@ -276,6 +411,33 @@ class TestProfileStore:
             item for item in profiles
             if item.profile_id.casefold() != profile.profile_id.casefold()
         ]
+        self._save([*profiles, profile])
+        return profile
+
+    def add_command(
+        self, profile_id: str, executable: str, args_json: str, cwd: str
+    ) -> TestProfile:
+        if not isinstance(args_json, str):
+            raise TestProfileError("固定参数 JSON 无效或超过本地大小上限；没有保存配置。")
+        try:
+            if len(args_json.encode("utf-8")) > MAX_TEST_PROFILE_BYTES:
+                raise TestProfileError("固定参数 JSON 无效或超过本地大小上限；没有保存配置。")
+        except UnicodeEncodeError:
+            raise TestProfileError("固定参数 JSON 含无效 Unicode；没有保存配置。") from None
+        try:
+            args_value = json.loads(args_json)
+        except (json.JSONDecodeError, TypeError, RecursionError):
+            raise TestProfileError("固定参数必须是合法 JSON 字符串数组；没有保存配置。") from None
+        profile = self._validate_profile({
+            "id": profile_id,
+            "kind": "command",
+            "executable": executable,
+            "args": args_value,
+            "cwd": cwd,
+        }, require_executable=True)
+        profiles = self.load()
+        if any(item.profile_id.casefold() == profile.profile_id.casefold() for item in profiles):
+            raise TestProfileError("该测试配置 ID 已存在；请先移除或选择其他 ID。")
         self._save([*profiles, profile])
         return profile
 
@@ -291,7 +453,7 @@ class TestProfileStore:
         safe_id = self.validate_id(profile_id)
         for profile in self.load():
             if profile.profile_id.casefold() == safe_id.casefold():
-                if profile.python is None:
+                if profile.kind == "python" and profile.python is None:
                     raise TestProfileError(
                         "该旧测试配置尚未选择外部 Python；用 /测试 添加 <同一ID> 重新配置。"
                     )
@@ -303,13 +465,34 @@ class TestProfileStore:
     def runnable(self) -> list[TestProfile]:
         profiles: list[TestProfile] = []
         for profile in self.load():
-            if profile.python is None:
-                continue
             try:
-                resolved = self._validate_interpreter_path(profile.python, require_file=True)
+                if profile.kind == "python":
+                    if profile.python is None:
+                        continue
+                    resolved = self._validate_interpreter_path(profile.python, require_file=True)
+                    if resolved is None:
+                        continue
+                    profiles.append(TestProfile(
+                        profile_id=profile.profile_id,
+                        framework=profile.framework,
+                        cwd=profile.cwd,
+                        target=profile.target,
+                        python=resolved,
+                    ))
+                else:
+                    executable = self._validate_command_executable(
+                        profile.executable, require_file=True
+                    )
+                    profiles.append(TestProfile(
+                        profile_id=profile.profile_id,
+                        framework=None,
+                        cwd=profile.cwd,
+                        target=None,
+                        python=None,
+                        kind="command",
+                        executable=executable,
+                        args=profile.args,
+                    ))
             except TestProfileError:
                 continue
-            profiles.append(TestProfile(
-                profile.profile_id, profile.framework, profile.cwd, profile.target, resolved
-            ))
         return profiles

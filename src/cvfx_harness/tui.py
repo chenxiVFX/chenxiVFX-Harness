@@ -61,7 +61,7 @@ COMMANDS = (
     ("/恢复", "恢复安全会话"), ("/会话", "列出本地会话"),
     ("/多行", "撰写多行问题"), ("/压缩", "预览、压缩或撤销"),
     ("/统计", "查看本地估算和 provider usage"), ("/预算", "设置本地估算阈值"),
-    ("/配置", "查看或交互审阅非敏感配置"), ("/测试", "管理固定 Python 测试配置"),
+    ("/配置", "查看或交互审阅非敏感配置"), ("/测试", "管理用户配置并逐次审批运行"),
     ("/子代理", "管理隔离子任务"),
     ("/变更集", "查看批次证据或安全恢复"),
     ("/撤销", "预览并撤销写入"), ("/快捷键", "查看当前 TUI 按键映射"),
@@ -73,7 +73,7 @@ ENUM_COMPLETIONS = {
     "/项目说明": ("清除",),
     "/配置": ("显示", "编辑", "重置", "提供商", "模型", "端点", "预算", "输出上限"),
     "/配置 提供商": ("mock", "openai", "deepseek-anthropic"),
-    "/测试": ("列表", "添加", "运行", "移除"),
+    "/测试": ("列表", "添加", "添加命令", "运行", "移除"),
     "/计划": ("生成", "显示", "修订", "接受", "拒绝", "添加", "执行", "完成", "阻塞", "取消", "重试", "清空"),
     "/压缩": ("撤销",),
     "/变更集": ("列表", "证据", "恢复"),
@@ -309,11 +309,20 @@ class CommandCompleter(Completer):
                         profiles = []
                     for profile in profiles:
                         if profile.profile_id.casefold().startswith(prefix.casefold()):
-                            meta = (
-                                f"{profile.framework}，可运行"
-                                if profile.python is not None
-                                else "旧配置，需重新添加解释器"
-                            )
+                            if action == "运行":
+                                meta = (
+                                    "固定命令，可运行"
+                                    if profile.kind == "command"
+                                    else f"{profile.framework}，可运行"
+                                )
+                            elif profile.kind == "command":
+                                meta = "固定命令"
+                            else:
+                                meta = (
+                                    f"Python {profile.framework}"
+                                    if profile.python is not None
+                                    else "旧配置，需重新添加解释器"
+                                )
                             yield Completion(
                                 profile.profile_id,
                                 start_position=-len(prefix),
