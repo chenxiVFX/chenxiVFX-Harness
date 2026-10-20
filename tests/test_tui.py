@@ -29,7 +29,12 @@ from cvfx_harness.profiles import TestProfileStore
 from cvfx_harness.providers import AssistantTurn, MockProvider, ProviderCancelled, ToolCall
 from cvfx_harness.questions import QuestionnaireRequest, QuestionnaireResult, UserQuestion, UserQuestionAnswer
 from cvfx_harness.tools import ActionRequest, Workspace
-from cvfx_harness.tui import CommandCompleter, TerminalUI, terminal_supports_tui
+from cvfx_harness.tui import (
+    CommandCompleter,
+    TerminalUI,
+    run_tui_console,
+    terminal_supports_tui,
+)
 
 
 class PromptToolkitTests(unittest.TestCase):
@@ -1475,14 +1480,20 @@ class PromptToolkitTests(unittest.TestCase):
                 self.assertEqual(light_style.color, "145a32")
 
     def test_status_command_exposes_full_workspace_after_header_truncation(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="cvfx-tui-状态入口-") as workspace:
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-状态入口-") as outer:
+            workspace = str(Path(outer) / "项目 中文 with spaces")
+            Path(workspace).mkdir()
             provider = MockProvider()
 
             def send(pipe, ui: TerminalUI) -> None:
                 self._wait_until(lambda: ui._pending is not None, "TUI did not become ready")
                 pipe.send_text("/状态\r")
                 self._wait_until(
-                    lambda: f"工作区：{Path(workspace).resolve()}" in ui._transcript,
+                    lambda: (
+                        f"工作区：{Path(workspace).resolve()}" in ui._transcript
+                        and "工作区根身份：有效" in ui._transcript
+                        and "工作区信任与审批边界" in ui._transcript
+                    ),
                     "status command did not show the full workspace path",
                 )
                 pipe.send_text("/退出\r")
@@ -1491,6 +1502,59 @@ class PromptToolkitTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertIn("提供商：", ui._transcript)
             self.assertIn(f"工作区：{Path(workspace).resolve()}", ui._transcript)
+            self.assertIn("工作区信任与审批边界", ui._transcript)
+            self.assertIn("工作区根身份：有效", ui._transcript)
+            self.assertIn("--workspace 启动新会话", ui._transcript)
+
+    def test_tui_keeps_the_startup_root_if_its_path_is_replaced_before_worker_start(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cvfx-tui-root-swap-") as temp:
+            selected = Path(temp) / "selected 中文 root"
+            selected.mkdir()
+            args = build_parser().parse_args(
+                ["--workspace", str(selected), "--provider", "mock"]
+            )
+
+            class SwappingUI:
+                def __init__(self, worker, **kwargs) -> None:
+                    self._worker = worker
+                    self.reference_workspace = kwargs["reference_workspace"]
+                    self.output_lines: list[str] = []
+                    self.cancellation_event = threading.Event()
+
+                def output(self, line: str) -> None:
+                    self.output_lines.append(line)
+
+                def stream_write(self, _fragment: str) -> None:
+                    return
+
+                def input(self, _prompt: str) -> str:
+                    raise AssertionError("a replaced root must stop before requesting input")
+
+                def ask_questions(self, _request):
+                    raise AssertionError("a replaced root must stop before prompting")
+
+                def run(self) -> int:
+                    selected.rename(Path(temp) / "retired root")
+                    selected.mkdir()
+                    (selected / "marker.txt").write_text("new root", encoding="utf-8")
+                    return self._worker(self)
+
+            ui_instances: list[SwappingUI] = []
+
+            def make_ui(worker, **kwargs):
+                ui = SwappingUI(worker, **kwargs)
+                ui_instances.append(ui)
+                return ui
+
+            with patch("cvfx_harness.tui.TerminalUI", side_effect=make_ui):
+                result = run_tui_console(args)
+
+            self.assertEqual(result, 2)
+            self.assertTrue(
+                any("工作区根目录在运行期间发生变化" in line for line in ui_instances[0].output_lines),
+                repr(ui_instances[0].output_lines),
+            )
+            self.assertEqual((selected / "marker.txt").read_text(encoding="utf-8"), "new root")
 
     def test_long_prompt_submission_does_not_look_like_manual_transcript_scroll(self) -> None:
         from cvfx_harness.tui import _InputRequest

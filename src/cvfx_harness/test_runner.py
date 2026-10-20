@@ -102,6 +102,7 @@ def _test_environment() -> dict[str, str]:
 
 
 def _command_for(profile: TestProfile, workspace: Workspace) -> tuple[list[str], Path]:
+    workspace.resolve_directory(".")
     if not profile.python:
         raise TestProfileError("测试配置尚未选择外部 Python 解释器。")
     interpreter = TestProfileStore._validate_interpreter_path(

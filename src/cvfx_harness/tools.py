@@ -565,8 +565,13 @@ class Workspace:
 
     def __init__(self, root: str | Path) -> None:
         try:
-            self.root = Path(root).expanduser().resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
+            requested_root = Path(root).expanduser()
+            if self._is_reparse_point(requested_root):
+                raise WorkspaceError("工作区根目录不能是 symlink/junction。")
+            self.root = requested_root.resolve(strict=True)
+        except WorkspaceError:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
             raise WorkspaceError(f"工作区路径不可用：{type(exc).__name__}") from None
         if not self.root.is_dir():
             raise WorkspaceError("工作区必须是已存在的目录。")
@@ -625,6 +630,7 @@ class Workspace:
         return self._resolve_path(relative_path, allow_root=False)
 
     def resolve_directory(self, relative_path: str) -> Path:
+        self._assert_root_identity()
         target = self._resolve_path(relative_path, allow_root=True)
         current = self.root
         for part in Path(relative_path).parts:
@@ -1643,6 +1649,7 @@ class Workspace:
     def internal_storage_dir(self, name: str, *, create: bool) -> Path | None:
         if name not in {_BACKUP_DIR, "sessions", "config", "plans", _CHANGE_SET_DIR}:
             raise WorkspaceError("未授权的 Harness 内部存储目录。")
+        self._assert_root_identity()
         control = self.root / _CONTROL_DIR
         storage_dir = control / name
         for directory in (control, storage_dir):
@@ -2048,11 +2055,20 @@ class Workspace:
             os.close(directory_fd)
             raise
 
+    def _assert_root_identity(self) -> None:
+        if self._is_reparse_point(self.root):
+            raise WorkspaceError("工作区路径包含 symlink/junction；操作已取消。")
+        try:
+            root_info = self.root.stat()
+        except OSError:
+            raise WorkspaceError("工作区根目录已不可用或发生变化；操作已取消。") from None
+        if (root_info.st_dev, root_info.st_ino) != self._root_identity:
+            raise WorkspaceError("工作区根目录在运行期间发生变化；操作已取消。")
+
     def _assert_no_reparse_points(self, target: Path) -> None:
         self._target_parts(target)
+        self._assert_root_identity()
         current = self.root
-        if self._is_reparse_point(current):
-            raise WorkspaceError("工作区路径包含 symlink/junction；操作已取消。")
         for component in target.relative_to(self.root).parts:
             current = current / component
             if self._is_reparse_point(current):

@@ -52,7 +52,7 @@ MAX_TRANSCRIPT_CHARS = 200_000
 POLL_INTERVAL_SECONDS = 0.025
 COMMANDS = (
     ("/帮助", "显示完整说明"), ("/命令", "列出中文命令"),
-    ("/状态", "查看模型和工作区"), ("/项目说明", "预览并确认根目录项目说明"),
+    ("/状态", "查看模型、工作区和审批边界"), ("/项目说明", "预览并确认根目录项目说明"),
     ("/模式", "切换计划或执行"),
     ("/目标", "设置会话目标"), ("/计划", "生成、审阅、修订或执行计划"),
     ("/保存", "保存安全会话"), ("/检查点", "保存手写摘要"),
@@ -1674,6 +1674,7 @@ def run_tui_console(args) -> int | None:
     def worker(ui: TerminalUI) -> int:
         return run_console(
             args,
+            selected_workspace=reference_workspace,
             input_fn=ui.input,
             output=ui.output,
             stream_write=ui.stream_write,

@@ -44,6 +44,7 @@ from cvfx_harness.cli import (
     _collect_multiline_input,
     _completion_matches,
     _safe_terminal_text,
+    build_parser,
     parse_references,
     run_console,
 )
@@ -1006,6 +1007,54 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaises(WorkspaceError) as caught:
             Workspace(missing)
         self.assertNotIn(str(missing), str(caught.exception))
+
+    def test_selected_workspace_root_cannot_be_symlink(self) -> None:
+        target = self.root / "ordinary project"
+        target.mkdir()
+        linked_root = self.root / "linked project"
+        if os.name == "nt":
+            def quote_powershell(value: Path) -> str:
+                return "'" + str(value).replace("'", "''") + "'"
+
+            command = (
+                "$ErrorActionPreference = 'Stop'; "
+                f"New-Item -ItemType Junction -Path {quote_powershell(linked_root)} "
+                f"-Target {quote_powershell(target)} | Out-Null"
+            )
+            result = subprocess.run(
+                ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                self.skipTest("directory junction fixture could not be created")
+        else:
+            try:
+                linked_root.symlink_to(target, target_is_directory=True)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(
+                    f"directory symlink unavailable in this test environment: {type(exc).__name__}"
+                )
+        with self.assertRaisesRegex(WorkspaceError, "根目录不能是 symlink/junction"):
+            Workspace(linked_root)
+
+    def test_root_replacement_between_start_and_file_access_is_rejected(self) -> None:
+        selected = self.root / "project with space"
+        selected.mkdir()
+        workspace = Workspace(selected)
+        retired = self.root / "retired project"
+        selected.rename(retired)
+        selected.mkdir()
+        (selected / "marker.txt").write_text("new root must not be read", encoding="utf-8")
+
+        target = workspace.resolve("marker.txt")
+        with self.assertRaisesRegex(WorkspaceError, "根目录在运行期间发生变化"):
+            workspace._read_snapshot(target)
+        self.assertEqual(
+            (selected / "marker.txt").read_text(encoding="utf-8"),
+            "new root must not be read",
+        )
 
     @unittest.skipUnless(os.name == "nt", "junctions are Windows-specific")
     def test_directory_junction_escape_is_rejected(self) -> None:
@@ -2841,6 +2890,126 @@ class AgentTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_workspace_help_and_status_make_root_and_approval_boundary_explicit(self) -> None:
+        with make_test_temp(prefix="工作区 状态-") as temp:
+            selected = Path(temp) / "项目 中文"
+            selected.mkdir()
+            args = build_parser().parse_args(
+                ["--workspace", str(selected), "--provider", "mock"]
+            )
+            self.assertEqual(args.workspace, str(selected))
+
+            parser_help = build_parser().format_help()
+            self.assertIn("已存在的工作区目录", parser_help)
+            self.assertIn("包含空格的路径请加引号", parser_help)
+            self.assertIn("重新启动新会话", parser_help)
+
+            provider = ScriptedProvider([])
+            outputs: list[str] = []
+            inputs = iter(["/状态", "/退出"])
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                result = run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append)
+            self.assertEqual(result, 0)
+            state = next(line for line in outputs if line.startswith("提供商："))
+            self.assertIn(f"工作区：{selected.resolve()}", state)
+            self.assertIn("工作区根身份：有效", state)
+            self.assertIn("工作区信任与审批边界", state)
+            self.assertIn("文件读取、目录列表和搜索逐次审批", state)
+            self.assertIn("候选计划或子代理任务", state)
+            self.assertIn("--workspace 启动新会话", state)
+            self.assertEqual(provider.requests, [])
+
+    def test_status_reports_workspace_root_replacement_without_reading_new_root(self) -> None:
+        with make_test_temp(prefix="status-root-swap-") as temp:
+            selected = Path(temp) / "selected root"
+            selected.mkdir()
+            retired = Path(temp) / "retired root"
+            args = build_parser().parse_args(["--workspace", str(selected), "--provider", "mock"])
+            provider = ScriptedProvider([])
+            outputs: list[str] = []
+            prompt_count = 0
+
+            def replace_then_read_status(_prompt: str) -> str:
+                nonlocal prompt_count
+                prompt_count += 1
+                if prompt_count == 1:
+                    selected.rename(retired)
+                    selected.mkdir()
+                    (selected / "marker.txt").write_text("must not inspect", encoding="utf-8")
+                    return "/状态"
+                return "/退出"
+
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                result = run_console(args, input_fn=replace_then_read_status, output=outputs.append)
+
+            status = next(line for line in outputs if line.startswith("提供商："))
+            self.assertEqual(result, 0)
+            self.assertIn("工作区根身份：无效", status)
+            self.assertIn("根目录在运行期间发生变化", status)
+            self.assertEqual(provider.requests, [])
+
+    def test_selected_workspace_does_not_inherit_other_root_session_plan_or_notes(self) -> None:
+        from cvfx_harness.plans import PlanStore
+        from cvfx_harness.sessions import SessionStore
+
+        with make_test_temp(prefix="双工作区隔离-") as temp:
+            root = Path(temp)
+            first = root / "项目 甲"
+            second = root / "项目 乙"
+            first.mkdir()
+            second.mkdir()
+            first_marker = "FIRST_WORKSPACE_PRIVATE_SYNTHETIC_MARKER"
+            (first / "AGENTS.md").write_text(first_marker, encoding="utf-8")
+            (first / "引用.txt").write_text(first_marker, encoding="utf-8")
+            first_workspace = Workspace(first)
+            SessionStore(first_workspace).save_checkpoint("仅甲", first_marker)
+            PlanStore(first_workspace).add("FIRST_WORKSPACE_PLAN_SYNTHETIC_MARKER")
+
+            second_path = str(second)
+            args = build_parser().parse_args(
+                ["--workspace", second_path, "--provider", "mock"]
+            )
+            provider = ScriptedProvider([])
+            outputs: list[str] = []
+            inputs = iter(["/状态", "/会话", "/计划", "/子代理 列表", "/退出"])
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=provider):
+                result = run_console(args, input_fn=lambda _prompt: next(inputs), output=outputs.append)
+
+            combined = "\n".join(outputs)
+            self.assertEqual(result, 0)
+            self.assertIn(f"工作区：{second.resolve()}", combined)
+            self.assertIn("本地会话：\n  （暂无）", combined)
+            self.assertIn("当前没有计划步骤", combined)
+            self.assertIn("当前没有子任务", combined)
+            self.assertIn("目标：（未设置）", combined)
+            self.assertNotIn(first_marker, combined)
+            self.assertNotIn("FIRST_WORKSPACE_PLAN_SYNTHETIC_MARKER", combined)
+            self.assertNotIn(str(first.resolve()), combined)
+            self.assertEqual(provider.requests, [])
+
+            self.assertEqual(SessionStore(first_workspace).list_names(), ["仅甲"])
+            self.assertEqual(
+                PlanStore(first_workspace).load().steps[0].text,
+                "FIRST_WORKSPACE_PLAN_SYNTHETIC_MARKER",
+            )
+
+    def test_invalid_workspace_stops_before_provider_setup(self) -> None:
+        with make_test_temp(prefix="invalid-root-") as temp:
+            missing = Path(temp) / "missing"
+            outputs: list[str] = []
+            args = build_parser().parse_args(["--workspace", str(missing), "--provider", "mock"])
+            with patch(
+                "cvfx_harness.cli.provider_from_environment",
+                side_effect=AssertionError("provider setup must not run for an invalid root"),
+            ):
+                result = run_console(
+                    args,
+                    input_fn=lambda _prompt: self.fail("invalid root must stop"),
+                    output=outputs.append,
+                )
+            self.assertEqual(result, 2)
+            self.assertTrue(any(line.startswith("错误：工作区路径不可用") for line in outputs))
+
     def test_tab_completion_is_limited_to_commands_and_fixed_enum_values(self) -> None:
         self.assertEqual(_completion_matches("/帮", "/帮"), ("/帮助",))
         self.assertIn("/项目说明", _completion_matches("/项", "/项"))

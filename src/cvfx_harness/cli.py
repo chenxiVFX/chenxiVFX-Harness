@@ -75,6 +75,17 @@ _CLI_COMMANDS = (
     "/恢复", "/继续", "/会话", "/多行", "/压缩", "/统计", "/预算", "/配置", "/测试", "/子代理",
     "/变更集", "/撤销", "/快捷键", "/按键", "/退出",
 )
+_WORKSPACE_BOUNDARY_STATUS = (
+    "工作区信任与审批边界：\n"
+    "文件工具只接受当前根目录内的相对路径；敏感/内部路径、链接或硬链接逃逸会被拒绝，"
+    "根目录在运行中被替换时操作停止。\n"
+    "文件读取、目录列表和搜索逐次审批；写入、补丁、变更集恢复和撤销先展示差异再单独审批。\n"
+    "计划和历史摘要不授予权限；子代理只读用户批准的范围；测试仅能运行用户保存的配置，"
+    "运行与分享输出分别审批；Shell 禁用。\n"
+    "本进程根目录固定。新进程不继承本会话的目标、对话、项目说明、文件引用、待审批动作、"
+    "候选计划或子代理任务。会话不会自动恢复；计划等持久记录仅属于各自工作区。"
+    "运行中的请求按 Ctrl+C 取消，审批按 Esc 取消；随后输入 /退出，再用 --workspace 启动新会话。"
+)
 _CLI_ENUM_ARGUMENTS = {
     "/项目说明": ("清除",),
     "/模式": ("计划", "执行"),
@@ -437,7 +448,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workspace",
         default=".",
-        help="工作区目录；所有文件工具只接受该目录内的相对路径",
+        metavar="目录",
+        help=(
+            "已存在的工作区目录（默认当前目录）；不自动创建或扫描主目录。"
+            "根目录不能是 symlink/junction；包含空格的路径请加引号。"
+            "每次启动固定一个根目录；更换目录须取消/结束当前会话后重新启动新会话。"
+        ),
     )
     parser.add_argument(
         "--provider",
@@ -591,7 +607,7 @@ def _help_text() -> str:
     return """命令：
   /帮助              显示帮助
   /命令              列出可用的中文命令
-  /状态              显示完整提供商、模型、工作区、目标和模式（顶栏会随宽度省略）
+  /状态              显示完整提供商、模型、工作区、审批边界、目标和模式
   /项目说明 [文件名|清除]  预览并确认工作区根目录的项目说明；不自动读取或发送
   /模式 计划|执行    切换计划或执行模式（计划模式会拦截写入、变更集恢复与撤销）
   /目标 <内容>       设置本会话目标；/目标 清空 可清除
@@ -639,6 +655,12 @@ def _help_text() -> str:
   /撤销              预览并恢复最近一次 Harness 文件写入
   /多行              开始多行提问；单独输入 /提交 发送，/取消 丢弃
   /退出              结束会话
+
+工作区在进程启动时固定，/状态 会显示完整路径和当前信任/审批边界；不会在运行中的任务之间切换根目录。
+要选择另一工作区并开始新会话，请先 Ctrl+C 取消模型请求、或在审批时按 Esc 取消，然后 /退出；
+重新运行 cvfx-harness --workspace \"<已存在目录>\"（中文或空格路径请加引号）。
+新进程不会继承本进程的目标、对话、项目说明、文件引用、待审批动作、候选计划或子代理任务，
+也不会自动恢复会话或扫描其他目录；所选工作区自身的持久计划仍需人工审阅，不会自动执行。
 
 模型可在信息不足时使用结构化问卷询问 1–3 个非敏感问题；建议可选，用户可自由作答。TUI 按题编辑并审阅后显式提交，Esc 取消本问卷；Ctrl+C 取消当前模型请求。默认问答仅本次使用；当前上下文安全时，用户可在提交前明确允许把普通问答随 /保存 写入工作区本地会话；已有未存档上下文时本地会禁用该选项。未同意保存的回答及其影响的后续轮次会从存档中省略，并显示恢复提示。疑似密钥、密码或 Token 请求会被阻止。
 文件引用：在提问中写 @相对路径，或用 @{包含空格的相对路径}。
@@ -1115,6 +1137,7 @@ def _ask_user_cli(
 def run_console(
     args: argparse.Namespace,
     *,
+    selected_workspace: Workspace | None = None,
     input_fn: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
     stream_write: Callable[[str], None] | None = None,
@@ -1122,7 +1145,8 @@ def run_console(
     ask_user_fn: Callable[[QuestionnaireRequest], QuestionnaireResult] | None = None,
 ) -> int:
     try:
-        workspace = Workspace(args.workspace)
+        workspace = selected_workspace or Workspace(args.workspace)
+        workspace.resolve_directory(".")
         config_store = WorkspaceConfigStore(workspace)
         if getattr(args, "ignore_config", False):
             workspace_config, config_exists = WorkspaceConfig(), False
@@ -1649,6 +1673,13 @@ def run_console(
             return 0
         if command in {"/状态", "/status"}:
             _, omissions = agent.export_session()
+            try:
+                workspace.resolve_directory(".")
+                workspace_root_status = "工作区根身份：有效"
+            except WorkspaceError as exc:
+                workspace_root_status = (
+                    "工作区根身份：无效；" + _safe_error_text(exc)
+                )
             omission_status = (
                 "当前或继承存档存在省略："
                 + describe_session_omissions(omissions)
@@ -1660,10 +1691,12 @@ def run_console(
                 f"提供商：{_safe_terminal_text(str(provider.label))}\n"
                 f"模型：{_safe_terminal_text(str(getattr(provider, 'model', '未知')))}\n"
                 f"工作区：{_safe_terminal_text(str(workspace.root))}\n"
+                f"{workspace_root_status}\n"
                 f"模式：{mode}\n"
                 f"目标：{_safe_terminal_text(redact_likely_secrets(agent.goal)[0]) or '（未设置）'}\n"
                 f"会话完整性：{omission_status}\n"
-                f"{project_guidance_status()}"
+                f"{project_guidance_status()}\n"
+                f"{_WORKSPACE_BOUNDARY_STATUS}"
             )
             continue
         if command in {"/配置", "/config"}:
