@@ -541,16 +541,29 @@ def main() -> int:
                 input_text=profile_input,
             )
         if runner_result.returncode != 0:
-            _fail("打包 EXE 的用户测试 profile 运行失败")
-        if (
-            "合成测试通过" not in runner_result.stdout
-            or "1 passed" not in runner_result.stdout
-            or runner_result.stdout.count("退出码为 0") < 3
-            or "pytest" not in runner_result.stdout
-            or "Node 固定命令 profile 合成测试通过" not in runner_result.stdout
-            or "固定命令可执行文件：" not in runner_result.stdout
-        ):
-            _fail("打包 EXE 未完成外部 Python unittest/pytest 与 Node 固定命令 profile fixture")
+            _fail(
+                "打包 EXE 的用户测试 profile 运行失败；安全错误签名："
+                f"{_process_error_signature(runner_result)}"
+            )
+        expected_markers = {
+            "unittest 合成结果": "合成测试通过",
+            "pytest 合成结果": "1 passed",
+            "三次退出码为 0": "退出码为 0",
+            "pytest profile": "pytest",
+            "Node 合成结果": "Node 固定命令 profile 合成测试通过",
+            "固定命令预览": "固定命令可执行文件：",
+        }
+        missing_markers = [
+            label for label, marker in expected_markers.items()
+            if marker not in runner_result.stdout
+        ]
+        if runner_result.stdout.count("退出码为 0") < 3:
+            missing_markers.append("三次退出码为 0 的实际计数不足")
+        if missing_markers:
+            _fail(
+                "打包 EXE 的用户测试 profile 未满足合成预期；缺少安全标记："
+                + ", ".join(missing_markers)
+            )
 
         shutil.copy2(executable, output_dir / executable.name)
 

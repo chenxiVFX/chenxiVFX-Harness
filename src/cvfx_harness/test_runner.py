@@ -200,14 +200,16 @@ def _command_executable_identity(
         after_path = resolved.stat()
         resolved_again = Path(configured).resolve(strict=True)
         stable_metadata = _file_identity_metadata(opened)
-        if (
-            read_bytes != opened.st_size
-            or _file_identity_metadata(after_open) != stable_metadata
-            or _file_identity_metadata(after_path) != stable_metadata
-            or _path_key(resolved_again) != _path_key(resolved)
-            or Workspace._is_reparse_point(resolved_again)
-        ):
+        if read_bytes != opened.st_size:
+            raise TestProfileError("命令可执行文件身份校验读取长度不一致；未启动测试进程。")
+        if _file_identity_metadata(after_open) != stable_metadata:
             raise TestProfileError("命令可执行文件在身份校验期间发生变化；未启动测试进程。")
+        if _file_identity_metadata(after_path) != stable_metadata:
+            raise TestProfileError("命令可执行文件路径在身份校验期间发生变化；未启动测试进程。")
+        if _path_key(resolved_again) != _path_key(resolved):
+            raise TestProfileError("命令可执行文件符号链接目标在身份校验期间发生变化；未启动测试进程。")
+        if Workspace._is_reparse_point(resolved_again):
+            raise TestProfileError("命令可执行文件在身份校验期间变为 symlink/junction；未启动测试进程。")
         if cancellation_event is not None and cancellation_event.is_set():
             raise ProviderCancelled("test executable identity check cancelled")
 
