@@ -410,6 +410,23 @@ class PlanProposalProtocolTests(unittest.TestCase):
         self.assertEqual(draft.steps[0].completion_criteria, "输出键名和含义，不包含密钥值")
         self.assertEqual(draft.steps[1].required_tools, ("list_directory", "run_test_profile"))
 
+    def test_plan_accepts_current_search_and_change_set_tool_names(self) -> None:
+        proposal = json.dumps(
+            {
+                "steps": [{
+                    "description": "搜索并审阅所需模块，再提交同批精确修改",
+                    "completion_criteria": "两文件差异逐项获批且已有测试通过",
+                    "required_tools": ["read_file", "search_text", "apply_change_set", "run_test_profile"],
+                }]
+            },
+            ensure_ascii=False,
+        )
+        draft = parse_plan_proposal(proposal)
+        self.assertEqual(
+            draft.steps[0].required_tools,
+            ("read_file", "search_text", "apply_change_set", "run_test_profile"),
+        )
+
     def test_malformed_duplicate_unknown_control_secret_and_oversized_json_fail(self) -> None:
         invalid = [
             "{not-json}",

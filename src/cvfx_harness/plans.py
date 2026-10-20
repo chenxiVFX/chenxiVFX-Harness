@@ -17,8 +17,11 @@ MAX_PLAN_STEPS = 3
 MAX_STEP_CHARS = 400
 MAX_PLAN_BYTES = 8192
 MAX_REQUIRED_TOOLS = 5
-PLAN_TOOLS = frozenset({"read_file", "list_directory", "write_file", "patch_file", "run_test_profile"})
-PLAN_PROGRESS_TOOLS = PLAN_TOOLS | {"search_text", "apply_change_set", "ask_user"}
+PLAN_TOOLS = frozenset({
+    "read_file", "list_directory", "search_text", "write_file", "patch_file",
+    "apply_change_set", "run_test_profile",
+})
+PLAN_PROGRESS_TOOLS = PLAN_TOOLS | {"ask_user"}
 PLAN_PROGRESS_PHASES = frozenset({
     "provider_request", "tool_approval", "local_interaction", "tool_execution",
     "tool_result_returned", "finished", "unknown"

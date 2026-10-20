@@ -1534,8 +1534,10 @@ def run_console(
         tool_names = {
             "read_file": "读取文件",
             "list_directory": "列出目录",
+            "search_text": "工作区搜索",
             "write_file": "写入文件",
             "patch_file": "精确补丁",
+            "apply_change_set": "多文件变更集",
             "run_test_profile": "运行已配置测试",
         }
         for index, step in enumerate(draft.steps, 1):

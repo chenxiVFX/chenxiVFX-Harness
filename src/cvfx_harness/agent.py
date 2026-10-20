@@ -808,7 +808,8 @@ class Agent:
             '{"steps":[{"description":"...","completion_criteria":"...",'
             '"required_tools":["read_file"]}]}。steps 必须为 1 到 3 项；每项只包含这三个字段。'
             "说明和完成条件各自最多 400 字符；required_tools 只可使用 read_file、list_directory、"
-            "write_file、patch_file、run_test_profile，最多 5 个且不重复。只列完成目标真正需要的工具；"
+            "search_text、write_file、patch_file、apply_change_set、run_test_profile，最多 5 个且不重复。"
+            "只列完成目标真正需要的工具；"
             "这些名称仅作建议，不代表用户授权。完成条件应可由用户检查。"
         )
         messages = [

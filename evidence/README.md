@@ -43,3 +43,5 @@ CVFX_TUI_QA_NO_COLOR=1 python scripts/record_tui_qa.py
 ## 验证边界
 
 这些证据说明当前 TUI 在合成离线流程中的行为。它们不验证真实 provider/API、网络 usage 或缓存计数，也不是 Windows Terminal、PowerShell/ConPTY、IME、剪贴板或屏幕阅读器的人工验收。CI 的 Windows/Linux 矩阵与 Windows standalone 检查是独立证据，不等于 Windows 交互终端实测。
+
+完整 CLI/主 Agent 的合成项目回归、首轮失败到定向修复、审批拒绝、并发版本冲突和取消闭环见[确定性项目交互验收](system-acceptance.md)，可用 `python scripts/system_acceptance.py` 重现；该脚本已在跨平台离线矩阵及 Windows standalone workflow 中运行。

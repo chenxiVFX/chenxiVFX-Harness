@@ -38,6 +38,9 @@ jobs:
           --only-binary=:all: --index-url https://pypi.org/simple
           -r packaging/verification-test-requirements.txt
 
+      - name: Verify source interaction flow on Windows
+        run: python scripts/system_acceptance.py
+
       - name: Build, audit, and smoke-test the standalone executable
         id: bundle
         run: >-

@@ -50,6 +50,9 @@ jobs:
       - name: Run synthetic unittest and pytest user profiles
         run: python scripts/test_runner_selfcheck.py
 
+      - name: Verify synthetic project interaction and approval boundaries
+        run: python scripts/system_acceptance.py
+
       - name: Compile project and tests
         run: python -m compileall -q src tests scripts
 
