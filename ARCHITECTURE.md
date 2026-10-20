@@ -25,7 +25,7 @@ CLI：中文命令、文件引用/项目说明、权限确认、压缩预览和�
 
 ## 对话与稳定前缀
 
-Agent 的 system message 在每个请求、恢复和压缩后保持固定文本；内置工具 schema 顺序固定，有已保存测试 profile 时才在尾部增加 ID 枚举 runner，profile 改动会改变该尾部 schema。每次提问最多进行 4 轮模型回复，每轮最多执行 4 项调用，单个响应最多接受 16 项调用。目录列表、文件读取和文件写入都要逐项审批；目录列表只返回有限数量的名称/类型，跳过敏感条目并拒绝链接目录。文件写入继续经过差异预览和备份。
+Agent 的 system message 在每个请求、恢复和压缩后保持固定文本；内置工具 schema 顺序固定，有已保存测试 profile 时才在尾部增加 ID 枚举 runner。Profile ID 按不区分大小写的稳定顺序编码，配置文件中无关的排列变化不会扰动 schema；增删 ID 仍会改变该尾部 schema。子代理批准的精确路径按稳定顺序呈现，但授权范围变化会如实更新请求内容。用户目标、文件引用、已确认项目说明和对话仍在 user 消息中按当前状态更新，不为缓存复用而冻结。每次提问最多进行 4 轮模型回复，每轮最多执行 4 项调用，单个响应最多接受 16 项调用。目录列表、文件读取和文件写入都要逐项审批；目录列表只返回有限数量的名称/类型，跳过敏感条目并拒绝链接目录。文件写入继续经过差异预览和备份。
 
 `ask_user` 是当前 Agent 的结构化澄清工具，可请求 1–3 个短问题、每题最多 4 个建议。schema、重复 ID、文本控制字符、字节/字符上限和疑似凭据在展示前校验；界面回调发生在一次 Provider 请求结束后，因此本地等待不占用该次网络请求时限。TUI 独立显示问题草稿，建议只填值，多行 Enter 不提交；审阅后显式提交才形成工具结果。默认仅本次使用；在当前会话上下文仍可安全存档时，提交前用户可明确允许普通问答随之后的 `/保存` 写入工作区会话。若历史含未存档回答、文件引用、敏感内容或工具结果，界面会禁用问卷存档选择，防止把受先前私有上下文影响的问题和回答写入会话。Esc 返回空的 `cancelled` 结果，Ctrl+C 抛出当前模型轮次取消并恢复普通输入。答案作为不可信工具结果追加在当前轮，仅可被后续模型请求消费；问卷草稿和回答不出现在 TUI transcript/history/clipboard。仅本次回答及其影响的后续上下文不会存档，CLI 会显示省略状态；有明确保存同意的回答可按不可信上下文保存，永不恢复成工具调用或授权。答案本身不会触发审批或扩大任何能力。计划模式仍提供该澄清工具；子代理仅获 read/list 工具，遇到 ask_user 会以明确失败状态要求主会话补充信息。
 
@@ -51,7 +51,13 @@ socket 的读取超时设为剩余截止时间，不以短超时轮询后恢复�
 
 普通内容片段可立即交给 CLI；reasoning 内容不显示。OpenAI 工具调用片段按索引累积，Anthropic `input_json_delta` 在内容块结束时才解析。两种协议均校验完整 JSON、唯一键、参数大小、调用编号和工具结束状态；畸形或截断的调用在完整校验前不会交给 Agent。OpenAI 一个回复可含多个工具调用，子代理仍只接收本轮限制内的精确只读工具。之后 Agent 才执行原有逐次人工审批。用户测试 profile 工具沿用相同流程，且再执行独立的测试与输出分享审批。协议错误、缺少终止标记或超限时，Provider 抛出安全的流错误，Agent 清除未完成轮次且不返回工具调用；解析完成但响应因长度截断或完成状态不匹配时，也不执行工具。流式文字可能已显示一部分，错误后不会撤回；终端输出先脱敏疑似凭据并转义控制字符。当前拒绝多候选项、多模态、logprobs、未知 delta 字段和不支持流式的 provider。
 
-本地字符估算、provider 返回的 prompt/completion usage 和 provider 明确报告的缓存命中分开计数。缺少或格式无效的 usage 不会冒充真实用量；缓存字段缺失或互相冲突时显示未知。OpenAI 兼容响应接受 `prompt_cache_hit_tokens` 或 `prompt_tokens_details.cached_tokens` 的一致报告；Anthropic 兼容路由当前未提供本地确认的缓存字段映射，因此其缓存统计保持未知，不推算节省。
+## Provider 请求字段、缓存与 Token 统计
+
+OpenAI 兼容请求体固定发送 `model`、`messages`、`max_tokens`、`reasoning_effort: "high"`、`thinking: {"type":"enabled"}`；SSE 请求额外发送 `stream: true`，存在工具时才发送 `tools` 与 `tool_choice: "auto"`。DeepSeek Anthropic 兼容请求体固定发送 `model`、`max_tokens`、转换后的 `messages`、`stream`、`thinking: {"type":"disabled"}`；system、工具和 `tool_choice: {"type":"auto"}` 按需添加。当前没有发送 `cache_control` 或其他显式缓存控制字段。
+
+DeepSeek [KV 缓存文档](https://api-docs.deepseek.com/guides/kv_cache/)说明其磁盘前缀缓存默认启用、由服务自动管理、按 best-effort 工作且不保证命中，并可在 usage 中报告 `prompt_cache_hit_tokens` 与 `prompt_cache_miss_tokens`；Harness 只采用校验通过的命中计数，不从稳定前缀推断命中或节省。DeepSeek [Anthropic 兼容指南](https://api-docs.deepseek.com/guides/anthropic_api/)说明消息与工具块中的 `cache_control` 在该兼容路径会被忽略，因此这里不添加它。OpenAI 兼容响应的两个缓存命中字段别名必须一致；DeepSeek Anthropic 兼容响应当前没有本地确认的缓存字段映射，缓存命中保持 `unknown`。这些说明描述文档和本地适配器字段，不代表线上缓存行为已重新验证。
+
+本地输入字符估算、输出预算核算、provider 实际 usage 与缓存命中字段分开计数。输出预算核算是兼容保留字段 `estimated_output_tokens` 的语义：主会话在有效 usage 存在时按本地响应估算与 provider completion 报告的较大值入账，usage 缺失或请求失败时按该请求完整 `max_tokens` 额度保守记账；子代理按本地序列化响应估算与有效 provider completion 报告较大值记账，usage 缺失时只记本地估算。它们都不是 provider 实际输出量。单次 JSON 保留旧 `local_estimate.output_tokens`，并通过 `budget_accounting` 与 `output_tokens_semantics` 明示该兼容别名的含义；交互 CLI 明确标出“输出预算核算”，子代理还分别显示 provider 实际输出与缓存字段。缺少或格式无效的 usage 不会冒充真实用量；缓存字段缺失或互相冲突时显示未知。
 
 ## 会话格式
 

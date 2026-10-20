@@ -586,6 +586,35 @@ class OpenAICompatibleProvider:
             return base
         return f"{base}/chat/completions"
 
+    def _request_body(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        max_tokens: int,
+        stream: bool,
+    ) -> dict[str, Any]:
+        """Construct the shared OpenAI-compatible payload without transport state."""
+        if type(max_tokens) is not int or not 1 <= max_tokens <= 65536:
+            raise ProviderError("max_tokens must be between 1 and 65536")
+        if not isinstance(messages, list) or not isinstance(tools, list):
+            raise ProviderError("模型请求上下文格式无效。")
+        if type(stream) is not bool:
+            raise ProviderError("模型请求流式标记无效。")
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "reasoning_effort": "high",
+            "thinking": {"type": "enabled"},
+        }
+        if stream:
+            body["stream"] = True
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        return body
+
     def complete(
         self,
         messages: list[dict[str, Any]],
@@ -596,18 +625,7 @@ class OpenAICompatibleProvider:
     ) -> AssistantTurn:
         if cancellation_event is not None and cancellation_event.is_set():
             raise ProviderCancelled("provider request cancelled before send")
-        if type(max_tokens) is not int or not 1 <= max_tokens <= 65536:
-            raise ProviderError("max_tokens must be between 1 and 65536")
-        body: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "reasoning_effort": "high",
-            "thinking": {"type": "enabled"},
-        }
-        if tools:
-            body["tools"] = tools
-            body["tool_choice"] = "auto"
+        body = self._request_body(messages, tools, max_tokens=max_tokens, stream=False)
 
         headers = {
             "Content-Type": "application/json; charset=utf-8",
@@ -655,8 +673,6 @@ class OpenAICompatibleProvider:
         """Receive bounded SSE deltas; never return partial tool calls to Agent."""
         if cancellation_event is not None and cancellation_event.is_set():
             raise ProviderCancelled("provider stream cancelled before send")
-        if type(max_tokens) is not int or not 1 <= max_tokens <= 65536:
-            raise ProviderError("max_tokens must be between 1 and 65536")
         if not callable(on_text_delta):
             raise ProviderStreamError("SSE 文本回调无效。")
         stream_timeout = self.stream_timeout
@@ -669,17 +685,7 @@ class OpenAICompatibleProvider:
                 raise ProviderStreamError("SSE 单次请求时限无效。")
             stream_timeout = min(stream_timeout, float(timeout_seconds))
 
-        body: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "reasoning_effort": "high",
-            "thinking": {"type": "enabled"},
-            "stream": True,
-        }
-        if tools:
-            body["tools"] = tools
-            body["tool_choice"] = "auto"
+        body = self._request_body(messages, tools, max_tokens=max_tokens, stream=True)
         headers = {
             "Content-Type": "application/json; charset=utf-8",
             "Accept": "text/event-stream",

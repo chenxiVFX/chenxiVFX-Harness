@@ -62,9 +62,9 @@ from .sessions import (
     contains_likely_secret,
     redact_likely_secrets,
 )
-from .subagents import DelegationPlanError, SubagentManager, build_delegation_plan
+from .subagents import DelegationPlanError, SubagentManager, SubagentResult, build_delegation_plan
 from .tools import ActionRequest, Workspace, WorkspaceError
-from .usage import DEFAULT_TOKEN_BUDGET
+from .usage import DEFAULT_TOKEN_BUDGET, usage_breakdown
 
 _REFERENCE = re.compile(r"(?<![\w@])@(?:\{([^{}]+)\}|([^\s]+))", re.UNICODE)
 _TRAILING_PUNCTUATION = ",，。;；!?！？)]}"
@@ -413,36 +413,42 @@ def _single_request_usage(agent: Agent | None) -> dict[str, object]:
         completion = stats.provider_completion_tokens
         cache_reports = stats.provider_cached_prompt_reports
         cache_tokens = stats.provider_cached_prompt_tokens
-    provider_state = (
-        "unknown" if reports == 0 else "reported" if reports == requests else "partial"
+    return usage_breakdown(
+        requests=requests,
+        estimated_input_tokens=input_estimate,
+        budgeted_output_tokens=output_estimate,
+        provider_usage_reports=reports,
+        provider_prompt_tokens=prompt,
+        provider_completion_tokens=completion,
+        provider_cached_prompt_reports=cache_reports,
+        provider_cached_prompt_tokens=cache_tokens,
     )
-    cache_state = (
-        "unknown"
-        if cache_reports == 0
-        else "reported"
-        if cache_reports == reports == requests
-        else "partial"
+
+
+def _format_subagent_usage(result: SubagentResult) -> str:
+    requests = result.provider_requests
+    reports = result.provider_usage_reports
+    if reports == 0:
+        provider_output = "提供商实际输出未知"
+    elif reports == requests:
+        provider_output = f"提供商实际输出 {result.provider_completion_tokens} tokens"
+    else:
+        provider_output = (
+            f"提供商实际输出部分报告 {result.provider_completion_tokens} tokens，{reports}/{requests} 次"
+        )
+    cache_reports = result.provider_cached_prompt_reports
+    if cache_reports == 0:
+        provider_cache = "提供商缓存命中未知"
+    elif cache_reports == requests == reports:
+        provider_cache = f"提供商报告缓存命中 {result.provider_cached_prompt_tokens} tokens"
+    else:
+        provider_cache = (
+            f"提供商缓存命中部分报告 {result.provider_cached_prompt_tokens} tokens，"
+            f"{cache_reports}/{requests} 次"
+        )
+    return (
+        f"（预算核算输出 {result.output_tokens} tokens；{provider_output}；{provider_cache}）"
     )
-    return {
-        "requests": requests,
-        "local_estimate": {
-            "status": "estimated",
-            "input_tokens": input_estimate,
-            "output_tokens": output_estimate,
-        },
-        "provider_actual": {
-            "status": provider_state,
-            "reports": reports,
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "total_tokens": prompt + completion,
-        },
-        "cache_actual": {
-            "status": cache_state,
-            "reports": cache_reports,
-            "cached_prompt_tokens": cache_tokens,
-        },
-    }
 
 
 def _emit_single_request_result(
@@ -2731,7 +2737,8 @@ def run_console(
                 f"工具前缀独立估算（系统提示 + 当前 {schema_count} 项工具 schema）：{estimates['stable_prefix']} tokens\n"
                 f"会话消息独立估算：{estimates['conversation']} tokens；两个分项不相加，也不是缓存命中量\n"
                 f"累计请求：{stats.requests}\n"
-                f"累计本地估算输入/输出：{stats.estimated_input_tokens} / {stats.estimated_output_tokens} tokens\n"
+                f"累计本地输入估算：{stats.estimated_input_tokens} tokens；输出预算核算：{stats.estimated_output_tokens} tokens"
+                "（有 usage 时取本地响应估算与报告输出较大值；缺失时按请求 max_tokens 全额预留）\n"
                 f"提供商 usage 字段：{provider_usage}\n"
                 f"提供商缓存命中字段：{provider_cache}\n"
                 "本地字符启发式不是 tokenizer 精确值；阈值不代表提供商上下文窗口或账户额度。"
@@ -2843,7 +2850,7 @@ def run_console(
                 else:
                     lines = [
                         f"{item.task_id} [{item.status}] {_safe_terminal_text(item.task)}（限时 {item.timeout_seconds:g}s）"
-                        + (f"（输出 {item.result.output_tokens} tokens）" if item.result else "")
+                        + (_format_subagent_usage(item.result) if item.result else "")
                         + (f"（{_safe_terminal_text(item.result.failure)}）" if item.result and item.result.failure else "")
                         + ("（已收取）" if item.collected else "")
                         for item in snapshots

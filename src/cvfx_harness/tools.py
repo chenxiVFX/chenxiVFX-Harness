@@ -4132,7 +4132,10 @@ def build_tool_schemas(test_profile_ids: list[str] | tuple[str, ...] = ()) -> li
                         "properties": {
                             "profile_id": {
                                 "type": "string",
-                                "enum": list(test_profile_ids),
+                                # Profile IDs are a set of allowed choices. Config
+                                # file ordering is incidental and would churn the
+                                # otherwise stable request prefix.
+                                "enum": sorted(test_profile_ids, key=lambda item: (item.casefold(), item)),
                             }
                         },
                         "required": ["profile_id"],

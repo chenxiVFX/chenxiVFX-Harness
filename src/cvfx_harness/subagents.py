@@ -5,7 +5,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .providers import (
@@ -34,7 +34,7 @@ from .tools import (
     authorize_subagent_plan,
     run_tool,
 )
-from .usage import estimate_payload_tokens, estimate_tokens
+from .usage import estimate_payload_tokens, estimate_tokens, usage_breakdown
 
 MAX_PROPOSED_TASKS = 3
 MAX_SESSION_TASKS = 3
@@ -67,6 +67,12 @@ def _scope_key(path: str) -> str:
     return path.casefold() if os.name == "nt" else path
 
 
+def _canonical_read_scopes(
+    read_scopes: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted(read_scopes, key=lambda item: (item[1], _scope_key(item[0]), item[0])))
+
+
 @dataclass(frozen=True)
 class DelegationPlan:
     tasks: tuple[str, ...]
@@ -89,6 +95,22 @@ class SubagentResult:
     input_tokens: int
     output_tokens: int
     failure: str = ""
+    provider_requests: int = 0
+    provider_usage_reports: int = 0
+    provider_prompt_tokens: int = 0
+    provider_completion_tokens: int = 0
+    provider_cached_prompt_reports: int = 0
+    provider_cached_prompt_tokens: int = 0
+
+
+@dataclass
+class _ChildUsage:
+    requests: int = 0
+    reports: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_reports: int = 0
+    cached_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -170,6 +192,25 @@ def _safe_failure(exc: BaseException) -> str:
     return "任务执行错误"
 
 
+def _valid_provider_usage(usage: Any) -> bool:
+    return usage is None or (
+        isinstance(usage, ProviderUsage)
+        and type(usage.prompt_tokens) is int
+        and usage.prompt_tokens >= 0
+        and type(usage.completion_tokens) is int
+        and usage.completion_tokens >= 0
+        and type(usage.total_tokens) is int
+        and usage.total_tokens == usage.prompt_tokens + usage.completion_tokens
+        and (
+            usage.cached_prompt_tokens is None
+            or (
+                type(usage.cached_prompt_tokens) is int
+                and 0 <= usage.cached_prompt_tokens <= usage.prompt_tokens
+            )
+        )
+    )
+
+
 def _run_one(
     index: int,
     task: str,
@@ -183,10 +224,49 @@ def _run_one(
     read_scopes: tuple[tuple[str, str], ...] = (),
     reserve_input: Any = None,
 ) -> SubagentResult:
+    usage = _ChildUsage()
+    result = _run_one_impl(
+        index,
+        task,
+        provider,
+        input_budget=input_budget,
+        output_budget=output_budget,
+        timeout_seconds=timeout_seconds,
+        cancellation_event=cancellation_event,
+        workspace=workspace,
+        read_scopes=read_scopes,
+        reserve_input=reserve_input,
+        usage=usage,
+    )
+    return replace(
+        result,
+        provider_requests=usage.requests,
+        provider_usage_reports=usage.reports,
+        provider_prompt_tokens=usage.prompt_tokens,
+        provider_completion_tokens=usage.completion_tokens,
+        provider_cached_prompt_reports=usage.cached_reports,
+        provider_cached_prompt_tokens=usage.cached_tokens,
+    )
+
+
+def _run_one_impl(
+    index: int,
+    task: str,
+    provider: object,
+    *,
+    input_budget: int,
+    output_budget: int,
+    timeout_seconds: float,
+    cancellation_event: threading.Event,
+    workspace: Workspace | None = None,
+    read_scopes: tuple[tuple[str, str], ...] = (),
+    reserve_input: Any = None,
+    usage: _ChildUsage,
+) -> SubagentResult:
     scope_text = ""
     if read_scopes:
         scope_text = "\n允许的只读工具与精确路径：" + ", ".join(
-            f"{operation}={path}" for path, operation in read_scopes
+            f"{operation}={path}" for path, operation in _canonical_read_scopes(read_scopes)
         ) + "。不可读取其他路径。"
     messages = [
         {"role": "system", "content": SUBAGENT_SYSTEM_PROMPT + scope_text},
@@ -247,6 +327,7 @@ def _run_one(
             }
             if request_tools:
                 provider_arguments["tools"] = request_tools
+            usage.requests += 1
             turn = complete_subagent(messages, **provider_arguments)
         except (ProviderCancelled, KeyboardInterrupt):
             cancellation_event.set()
@@ -259,6 +340,17 @@ def _run_one(
             failure = "任务超过时限" if status == "timed_out" else _safe_failure(exc)
             return SubagentResult(index, task, status, "", total_input_tokens, total_output_tokens, failure)
 
+        if (
+            isinstance(turn, AssistantTurn)
+            and isinstance(turn.usage, ProviderUsage)
+            and _valid_provider_usage(turn.usage)
+        ):
+            usage.reports += 1
+            usage.prompt_tokens += turn.usage.prompt_tokens
+            usage.completion_tokens += turn.usage.completion_tokens
+            if turn.usage.cached_prompt_tokens is not None:
+                usage.cached_reports += 1
+                usage.cached_tokens += turn.usage.cached_prompt_tokens
         if time.monotonic() > deadline:
             cancellation_event.set()
             return SubagentResult(index, task, "timed_out", "", total_input_tokens, total_output_tokens, "任务超过时限")
@@ -292,22 +384,7 @@ def _run_one(
             return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型响应格式无效")
         if "content" in turn.assistant_message and (raw_content or "") != turn.content:
             return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型响应格式无效")
-        if turn.usage is not None and (
-            not isinstance(turn.usage, ProviderUsage)
-            or type(turn.usage.prompt_tokens) is not int
-            or turn.usage.prompt_tokens < 0
-            or type(turn.usage.completion_tokens) is not int
-            or turn.usage.completion_tokens < 0
-            or type(turn.usage.total_tokens) is not int
-            or turn.usage.total_tokens != turn.usage.prompt_tokens + turn.usage.completion_tokens
-            or (
-                turn.usage.cached_prompt_tokens is not None
-                and (
-                    type(turn.usage.cached_prompt_tokens) is not int
-                    or not 0 <= turn.usage.cached_prompt_tokens <= turn.usage.prompt_tokens
-                )
-            )
-        ):
+        if not _valid_provider_usage(turn.usage):
             return SubagentResult(index, task, "failed", "", total_input_tokens, total_output_tokens, "模型用量格式无效")
         if set(turn.assistant_message) - {
             "role", "content", "reasoning_content", "tool_calls", "deepseek_anthropic_content",
@@ -573,7 +650,7 @@ class SubagentManager:
                         "content": SUBAGENT_SYSTEM_PROMPT
                         + (
                             "\n允许的只读工具与精确路径："
-                            + ", ".join(f"{op}={path}" for path, op in read_scopes)
+                            + ", ".join(f"{op}={path}" for path, op in _canonical_read_scopes(read_scopes))
                             + "。不可读取其他路径。"
                             if read_scopes
                             else ""
@@ -935,6 +1012,21 @@ def render_untrusted_subagent_summary(results: tuple[SubagentResult, ...] | list
             "content": result.content,
             "input_tokens": result.input_tokens,
             "output_tokens": result.output_tokens,
+            "output_tokens_semantics": "budget_accounting_compatibility_alias",
+            "usage": usage_breakdown(
+                requests=result.provider_requests,
+                estimated_input_tokens=result.input_tokens,
+                budgeted_output_tokens=result.output_tokens,
+                provider_usage_reports=result.provider_usage_reports,
+                provider_prompt_tokens=result.provider_prompt_tokens,
+                provider_completion_tokens=result.provider_completion_tokens,
+                provider_cached_prompt_reports=result.provider_cached_prompt_reports,
+                provider_cached_prompt_tokens=result.provider_cached_prompt_tokens,
+                output_tokens_basis=(
+                    "max(local serialized response estimate, valid provider completion report); "
+                    "when provider usage is absent, local estimate only"
+                ),
+            ),
             "failure": result.failure,
         }
         for result in results

@@ -9,6 +9,70 @@ from typing import Any
 DEFAULT_TOKEN_BUDGET = 16_384
 
 
+def usage_breakdown(
+    *,
+    requests: int,
+    estimated_input_tokens: int,
+    budgeted_output_tokens: int,
+    provider_usage_reports: int,
+    provider_prompt_tokens: int,
+    provider_completion_tokens: int,
+    provider_cached_prompt_reports: int,
+    provider_cached_prompt_tokens: int,
+    output_tokens_basis: str = (
+        "max(local response estimate, provider completion report); "
+        "when usage is absent, the full request max_tokens allowance"
+    ),
+) -> dict[str, Any]:
+    """Build the shared, explicit usage shape for CLI and subagent JSON.
+
+    ``estimated_output_tokens`` is retained as a compatibility alias, even
+    though it is a budget-accounting value: an estimate/provider maximum may
+    be charged when usage is absent. Provider and cache fields remain separate.
+    """
+    provider_state = (
+        "unknown"
+        if provider_usage_reports == 0
+        else "reported"
+        if provider_usage_reports == requests
+        else "partial"
+    )
+    cache_state = (
+        "unknown"
+        if provider_cached_prompt_reports == 0
+        else "reported"
+        if provider_cached_prompt_reports == provider_usage_reports == requests
+        else "partial"
+    )
+    return {
+        "requests": requests,
+        "budget_accounting": {
+            "status": "accounted",
+            "input_tokens_local_estimate": estimated_input_tokens,
+            "output_tokens": budgeted_output_tokens,
+            "output_tokens_basis": output_tokens_basis,
+        },
+        "local_estimate": {
+            "status": "estimated",
+            "input_tokens": estimated_input_tokens,
+            "output_tokens": budgeted_output_tokens,
+            "output_tokens_semantics": "budget_accounting_compatibility_alias",
+        },
+        "provider_actual": {
+            "status": provider_state,
+            "reports": provider_usage_reports,
+            "prompt_tokens": provider_prompt_tokens,
+            "completion_tokens": provider_completion_tokens,
+            "total_tokens": provider_prompt_tokens + provider_completion_tokens,
+        },
+        "cache_actual": {
+            "status": cache_state,
+            "reports": provider_cached_prompt_reports,
+            "cached_prompt_tokens": provider_cached_prompt_tokens,
+        },
+    }
+
+
 @dataclass(frozen=True)
 class ProviderUsage:
     """Token counts reported by a provider, when its response includes them."""

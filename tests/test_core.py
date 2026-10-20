@@ -89,6 +89,7 @@ from cvfx_harness.tools import (
     Workspace,
     WorkspaceConflictError,
     WorkspaceError,
+    build_tool_schemas,
     run_tool,
 )
 from cvfx_harness.usage import ProviderUsage
@@ -454,6 +455,20 @@ class WorkspaceTests(unittest.TestCase):
         }
         arguments.update(extra)
         return ToolCall("patch-1", "patch_file", arguments)  # type: ignore[arg-type]
+
+    def test_profile_tool_enum_ignores_config_order_but_changes_with_membership(self) -> None:
+        def profile_enum(profile_ids: list[str]) -> list[str]:
+            schema = next(
+                item for item in build_tool_schemas(profile_ids)
+                if item["function"]["name"] == "run_test_profile"
+            )
+            return schema["function"]["parameters"]["properties"]["profile_id"]["enum"]
+
+        first = profile_enum(["zeta", "Alpha", "beta"])
+        second = profile_enum(["beta", "zeta", "Alpha"])
+        self.assertEqual(first, ["Alpha", "beta", "zeta"])
+        self.assertEqual(second, first)
+        self.assertEqual(profile_enum(["zeta", "Alpha", "new"]), ["Alpha", "new", "zeta"])
 
     def test_patch_preserves_chinese_crlf_and_missing_final_newline_then_undoes(self) -> None:
         target = self.root / "说明.txt"
@@ -2023,6 +2038,40 @@ class ScriptedProvider:
 
 
 class ProjectGuidanceTests(unittest.TestCase):
+    def test_dynamic_user_context_updates_while_system_and_tool_prefix_stay_stable(self) -> None:
+        with make_test_temp(prefix="cache-prefix-dynamic-context-") as temp:
+            root = Path(temp)
+            guide_path = root / "AGENTS.md"
+            guide_path.write_text("项目约束 v1：保留中文接口。", encoding="utf-8")
+            store = ProjectGuidanceStore(Workspace(root))
+            provider = ScriptedProvider([
+                AssistantTurn("第一轮合成答复。"),
+                AssistantTurn("第二轮合成答复。"),
+            ])
+            agent = Agent(provider, Workspace(root), approve_action=lambda _request: False)
+
+            agent.goal = "目标 v1"
+            agent.ask("问题 v1", references=[("src/旧版.py", "引用内容 v1")], project_guidance=store.preview("AGENTS.md"))
+            guide_v1 = store.preview("AGENTS.md")
+            guide_path.write_text("项目约束 v2：更新接口要求。", encoding="utf-8")
+            guide_v2 = store.preview("AGENTS.md")
+            agent.goal = "目标 v2"
+            agent.ask("问题 v2", references=[("src/新版.py", "引用内容 v2")], project_guidance=guide_v2)
+
+        first, second = provider.requests
+        self.assertEqual(first[0], {"role": "system", "content": SYSTEM_PROMPT})
+        self.assertEqual(second[0], first[0])
+        self.assertEqual(provider.tool_schemas[0], provider.tool_schemas[1])
+        self.assertIn("目标 v1", first[-1]["content"])
+        self.assertIn("src/旧版.py", first[-1]["content"])
+        self.assertIn("项目约束 v1", first[-1]["content"])
+        self.assertIn("目标 v2", second[-1]["content"])
+        self.assertIn("src/新版.py", second[-1]["content"])
+        self.assertIn("项目约束 v2", second[-1]["content"])
+        self.assertNotIn("目标 v1", second[-1]["content"])
+        self.assertNotIn("项目约束 v1", second[-1]["content"])
+        self.assertNotEqual(guide_v1.sha256, guide_v2.sha256)
+
     def test_store_limits_discovery_and_reads_to_root_utf8_documents(self) -> None:
         with make_test_temp(prefix="project-guidance-root-") as temp:
             root = Path(temp)
@@ -2923,6 +2972,15 @@ class CliTests(unittest.TestCase):
             "status": "reported", "reports": 1, "cached_prompt_tokens": 5,
         })
         self.assertEqual(payload["usage"]["local_estimate"]["status"], "estimated")
+        self.assertEqual(
+            payload["usage"]["local_estimate"]["output_tokens_semantics"],
+            "budget_accounting_compatibility_alias",
+        )
+        self.assertEqual(payload["usage"]["budget_accounting"]["status"], "accounted")
+        self.assertEqual(
+            payload["usage"]["budget_accounting"]["output_tokens_basis"],
+            "max(local response estimate, provider completion report); when usage is absent, the full request max_tokens allowance",
+        )
 
     def test_single_request_json_reports_missing_usage_and_never_executes_proposed_tools(self) -> None:
         with make_test_temp(prefix="cli-json-missing-usage-") as temp:
@@ -2939,6 +2997,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["usage"]["provider_actual"]["status"], "unknown")
         self.assertEqual(payload["usage"]["cache_actual"]["status"], "unknown")
         self.assertEqual(payload["usage"]["local_estimate"]["status"], "estimated")
+        self.assertEqual(payload["usage"]["budget_accounting"]["status"], "accounted")
 
         with make_test_temp(prefix="cli-json-approval-required-") as temp:
             private_path = "private synthetic.txt"
@@ -3674,6 +3733,39 @@ class CliTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_provider_bodies_keep_only_fixed_cache_prefix_fields_and_dynamic_user_messages(self) -> None:
+        system = {"role": "system", "content": SYSTEM_PROMPT}
+        first_messages = [system, {"role": "user", "content": "目标 v1；引用 v1；项目说明 v1"}]
+        second_messages = [system, {"role": "user", "content": "目标 v2；引用 v2；项目说明 v2"}]
+        tools = [TOOL_SCHEMAS[0]]
+
+        openai = OpenAICompatibleProvider("http://127.0.0.1:32123", "", "fixture-model")
+        openai_first = openai._request_body(first_messages, tools, max_tokens=17, stream=False)
+        openai_second = openai._request_body(second_messages, tools, max_tokens=17, stream=False)
+        self.assertEqual(
+            set(openai_first),
+            {"model", "messages", "max_tokens", "reasoning_effort", "thinking", "tools", "tool_choice"},
+        )
+        self.assertEqual(openai_first["messages"][0], openai_second["messages"][0])
+        self.assertNotEqual(openai_first["messages"][1], openai_second["messages"][1])
+        self.assertEqual(openai_first["tools"], openai_second["tools"])
+        self.assertNotIn("cache_control", json.dumps(openai_first))
+        openai_stream = openai._request_body(first_messages, tools, max_tokens=17, stream=True)
+        self.assertEqual({*openai_stream}, {*openai_first, "stream"})
+        self.assertIs(openai_stream["stream"], True)
+
+        anthropic = DeepSeekAnthropicProvider(
+            "http://127.0.0.1:32123/anthropic", "", "deepseek-flash"
+        )
+        anthropic_body = anthropic._request_body(first_messages, [], max_tokens=17, stream=True)
+        self.assertEqual(
+            set(anthropic_body),
+            {"model", "max_tokens", "messages", "stream", "thinking", "system"},
+        )
+        self.assertEqual(anthropic_body["system"], SYSTEM_PROMPT)
+        self.assertEqual(anthropic_body["messages"][-1]["content"], first_messages[-1]["content"])
+        self.assertNotIn("cache_control", json.dumps(anthropic_body))
+
     def test_anthropic_sse_parser_decodes_chinese_when_every_utf8_byte_is_split(self) -> None:
         wire = fixture_anthropic_sse([
             {"type": "message_start", "message": {"type": "message", "role": "assistant", "content": []}},

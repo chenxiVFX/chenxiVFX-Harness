@@ -15,7 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cvfx_harness.agent import Agent, SYSTEM_PROMPT
-from cvfx_harness.cli import _format_compression_summary, run_console
+from cvfx_harness.cli import _format_compression_summary, _format_subagent_usage, run_console
 from cvfx_harness.providers import AssistantTurn, MockProvider, ProviderCancelled, ProviderError, ToolCall
 from cvfx_harness.questions import QuestionnaireResult, UserQuestionAnswer
 from cvfx_harness.sessions import MAX_SESSION_BYTES, SessionError, SessionStore
@@ -1011,7 +1011,8 @@ class CompressionTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             combined = "\n".join(outputs)
             self.assertIn("当前上下文本地估算", combined)
-            self.assertIn("累计本地估算输入/输出", combined)
+            self.assertIn("累计本地输入估算", combined)
+            self.assertIn("输出预算核算", combined)
             self.assertIn("1 次有效报告，输入 17、输出 3", combined)
             self.assertIn("没有有效缓存命中字段；命中量未知", combined)
             self.assertNotIn("已节省", combined)
@@ -1133,6 +1134,110 @@ class CompressionTests(unittest.TestCase):
 
 
 class DelegationTests(unittest.TestCase):
+    def test_child_scope_order_is_canonical_and_usage_summary_separates_budget_from_actual(self) -> None:
+        from cvfx_harness.subagents import (
+            SUBAGENT_SYSTEM_PROMPT,
+            _run_one,
+            render_untrusted_subagent_summary,
+        )
+
+        class CapturedProvider:
+            def __init__(self):
+                self.requests = []
+
+            def complete_subagent(self, messages, *, tools=None, timeout_seconds, max_output_tokens, cancellation_event):
+                del timeout_seconds, max_output_tokens, cancellation_event
+                self.requests.append((json.loads(json.dumps(messages)), list(tools or [])))
+                return AssistantTurn(
+                    "中文合成答复",
+                    assistant_message={"role": "assistant", "content": "中文合成答复"},
+                    usage=ProviderUsage(12, 3, 15, 7),
+                )
+
+        with tempfile.TemporaryDirectory(prefix="child-cache-prefix-") as temp:
+            workspace = Workspace(Path(temp))
+            provider = CapturedProvider()
+            scopes_a = (("b.py", "read_file"), ("a.py", "read_file"))
+            scopes_b = tuple(reversed(scopes_a))
+            result_a = _run_one(
+                1, "检查中文文件", provider, input_budget=512, output_budget=256,
+                timeout_seconds=5, cancellation_event=threading.Event(),
+                workspace=workspace, read_scopes=scopes_a,
+            )
+            result_b = _run_one(
+                1, "检查中文文件", provider, input_budget=512, output_budget=256,
+                timeout_seconds=5, cancellation_event=threading.Event(),
+                workspace=workspace, read_scopes=scopes_b,
+            )
+            result_c = _run_one(
+                1, "检查中文文件", provider, input_budget=512, output_budget=256,
+                timeout_seconds=5, cancellation_event=threading.Event(),
+                workspace=workspace, read_scopes=(("c.py", "read_file"), ("a.py", "read_file")),
+            )
+
+        first_messages, first_tools = provider.requests[0]
+        second_messages, second_tools = provider.requests[1]
+        third_messages, third_tools = provider.requests[2]
+        self.assertEqual(first_messages[0], second_messages[0])
+        self.assertEqual(first_messages[0]["content"], SUBAGENT_SYSTEM_PROMPT + "\n允许的只读工具与精确路径：read_file=a.py, read_file=b.py。不可读取其他路径。")
+        self.assertEqual(first_tools, second_tools)
+        self.assertTrue(third_messages[0]["content"].startswith(SUBAGENT_SYSTEM_PROMPT))
+        self.assertIn("read_file=c.py", third_messages[0]["content"])
+        self.assertEqual(third_tools, first_tools)
+        self.assertTrue(all(result.status == "completed" for result in (result_a, result_b, result_c)))
+        self.assertEqual(result_a.provider_requests, 1)
+        self.assertEqual(result_a.provider_usage_reports, 1)
+        self.assertEqual(result_a.provider_completion_tokens, 3)
+        self.assertEqual(result_a.provider_cached_prompt_reports, 1)
+        self.assertEqual(result_a.provider_cached_prompt_tokens, 7)
+        usage_label = _format_subagent_usage(result_a)
+        self.assertIn("预算核算输出", usage_label)
+        self.assertIn("提供商实际输出 3 tokens", usage_label)
+        self.assertIn("提供商报告缓存命中 7 tokens", usage_label)
+
+        body = json.loads(
+            render_untrusted_subagent_summary([result_a]).split("\n", 2)[2].rsplit("\n", 1)[0]
+        )
+        self.assertEqual(body[0]["output_tokens_semantics"], "budget_accounting_compatibility_alias")
+        self.assertEqual(body[0]["usage"]["provider_actual"]["status"], "reported")
+        self.assertEqual(body[0]["usage"]["provider_actual"]["completion_tokens"], 3)
+        self.assertEqual(body[0]["usage"]["cache_actual"]["cached_prompt_tokens"], 7)
+
+        class MissingUsageProvider:
+            def complete_subagent(self, *_args, **_kwargs):
+                return AssistantTurn("未知输出")
+
+        with tempfile.TemporaryDirectory(prefix="child-cache-unknown-") as temp:
+            unknown = _run_one(
+                1, "中文只读任务", MissingUsageProvider(), input_budget=512, output_budget=256,
+                timeout_seconds=5, cancellation_event=threading.Event(),
+            )
+        self.assertEqual(unknown.provider_usage_reports, 0)
+        self.assertIn("提供商实际输出未知", _format_subagent_usage(unknown))
+        self.assertIn("提供商缓存命中未知", _format_subagent_usage(unknown))
+        unknown_body = json.loads(
+            render_untrusted_subagent_summary([unknown]).split("\n", 2)[2].rsplit("\n", 1)[0]
+        )
+        self.assertEqual(unknown_body[0]["usage"]["provider_actual"]["status"], "unknown")
+        self.assertEqual(unknown_body[0]["usage"]["cache_actual"]["status"], "unknown")
+
+        class CancelsAfterResponseProvider:
+            def complete_subagent(self, _messages, *, cancellation_event, **_kwargs):
+                cancellation_event.set()
+                return AssistantTurn(
+                    "已收到后取消",
+                    usage=ProviderUsage(8, 2, 10, 4),
+                )
+
+        with tempfile.TemporaryDirectory(prefix="child-cancel-usage-") as temp:
+            cancelled = _run_one(
+                1, "取消边界", CancelsAfterResponseProvider(), input_budget=512, output_budget=256,
+                timeout_seconds=5, cancellation_event=threading.Event(), workspace=Workspace(Path(temp)),
+            )
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertEqual(cancelled.provider_usage_reports, 1)
+        self.assertEqual(cancelled.provider_completion_tokens, 2)
+
     def test_subagent_cannot_request_user_input_and_reports_unsupported(self) -> None:
         from cvfx_harness.subagents import build_delegation_plan, run_bounded_subagents
 
