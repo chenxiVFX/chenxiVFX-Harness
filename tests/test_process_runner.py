@@ -221,6 +221,65 @@ class TestProcessRunner(unittest.TestCase):
                     _terminate_process_for_test_cleanup(child_pid)
             temporary.cleanup()
 
+    def test_node_command_cancellation_and_timeout_terminate_child_process_tree(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node is installed by CI; local host has no Node executable")
+        temporary_root = Path(__file__).resolve().parents[1] / ".test-tmp"
+        temporary_root.mkdir(exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(
+            dir=temporary_root, prefix="Node 固定命令进程树 "
+        )
+        project = Path(temporary.name)
+        workspace = Workspace(project)
+        store = TestProfileStore(workspace)
+        shutil.copy2(FIXTURES / "node" / "hold-child.cjs", project / "hold-child.cjs")
+        profile = store.add_command("node-child", node, '["hold-child.cjs"]', ".")
+        started = project / "node-parent.started"
+        child_pid_file = project / "node-child.pid"
+        event = threading.Event()
+        results = []
+        worker = threading.Thread(
+            target=lambda: results.append(
+                execute_profile(profile, workspace, cancellation_event=event, timeout_seconds=15)
+            ),
+            daemon=True,
+        )
+        try:
+            worker.start()
+            deadline = time.monotonic() + 6
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(started.exists(), "Node command did not start its synthetic child")
+            child_pid = int(child_pid_file.read_text(encoding="ascii"))
+            event.set()
+            worker.join(timeout=6)
+            self.assertFalse(worker.is_alive(), "Node command runner did not finish after cancellation")
+            self.assertEqual(results[-1].status, "cancelled")
+            time.sleep(0.1)
+            self.assertFalse(_process_is_alive(child_pid), "Node child survived runner cancellation")
+
+            started.unlink()
+            child_pid_file.unlink()
+            timeout_result = execute_profile(profile, workspace, timeout_seconds=2)
+            self.assertEqual(timeout_result.status, "timeout")
+            timeout_child_pid = int(child_pid_file.read_text(encoding="ascii"))
+            self.assertFalse(
+                _process_is_alive(timeout_child_pid),
+                "Node child survived runner timeout",
+            )
+        finally:
+            event.set()
+            worker.join(timeout=6)
+            if child_pid_file.exists():
+                try:
+                    remaining_pid = int(child_pid_file.read_text(encoding="ascii"))
+                except (OSError, ValueError):
+                    remaining_pid = None
+                if remaining_pid is not None and _process_is_alive(remaining_pid):
+                    _terminate_process_for_test_cleanup(remaining_pid)
+            temporary.cleanup()
+
     def test_windows_user_code_starts_only_after_job_assignment(self) -> None:
         temporary, workspace, _store, profile = self._project("windows_job")
         try:

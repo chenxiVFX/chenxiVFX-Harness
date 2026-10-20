@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import sys
@@ -14,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from cvfx_harness.cli import build_parser, run_console
 from cvfx_harness.profiles import TestProfileError, TestProfileStore
 from cvfx_harness.providers import MockProvider
-from cvfx_harness.test_runner import TestRunResult
+from cvfx_harness.test_runner import TestRunResult, run_test_profile_tool
 from cvfx_harness.tui import CommandCompleter
 from cvfx_harness.tools import ToolCall, Workspace, WorkspaceError, build_tool_schemas, run_tool
 
@@ -349,17 +350,17 @@ class TestProfileStoreTests(unittest.TestCase):
         self.assertTrue(any("/测试 运行 unit-suite 重新开始" in line for line in outputs))
         self.assertTrue(any("不会自动重试" in line for line in outputs))
 
-    def test_node_command_profile_is_fixed_user_owned_and_runs_after_approval(self) -> None:
+    def test_node_command_profile_fails_then_passes_after_reviewed_patch(self) -> None:
         node = shutil.which("node")
         if node is None:
             self.skipTest("Node is installed by CI; local host has no Node executable")
         with self._synthetic_project() as root:
             project = Path(root)
             shutil.copy2(
-                Path(__file__).parent / "fixtures" / "test_profile_runner" / "node" / "smoke.test.cjs",
-                project / "smoke.test.cjs",
+                Path(__file__).parent / "fixtures" / "test_profile_runner" / "node" / "repair.test.cjs",
+                project / "repair.test.cjs",
             )
-            outputs: list[str] = []
+            first_outputs: list[str] = []
             inputs = iter([
                 "/测试 添加命令 node-smoke",
                 node,
@@ -377,7 +378,7 @@ class TestProfileStoreTests(unittest.TestCase):
                 result = run_console(
                     args,
                     input_fn=lambda _prompt: next(inputs),
-                    output=outputs.append,
+                    output=first_outputs.append,
                 )
 
             store = TestProfileStore(Workspace(project))
@@ -400,18 +401,134 @@ class TestProfileStoreTests(unittest.TestCase):
                     "cwd": ".",
                 },
             )
-            self.assertTrue(any("只保存配置，不会运行" in line for line in outputs))
-            self.assertTrue(any("固定命令" in line and "node-smoke" in line for line in outputs))
-            self.assertTrue(any("固定命令可执行文件：" in line for line in outputs))
-            self.assertTrue(any('"--test"' in line for line in outputs))
-            self.assertTrue(any("工作目录" in line for line in outputs))
-            self.assertTrue(any("shell=False" in line for line in outputs))
-            self.assertTrue(any("不是沙箱" in line for line in outputs))
-            self.assertTrue(any("120 秒" in line for line in outputs))
-            self.assertTrue(any("32768 bytes" in line for line in outputs))
-            self.assertTrue(any("中文合成 Node 测试" in line for line in outputs))
-            self.assertTrue(any("Node 固定命令 profile 合成测试通过" in line for line in outputs))
-            self.assertTrue(any("1..1" in line or "tests 1" in line for line in outputs))
+            self.assertTrue(any("只保存配置，不会运行" in line for line in first_outputs))
+            self.assertTrue(any("固定命令" in line and "node-smoke" in line for line in first_outputs))
+            self.assertTrue(any("固定命令可执行文件：" in line for line in first_outputs))
+            self.assertTrue(any('"--test"' in line for line in first_outputs))
+            self.assertTrue(any("工作目录" in line for line in first_outputs))
+            self.assertTrue(any("shell=False" in line for line in first_outputs))
+            self.assertTrue(any("不是沙箱" in line for line in first_outputs))
+            self.assertTrue(any("120 秒" in line for line in first_outputs))
+            self.assertTrue(any("32768 bytes" in line for line in first_outputs))
+            self.assertTrue(any("Node 合成项目需要一次精确修补" in line for line in first_outputs))
+            self.assertTrue(any("退出码为 1" in line for line in first_outputs))
+            self.assertTrue(any("AssertionError" in line for line in first_outputs))
+
+            before = (project / "repair.test.cjs").read_bytes()
+            patch_result = run_tool(
+                Workspace(project),
+                ToolCall("node-fix", "patch_file", {
+                    "path": "repair.test.cjs",
+                    "expected_sha256": hashlib.sha256(before).hexdigest(),
+                    "old_text": "2 + 2, 5",
+                    "new_text": "2 + 2, 4",
+                }),
+                approve_action=lambda request: request.operation == "patch",
+            )
+            self.assertIn("已应用精确补丁", patch_result)
+
+            second_outputs: list[str] = []
+            second_inputs = iter(["/测试 运行 node-smoke", "是", "/退出"])
+            with patch("cvfx_harness.cli.provider_from_environment", return_value=MockProvider()):
+                second_result = run_console(
+                    args,
+                    input_fn=lambda _prompt: next(second_inputs),
+                    output=second_outputs.append,
+                )
+            self.assertEqual(second_result, 0)
+            self.assertTrue(any("Node 修补后复测通过" in line for line in second_outputs))
+            self.assertTrue(any("退出码为 0" in line for line in second_outputs))
+
+    def test_command_profile_requires_new_approval_if_args_or_cwd_change(self) -> None:
+        executable = shutil.which("node")
+        if executable is None:
+            self.skipTest("Node is installed by CI; local host has no Node executable")
+        with self._synthetic_project() as root:
+            project = Path(root)
+            (project / "alternate").mkdir()
+            (project / "marker.cjs").write_text(
+                "require('node:fs').writeFileSync('executed.flag', 'yes');\n",
+                encoding="utf-8",
+            )
+            workspace = Workspace(project)
+            store = TestProfileStore(workspace)
+            profile = store.add_command("mutable", executable, '["marker.cjs"]', ".")
+            approval_requests = []
+            with patch("cvfx_harness.test_runner.execute_profile") as execute:
+                denied = run_test_profile_tool(
+                    workspace,
+                    store,
+                    profile.profile_id,
+                    approve_action=lambda request: approval_requests.append(request) or False,
+                    share_output=False,
+                )
+                self.assertIn("拒绝", denied)
+
+                def change_args(_request):
+                    store.remove(profile.profile_id)
+                    store.add_command(profile.profile_id, executable, '["--version"]', ".")
+                    return True
+
+                changed_args = run_test_profile_tool(
+                    workspace,
+                    store,
+                    profile.profile_id,
+                    approve_action=change_args,
+                    share_output=False,
+                )
+                self.assertIn("配置已更改", changed_args)
+
+                def change_cwd(_request):
+                    store.remove(profile.profile_id)
+                    store.add_command(profile.profile_id, executable, '["--version"]', "alternate")
+                    return True
+
+                changed_cwd = run_test_profile_tool(
+                    workspace,
+                    store,
+                    profile.profile_id,
+                    approve_action=change_cwd,
+                    share_output=False,
+                )
+                self.assertIn("配置已更改", changed_cwd)
+
+            self.assertEqual(len(approval_requests), 1)
+            execute.assert_not_called()
+            self.assertFalse((project / "executed.flag").exists())
+
+    def test_fixed_command_output_sharing_has_a_separate_approval(self) -> None:
+        executable = shutil.which("node")
+        if executable is None:
+            self.skipTest("Node is installed by CI; local host has no Node executable")
+        with self._synthetic_project() as root:
+            project = Path(root)
+            shutil.copy2(
+                Path(__file__).parent / "fixtures" / "test_profile_runner" / "node" / "smoke.test.cjs",
+                project / "smoke.test.cjs",
+            )
+            workspace = Workspace(project)
+            store = TestProfileStore(workspace)
+            profile = store.add_command("share-node", executable, '["--test"]', ".")
+            approvals = []
+            local_output = []
+
+            def approve(request):
+                approvals.append(request)
+                return request.operation == "run_test"
+
+            result = run_test_profile_tool(
+                workspace,
+                store,
+                profile.profile_id,
+                approve_action=approve,
+                emit_output=local_output.append,
+                share_output=True,
+            )
+
+            self.assertEqual([item.operation for item in approvals], ["run_test", "share_test_output"])
+            self.assertTrue(any("Node 固定命令 profile 合成测试通过" in item for item in local_output))
+            self.assertIn("用户选择仅在本地查看", result)
+            self.assertNotIn("用户另行批准的脱敏输出", result)
 
     def test_command_profile_rejects_shells_bad_json_and_model_supplied_fields(self) -> None:
         executable = shutil.which("node")
